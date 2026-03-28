@@ -1,134 +1,176 @@
+import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
-import { TrendingUp, Bitcoin, Activity, DollarSign } from 'lucide-react'
+import type { BotStatus, CryptoLedger, MarketStatus, StockAccount, StockPosition, CryptoPosition } from '@/types'
+import { TrendingUp, Bitcoin, Activity, DollarSign, Wallet } from 'lucide-react'
+
+function formatMoney(value: number) {
+  return `$${value.toFixed(2)}`
+}
 
 export default function Dashboard() {
-  const { data: stockPositions } = useQuery({
+  const { data: stockPositions = [] } = useQuery<StockPosition[]>({
     queryKey: ['stockPositions'],
     queryFn: api.getStockPositions,
     refetchInterval: 5000,
   })
-  
-  const { data: cryptoPositions } = useQuery({
+
+  const { data: cryptoPositions = [] } = useQuery<CryptoPosition[]>({
     queryKey: ['cryptoPositions'],
     queryFn: api.getCryptoPositions,
     refetchInterval: 5000,
   })
-  
-  const { data: botStatus } = useQuery({
+
+  const { data: botStatus } = useQuery<BotStatus>({
     queryKey: ['botStatus'],
     queryFn: api.getBotStatus,
     refetchInterval: 3000,
   })
-  
-  const { data: marketStatus } = useQuery({
+
+  const { data: marketStatus } = useQuery<MarketStatus>({
     queryKey: ['marketStatus'],
     queryFn: api.getMarketStatus,
     refetchInterval: 60000,
   })
-  
-  const stockPnL = stockPositions?.reduce((sum: number, p: any) => sum + p.pnl, 0) || 0
-  const cryptoPnL = cryptoPositions?.reduce((sum: number, p: any) => sum + p.pnl, 0) || 0
-  const totalPnL = stockPnL + cryptoPnL
-  
+
+  const { data: stockAccount } = useQuery<StockAccount>({
+    queryKey: ['stockAccount'],
+    queryFn: api.getStockAccount,
+    refetchInterval: 10000,
+  })
+
+  const { data: cryptoLedger } = useQuery<CryptoLedger>({
+    queryKey: ['cryptoPaperLedger'],
+    queryFn: api.getCryptoPaperLedger,
+    refetchInterval: 5000,
+  })
+
+  const summary = useMemo(() => {
+    const stockEquity = stockAccount?.portfolioValue ?? 0
+    const cryptoEquity = cryptoLedger?.equity ?? 0
+    const stockPnL = stockAccount?.unrealizedPnL ?? stockPositions.reduce((sum, p) => sum + p.pnl, 0)
+    const cryptoPnL = cryptoLedger?.totalPnL ?? cryptoPositions.reduce((sum, p) => sum + p.pnl, 0)
+    return {
+      stockEquity,
+      cryptoEquity,
+      totalEquity: stockEquity + cryptoEquity,
+      openPnL: stockPnL + cryptoPnL,
+      activePositions: stockPositions.length + cryptoPositions.length,
+    }
+  }, [cryptoLedger, cryptoPositions, stockAccount, stockPositions])
+
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-3xl font-bold text-white">Dashboard</h1>
-        <div className="flex items-center gap-3">
-          <div className={`px-4 py-2 rounded-full ${marketStatus?.stock.isOpen ? 'bg-green-900 text-green-300' : 'bg-gray-800 text-gray-400'}`}>
-            <div className="flex items-center gap-2">
-              <TrendingUp className="w-4 h-4" />
-              <span>Stock Market: {marketStatus?.stock.isOpen ? 'Open' : 'Closed'}</span>
-            </div>
-          </div>
-          <div className={`px-4 py-2 rounded-full ${botStatus?.running ? 'bg-green-900 text-green-300' : 'bg-gray-800 text-gray-400'}`}>
-            <div className="flex items-center gap-2">
-              <Activity className="w-4 h-4" />
-              <span>Bot: {botStatus?.running ? 'Active' : 'Inactive'}</span>
-            </div>
-          </div>
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <h1 className="text-3xl font-bold text-white">Dashboard</h1>
+          <p className="mt-1 text-gray-400">Live portfolio view for Tradier and the Kraken paper ledger.</p>
+        </div>
+        <div className="flex flex-wrap gap-3">
+          <StatusPill
+            active={marketStatus?.stock.isOpen ?? false}
+            icon={<TrendingUp className="h-4 w-4" />}
+            label={`Stock Market: ${marketStatus?.stock.isOpen ? 'Open' : 'Closed'}`}
+          />
+          <StatusPill
+            active={botStatus?.running ?? false}
+            icon={<Activity className="h-4 w-4" />}
+            label={`Bot: ${botStatus?.running ? 'Active' : 'Inactive'}`}
+          />
+          <StatusPill
+            active={(botStatus?.stockMode ?? 'PAPER') === 'LIVE'}
+            icon={<Wallet className="h-4 w-4" />}
+            label={`Stock Mode: ${botStatus?.stockMode ?? 'PAPER'}`}
+          />
         </div>
       </div>
-      
-      {/* Summary Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <StatCard
-          title="Total P&L"
-          value={`$${totalPnL.toFixed(2)}`}
-          icon={<DollarSign className="w-6 h-6" />}
-          trend={totalPnL >= 0 ? 'up' : 'down'}
-        />
-        <StatCard
-          title="Stock P&L"
-          value={`$${stockPnL.toFixed(2)}`}
-          icon={<TrendingUp className="w-6 h-6" />}
-          trend={stockPnL >= 0 ? 'up' : 'down'}
-        />
-        <StatCard
-          title="Crypto P&L (Paper)"
-          value={`$${cryptoPnL.toFixed(2)}`}
-          icon={<Bitcoin className="w-6 h-6" />}
-          trend={cryptoPnL >= 0 ? 'up' : 'down'}
-        />
-        <StatCard
-          title="Active Positions"
-          value={((stockPositions?.length || 0) + (cryptoPositions?.length || 0)).toString()}
-          icon={<Activity className="w-6 h-6" />}
-        />
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-5">
+        <StatCard title="Total Equity" value={formatMoney(summary.totalEquity)} icon={<DollarSign className="h-6 w-6" />} trend={summary.totalEquity >= 0 ? 'up' : 'down'} />
+        <StatCard title="Stock Equity" value={formatMoney(summary.stockEquity)} icon={<TrendingUp className="h-6 w-6" />} trend={summary.stockEquity >= 0 ? 'up' : 'down'} />
+        <StatCard title="Crypto Equity" value={formatMoney(summary.cryptoEquity)} icon={<Bitcoin className="h-6 w-6" />} trend={summary.cryptoEquity >= 0 ? 'up' : 'down'} />
+        <StatCard title="Open P&L" value={formatMoney(summary.openPnL)} icon={<Activity className="h-6 w-6" />} trend={summary.openPnL >= 0 ? 'up' : 'down'} />
+        <StatCard title="Active Positions" value={String(summary.activePositions)} icon={<Wallet className="h-6 w-6" />} />
       </div>
-      
-      {/* Markets Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <MarketPanel title="Stock Positions (Tradier)" positions={stockPositions || []} type="stock" />
-        <MarketPanel title="Crypto Positions (Kraken Paper)" positions={cryptoPositions || []} type="crypto" />
+
+      <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
+        <MarketPanel title={`Stock Positions (${botStatus?.stockMode ?? 'PAPER'})`} positions={stockPositions} type="stock" emptyMessage="No active stock positions" />
+        <MarketPanel title="Crypto Positions (PAPER)" positions={cryptoPositions} type="crypto" emptyMessage="No active crypto positions" />
       </div>
     </div>
   )
 }
 
-function StatCard({ title, value, icon, trend }: any) {
+function StatusPill({ active, icon, label }: { active: boolean; icon: React.ReactNode; label: string }) {
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-lg p-6">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-gray-400 text-sm">{title}</span>
-        <div className={trend === 'up' ? 'text-green-500' : 'text-red-500'}>
-          {icon}
-        </div>
-      </div>
-      <div className={`text-2xl font-bold ${trend === 'up' ? 'text-green-500' : 'text-red-500'}`}>
-        {value}
+    <div className={`rounded-full px-4 py-2 ${active ? 'bg-green-900 text-green-300' : 'bg-gray-800 text-gray-400'}`}>
+      <div className="flex items-center gap-2">
+        {icon}
+        <span>{label}</span>
       </div>
     </div>
   )
 }
 
-function MarketPanel({ title, positions, type }: any) {
+function StatCard({ title, value, icon, trend }: { title: string; value: string; icon: React.ReactNode; trend?: 'up' | 'down' }) {
+  const iconClass = trend === 'down' ? 'text-red-500' : 'text-green-500'
+  const valueClass = trend === 'down' ? 'text-red-500' : trend === 'up' ? 'text-green-500' : 'text-white'
+
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-lg p-6">
-      <h2 className="text-xl font-bold text-white mb-4">{title}</h2>
+    <div className="rounded-lg border border-gray-800 bg-gray-900 p-6">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-sm text-gray-400">{title}</span>
+        <div className={iconClass}>{icon}</div>
+      </div>
+      <div className={`text-2xl font-bold ${valueClass}`}>{value}</div>
+    </div>
+  )
+}
+
+function MarketPanel({
+  title,
+  positions,
+  type,
+  emptyMessage,
+}: {
+  title: string
+  positions: Array<StockPosition | CryptoPosition>
+  type: 'stock' | 'crypto'
+  emptyMessage: string
+}) {
+  return (
+    <div className="rounded-lg border border-gray-800 bg-gray-900 p-6">
+      <h2 className="mb-4 text-xl font-bold text-white">{title}</h2>
       {positions.length === 0 ? (
-        <p className="text-gray-500 text-center py-8">No active positions</p>
+        <p className="py-8 text-center text-gray-500">{emptyMessage}</p>
       ) : (
         <div className="space-y-3">
-          {positions.map((pos: any) => (
-            <div key={pos.symbol || pos.pair} className="flex items-center justify-between p-3 bg-gray-800 rounded-lg">
-              <div>
-                <div className="font-semibold text-white">{pos.symbol || pos.pair}</div>
-                <div className="text-sm text-gray-400">
-                  {type === 'stock' ? `${pos.shares} shares @ $${pos.avgPrice.toFixed(2)}` : `${pos.amount.toFixed(6)} @ $${pos.avgPrice.toFixed(2)}`}
+          {positions.map((position) => {
+            const key = type === 'stock' ? (position as StockPosition).symbol : (position as CryptoPosition).pair
+            const qtyLabel =
+              type === 'stock'
+                ? `${(position as StockPosition).shares.toFixed(0)} shares`
+                : `${(position as CryptoPosition).amount.toFixed(6)}`
+            return (
+              <div key={key} className="flex items-center justify-between rounded-lg bg-gray-800 p-3">
+                <div>
+                  <div className="font-semibold text-white">{key}</div>
+                  <div className="text-sm text-gray-400">
+                    {qtyLabel} @ ${position.avgPrice.toFixed(2)}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className={`font-semibold ${position.pnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                    {formatMoney(position.pnl)}
+                  </div>
+                  <div className={`text-sm ${position.pnlPercent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {position.pnlPercent >= 0 ? '+' : ''}
+                    {position.pnlPercent.toFixed(2)}%
+                  </div>
                 </div>
               </div>
-              <div className="text-right">
-                <div className={`font-semibold ${pos.pnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                  ${pos.pnl.toFixed(2)}
-                </div>
-                <div className={`text-sm ${pos.pnlPercent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {pos.pnlPercent >= 0 ? '+' : ''}{pos.pnlPercent.toFixed(2)}%
-                </div>
-              </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       )}
     </div>

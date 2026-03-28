@@ -44,19 +44,92 @@ class TradingBot(commands.Bot):
                 self.daily_summary.start()
     
     async def on_message(self, message):
-        """Process incoming messages"""
+    """Process incoming messages from webhooks or authorized users"""
+    
+    # Ignore own messages
+    if message.author == self.user:
+        return
+    
+    # Only process in trading channel
+    if message.channel.id != self.trading_channel_id:
+        return
+    
+    # Route based on source
+    if message.webhook_id:
+        # Message from Claude/ChatGPT via webhook
+        await self.process_ai_decision(message)
+    elif message.author.id == settings.DISCORD_USER_ID:
+        # Message directly from you
+        await self.process_user_command(message)
+    else:
+        # Message from someone else - ignore
+        logger.info(f"Ignored message from unauthorized user: {message.author.id}")
+    
+    # Process bot commands (optional)
+    await self.process_commands(message)
+
+    async def process_user_command(self, message):
+        """Process manual commands from authorized user"""
         
-        if message.author == self.user:
-            return
-        
-        if message.channel.id != self.trading_channel_id:
-            return
-        
-        # Messages from webhook (Claude/ChatGPT)
-        if message.webhook_id:
-            await self.process_ai_decision(message)
-        
-        await self.process_commands(message)
+        try:
+            decision_data = self._extract_decision(message)
+            
+            if not decision_data:
+                return  # Not a trade command
+            
+            # Rest of the code same as process_ai_decision
+            await message.add_reaction('👀')
+            
+            db = SessionLocal()
+            try:
+                account = self.tradier.get_account_sync()
+                safety_result = await self.safety.validate(decision_data, account, db)
+                
+                if not safety_result['safe']:
+                    await message.add_reaction('⛔')
+                    reply = await message.reply(
+                        f"❌ **REJECTED - Safety Check Failed**\n"
+                        f"Reason: {safety_result['reason']}\n\n"
+                        f"React with 🔓 to override (if you're sure)"
+                    )
+                    
+                    if settings.SAFETY_ALLOW_OVERRIDE:
+                        await reply.add_reaction('🔓')
+                        asyncio.create_task(
+                            self._handle_override(reply, message, decision_data)
+                        )
+                    return
+                
+                # Execute
+                await message.add_reaction('⚡')
+                result = await self._execute_screening(decision_data, db)
+                
+                execution_id = f"exec_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                self.executions[execution_id] = {
+                    'result': result,
+                    'decision': decision_data,
+                    'timestamp': datetime.now()
+                }
+                
+                confirmation = await message.reply(
+                    f"✅ **EXECUTED** (ID: `{execution_id}`)\n"
+                    f"{self._format_result(result)}\n\n"
+                    f"🚨 React with ❌ within {settings.SAFETY_GRACE_PERIOD_SECONDS}s to CANCEL"
+                )
+                
+                await confirmation.add_reaction('❌')
+                
+                asyncio.create_task(
+                    self._handle_cancellation_window(confirmation, execution_id, result)
+                )
+                
+            finally:
+                db.close()
+                
+        except Exception as e:
+            logger.error(f"Error processing user command: {e}", exc_info=True)
+            await message.add_reaction('❌')
+            await message.reply(f"**Error:** {str(e)}")
     
     async def process_ai_decision(self, message):
         """Process AI decision - EXECUTE IMMEDIATELY with safety checks"""

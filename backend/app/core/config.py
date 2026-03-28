@@ -1,26 +1,43 @@
-from pydantic_settings import BaseSettings
+from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file='.env', extra='ignore')
+
     # App
-    APP_ENV: str = "development"
-    SECRET_KEY: str
-    LOG_LEVEL: str = "INFO"
-    
-    # Tradier
-    TRADIER_API_KEY: str
-    TRADIER_ACCOUNT_ID: str
-    TRADIER_BASE_URL: str = "https://sandbox.tradier.com/v1"
-    
+    APP_ENV: str = 'development'
+    SECRET_KEY: str = 'change-this-secret'
+    LOG_LEVEL: str = 'INFO'
+
+    # Tradier legacy fallback
+    TRADIER_API_KEY: str = ''
+    TRADIER_ACCOUNT_ID: str = ''
+    TRADIER_BASE_URL: str = 'https://sandbox.tradier.com/v1'
+
+    # Tradier explicit paper/live credentials
+    TRADIER_PAPER_API_KEY: str = ''
+    TRADIER_PAPER_ACCOUNT_ID: str = ''
+    TRADIER_PAPER_BASE_URL: str = 'https://sandbox.tradier.com/v1'
+    TRADIER_LIVE_API_KEY: str = ''
+    TRADIER_LIVE_ACCOUNT_ID: str = ''
+    TRADIER_LIVE_BASE_URL: str = 'https://api.tradier.com/v1'
+
+    # Kraken CLI / future live credentials
+    KRAKEN_CLI_PATH: str = 'kraken'
+    KRAKEN_API_KEY: str = ''
+    KRAKEN_API_SECRET: str = ''
+
     # Discord
-    DISCORD_BOT_TOKEN: str
-    DISCORD_TRADING_CHANNEL_ID: int
-    DISCORD_WEBHOOK_URL: str
-    DISCORD_USER_ID: int
-    
+    DISCORD_BOT_TOKEN: str = ''
+    DISCORD_TRADING_CHANNEL_ID: int = 0
+    DISCORD_WEBHOOK_URL: str = ''
+    DISCORD_USER_ID: int = 0
+
     # Database
-    DATABASE_URL: str
-    REDIS_URL: str = "redis://localhost:6379"
-    
+    DATABASE_URL: str = 'sqlite:///./ai_bot.db'
+    REDIS_URL: str = 'redis://localhost:6379'
+
     # Safety
     SAFETY_MAX_TRADES_PER_DAY: int = 3
     SAFETY_MAX_POSITION_SIZE_PCT: float = 0.25
@@ -29,15 +46,67 @@ class Settings(BaseSettings):
     SAFETY_GRACE_PERIOD_SECONDS: int = 30
     SAFETY_ALLOW_OVERRIDE: bool = True
     SAFETY_REQUIRE_MARKET_HOURS: bool = True
-    
+
     # Risk
     STOP_LOSS_PCT: float = 0.015
     PROFIT_TARGET_PCT: float = 0.025
     TRAILING_STOP_PCT: float = 0.03
     TIME_STOP_HOUR: int = 15
     TIME_STOP_MINUTE: int = 45
-    
-    class Config:
-        env_file = ".env"
+
+    # Runtime / local tooling
+    BOT_DEFAULT_STOCK_MODE: str = 'PAPER'
+    BOT_DEFAULT_CRYPTO_MODE: str = 'PAPER'
+    RUNTIME_STATE_FILE: str = './backend/.runtime/runtime_state.json'
+    BACKUP_ROOT_DIR: str = './backups'
+
+    @property
+    def runtime_state_path(self) -> Path:
+        return Path(self.RUNTIME_STATE_FILE).resolve()
+
+    @property
+    def backup_root_path(self) -> Path:
+        return Path(self.BACKUP_ROOT_DIR).resolve()
+
+    def paper_tradier_credentials(self) -> dict[str, str]:
+        api_key = self.TRADIER_PAPER_API_KEY or self.TRADIER_API_KEY
+        account_id = self.TRADIER_PAPER_ACCOUNT_ID or self.TRADIER_ACCOUNT_ID
+        base_url = self.TRADIER_PAPER_BASE_URL or self.TRADIER_BASE_URL
+        return {
+            'api_key': api_key,
+            'account_id': account_id,
+            'base_url': base_url,
+        }
+
+    def live_tradier_credentials(self) -> dict[str, str]:
+        api_key = self.TRADIER_LIVE_API_KEY
+        account_id = self.TRADIER_LIVE_ACCOUNT_ID
+        base_url = self.TRADIER_LIVE_BASE_URL
+
+        if not api_key and self.TRADIER_API_KEY and 'sandbox' not in (self.TRADIER_BASE_URL or '').lower():
+            api_key = self.TRADIER_API_KEY
+            account_id = self.TRADIER_ACCOUNT_ID
+            base_url = self.TRADIER_BASE_URL
+
+        return {
+            'api_key': api_key,
+            'account_id': account_id,
+            'base_url': base_url,
+        }
+
+    @property
+    def tradier_paper_ready(self) -> bool:
+        creds = self.paper_tradier_credentials()
+        return bool(creds['api_key'] and creds['account_id'])
+
+    @property
+    def tradier_live_ready(self) -> bool:
+        creds = self.live_tradier_credentials()
+        return bool(creds['api_key'] and creds['account_id'])
+
+    @property
+    def kraken_live_ready(self) -> bool:
+        return bool(self.KRAKEN_API_KEY and self.KRAKEN_API_SECRET)
+
 
 settings = Settings()

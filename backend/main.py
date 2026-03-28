@@ -1,76 +1,186 @@
+"""AI Bot - Main FastAPI Application
+
+Hybrid stock + crypto API aligned to the system design doc.
 """
-AI Bot - Main FastAPI Application
-Stock (Tradier) + Crypto (Kraken) Trading System
-"""
-from fastapi import FastAPI
+from __future__ import annotations
+
+from datetime import datetime, time, timedelta
+from typing import Literal
+from zoneinfo import ZoneInfo
+
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-import logging
+from pydantic import BaseModel
 
-# Import routers
 from app.routers import crypto
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from app.services.kraken_service import crypto_ledger
+from app.services.runtime_state import runtime_state
+from app.services.tradier_client import tradier_client
 
 app = FastAPI(
-    title="AI Trading Bot API",
-    description="Stock (Tradier) and Crypto (Kraken) AI Trading System",
-    version="2.0.0"
+    title='AI Trading Bot API',
+    description='Stock (Tradier) and Crypto (Kraken) AI Trading System',
+    version='3.0.0',
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=['http://localhost:5173', 'http://localhost:3000'],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=['*'],
+    allow_headers=['*'],
 )
 
-# Include routers
-app.include_router(crypto.router, prefix="/api")
+app.include_router(crypto.router, prefix='/api')
 
-@app.get("/")
+ET = ZoneInfo('America/New_York')
+
+
+class ToggleRequest(BaseModel):
+    enabled: bool
+
+
+class StockModeRequest(BaseModel):
+    mode: Literal['PAPER', 'LIVE']
+
+
+@app.get('/')
 async def root():
     return {
-        "name": "AI Trading Bot",
-        "version": "2.0.0",
-        "markets": ["stocks", "crypto"],
-        "status": "online"
+        'name': 'AI Trading Bot',
+        'version': '3.0.0',
+        'markets': ['stocks', 'crypto'],
+        'status': 'online',
     }
 
-@app.get("/api/status")
+
+@app.get('/health')
+async def health():
+    return {'status': 'healthy'}
+
+
+@app.get('/api/status')
 async def get_status():
-    """Get bot status"""
+    state = runtime_state.touch()
     return {
-        "running": True,
-        "mode": "MIXED",
-        "stockMode": "LIVE",
-        "cryptoMode": "PAPER",
-        "safetyRequireMarketHours": True,
-        "lastHeartbeat": "2026-03-28T12:00:00Z"
-    }
-
-@app.get("/api/market-status")
-async def get_market_status():
-    """Get market status"""
-    from datetime import datetime
-    now = datetime.now()
-    
-    # Simple market hours check (9:30 AM - 4:00 PM ET)
-    is_market_open = 9 <= now.hour < 16
-    
-    return {
-        "stock": {
-            "isOpen": is_market_open,
-            "nextOpen": "2026-03-29T09:30:00-04:00",
-            "nextClose": "2026-03-28T16:00:00-04:00"
+        'running': state.running,
+        'mode': state.stock_mode,
+        'stockMode': state.stock_mode,
+        'cryptoMode': state.crypto_mode,
+        'safetyRequireMarketHours': state.safety_require_market_hours,
+        'lastHeartbeat': state.last_heartbeat,
+        'stockCapabilities': {
+            'paperReady': tradier_client.is_ready('PAPER'),
+            'liveReady': tradier_client.is_ready('LIVE'),
         },
-        "crypto": {
-            "isOpen": True  # Crypto markets always open
-        }
+        'cryptoCapabilities': {
+            'paperReady': True,
+            'liveReady': False,
+        },
     }
 
-if __name__ == "__main__":
+
+@app.post('/api/control/toggle')
+async def toggle_bot(request: ToggleRequest):
+    state = runtime_state.set_running(request.enabled)
+    return {'success': True, 'running': state.running, 'lastHeartbeat': state.last_heartbeat}
+
+
+@app.post('/api/control/stock-mode')
+async def set_stock_mode(request: StockModeRequest):
+    try:
+        state = runtime_state.set_stock_mode(request.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {'success': True, 'stockMode': state.stock_mode, 'lastHeartbeat': state.last_heartbeat}
+
+
+@app.post('/api/control/safety-override')
+async def toggle_safety(request: ToggleRequest):
+    state = runtime_state.set_safety_require_market_hours(request.enabled)
+    return {
+        'success': True,
+        'safetyRequireMarketHours': state.safety_require_market_hours,
+        'lastHeartbeat': state.last_heartbeat,
+    }
+
+
+@app.get('/api/stocks/account')
+async def get_stock_account():
+    mode = runtime_state.get().stock_mode
+    try:
+        return tradier_client.get_account_snapshot(mode)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Failed to fetch Tradier account: {exc}') from exc
+
+
+@app.get('/api/stocks/positions')
+async def get_stock_positions():
+    mode = runtime_state.get().stock_mode
+    try:
+        return tradier_client.get_positions_snapshot(mode)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Failed to fetch Tradier positions: {exc}') from exc
+
+
+@app.get('/api/stocks/history')
+async def get_stock_history(limit: int = Query(50, ge=1, le=500)):
+    # Placeholder until order history ingestion is added.
+    return []
+
+
+@app.get('/api/ai/decisions')
+async def get_ai_decisions(limit: int = Query(50, ge=1, le=500)):
+    # Placeholder until Discord/webhook audit log storage is added.
+    return []
+
+
+@app.get('/api/market-status')
+async def get_market_status():
+    now_et = datetime.now(ET)
+    weekday = now_et.weekday() < 5
+    market_open_today = datetime.combine(now_et.date(), time(9, 30), tzinfo=ET)
+    market_close_today = datetime.combine(now_et.date(), time(16, 0), tzinfo=ET)
+    is_open = weekday and market_open_today <= now_et <= market_close_today
+
+    next_open = market_open_today
+    if is_open:
+        next_close = market_close_today
+    else:
+        next_close = market_close_today if weekday else datetime.combine(now_et.date(), time(16, 0), tzinfo=ET)
+        while next_open <= now_et or next_open.weekday() >= 5:
+            next_open = datetime.combine(next_open.date() + timedelta(days=1), time(9, 30), tzinfo=ET)
+            next_close = datetime.combine(next_open.date(), time(16, 0), tzinfo=ET)
+
+    return {
+        'stock': {
+            'isOpen': is_open,
+            'nextOpen': next_open.isoformat(),
+            'nextClose': next_close.isoformat(),
+        },
+        'crypto': {'isOpen': True},
+    }
+
+
+@app.get('/api/dashboard/summary')
+async def get_dashboard_summary():
+    state = runtime_state.get()
+    stock_account = tradier_client.get_account_snapshot(state.stock_mode)
+    crypto_ledger_snapshot = crypto_ledger.get_ledger()
+    stock_equity = float(stock_account.get('portfolioValue', 0.0))
+    crypto_equity = float(crypto_ledger_snapshot.get('equity', 0.0))
+    stock_pnl = float(stock_account.get('unrealizedPnL', 0.0))
+    crypto_pnl = float(crypto_ledger_snapshot.get('totalPnL', 0.0))
+    return {
+        'stockMode': state.stock_mode,
+        'stockEquity': stock_equity,
+        'cryptoEquity': crypto_equity,
+        'totalEquity': stock_equity + crypto_equity,
+        'openPnL': stock_pnl + crypto_pnl,
+    }
+
+
+if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    uvicorn.run(app, host='0.0.0.0', port=8000)

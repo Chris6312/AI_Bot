@@ -1,18 +1,23 @@
+export type TradingMode = 'LIVE' | 'PAPER'
+
 export interface StockPosition {
   symbol: string
   shares: number
   avgPrice: number
   currentPrice: number
+  marketValue: number
   pnl: number
   pnlPercent: number
 }
 
 export interface CryptoPosition {
   pair: string
-  ohlcvPair: string // XBTUSD format for Kraken
+  ohlcvPair: string
   amount: number
   avgPrice: number
   currentPrice: number
+  marketValue: number
+  costBasis: number
   pnl: number
   pnlPercent: number
 }
@@ -31,18 +36,41 @@ export interface AIDecision {
   vix?: number
 }
 
-export interface PaperTrade {
+export interface TradeHistoryEntry {
   id: string
   timestamp: string
-  market: 'CRYPTO'
-  pair: string
-  ohlcvPair: string
+  market?: 'STOCK' | 'CRYPTO'
+  pair?: string
+  ohlcvPair?: string
+  symbol?: string
   side: 'BUY' | 'SELL'
-  amount: number
-  price: number
-  total: number
-  status: 'PENDING' | 'FILLED' | 'REJECTED'
+  shares?: number
+  amount?: number
+  price?: number
+  total?: number
+  status: 'PENDING' | 'FILLED' | 'REJECTED' | string
+  balance?: number
+}
+
+export interface StockAccount {
+  mode: TradingMode
+  connected: boolean
+  accountId: string
+  buyingPower: number
+  portfolioValue: number
+  cash: number
+  unrealizedPnL: number
+  dailyPnL: number
+}
+
+export interface CryptoLedger {
   balance: number
+  startingBalance: number
+  equity: number
+  marketValue: number
+  totalPnL: number
+  trades: TradeHistoryEntry[]
+  positions: CryptoPosition[]
 }
 
 export interface MarketStatus {
@@ -52,17 +80,25 @@ export interface MarketStatus {
     nextClose?: string
   }
   crypto: {
-    isOpen: boolean // Always true
+    isOpen: boolean
   }
 }
 
 export interface BotStatus {
   running: boolean
-  mode: 'LIVE' | 'PAPER'
-  stockMode: 'LIVE' | 'PAPER'
-  cryptoMode: 'PAPER' // Always paper for crypto
+  mode: TradingMode
+  stockMode: TradingMode
+  cryptoMode: 'PAPER'
   lastHeartbeat: string
   safetyRequireMarketHours: boolean
+  stockCapabilities: {
+    paperReady: boolean
+    liveReady: boolean
+  }
+  cryptoCapabilities: {
+    paperReady: boolean
+    liveReady: boolean
+  }
 }
 
 export interface CryptoCandle {
