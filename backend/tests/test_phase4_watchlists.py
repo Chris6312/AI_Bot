@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.core.database import Base, get_db
 from app.main import app
 from app.models.position import Position
+from app.models.watchlist_monitor_state import WatchlistMonitorState
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
@@ -463,3 +464,162 @@ def test_discord_guard_accepts_watchlist_schema_version_and_generated_at_utc() -
 
     assert accepted is True
     assert reason == 'accepted'
+
+
+
+def test_watchlist_ingest_initializes_monitoring_state(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+
+        persisted = watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monitor_rows = db.query(WatchlistMonitorState).order_by(WatchlistMonitorState.symbol.asc()).all()
+        assert len(monitor_rows) == 2
+        assert monitor_rows[0].latest_decision_state == 'PENDING_EVALUATION'
+        assert monitor_rows[0].last_decision_at_utc is not None
+        assert monitor_rows[0].next_evaluation_at_utc is not None
+        assert monitor_rows[0].evaluation_interval_seconds in {300, 900}
+        assert persisted['symbols'][0]['monitoring']['latestDecisionState'] == 'PENDING_EVALUATION'
+        assert persisted['monitoringSummary']['pendingEvaluationCount'] == 2
+
+
+def test_managed_only_transition_updates_monitoring_record(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        first_payload = build_stock_payload()
+        second_payload = deepcopy(first_payload)
+        second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][1]]
+        second_payload['bot_payload']['symbols'][0]['priority_rank'] = 1
+        second_payload['ui_payload']['summary']['selected_count'] = 1
+        second_payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        second_payload['ui_payload']['symbol_context'] = {'MSFT': second_payload['ui_payload']['symbol_context']['MSFT']}
+
+        watchlist_service.ingest_watchlist(db, first_payload, source='api')
+        db.add(
+            Position(
+                account_id='paper',
+                ticker='AAPL',
+                shares=10,
+                avg_entry_price=100.0,
+                current_price=101.0,
+                strategy='pullback_reclaim',
+                entry_time=datetime.now(UTC),
+                stop_loss=95.0,
+                profit_target=110.0,
+                peak_price=101.0,
+                is_open=True,
+            )
+        )
+        db.commit()
+
+        active_payload = watchlist_service.ingest_watchlist(db, second_payload, source='api')
+        managed_row = db.query(WatchlistSymbol).filter(WatchlistSymbol.symbol == 'AAPL').order_by(WatchlistSymbol.id.asc()).first()
+        assert managed_row is not None
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.watchlist_symbol_id == managed_row.id).one()
+        assert monitor_row.monitoring_status == MANAGED_ONLY
+        assert monitor_row.latest_decision_state == 'MONITOR_ONLY'
+        assert monitor_row.next_evaluation_at_utc is not None
+        assert active_payload['managedOnlySymbols'][0]['monitoring']['latestDecisionState'] == 'MONITOR_ONLY'
+
+
+def test_reconcile_to_inactive_clears_next_evaluation(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        first_payload = build_stock_payload()
+        second_payload = deepcopy(first_payload)
+        second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][1]]
+        second_payload['bot_payload']['symbols'][0]['priority_rank'] = 1
+        second_payload['ui_payload']['summary']['selected_count'] = 1
+        second_payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        second_payload['ui_payload']['symbol_context'] = {'MSFT': second_payload['ui_payload']['symbol_context']['MSFT']}
+
+        watchlist_service.ingest_watchlist(db, first_payload, source='api')
+        position = Position(
+            account_id='paper',
+            ticker='AAPL',
+            shares=10,
+            avg_entry_price=100.0,
+            current_price=101.0,
+            strategy='pullback_reclaim',
+            entry_time=datetime.now(UTC),
+            stop_loss=95.0,
+            profit_target=110.0,
+            peak_price=101.0,
+            is_open=True,
+        )
+        db.add(position)
+        db.commit()
+        watchlist_service.ingest_watchlist(db, second_payload, source='api')
+
+        position.is_open = False
+        position.shares = 0
+        db.commit()
+
+        watchlist_service.reconcile_scope_statuses(db, scope='stocks_only')
+        inactive_row = db.query(WatchlistSymbol).filter(WatchlistSymbol.symbol == 'AAPL').order_by(WatchlistSymbol.id.asc()).first()
+        assert inactive_row is not None
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.watchlist_symbol_id == inactive_row.id).one()
+        assert monitor_row.monitoring_status == INACTIVE
+        assert monitor_row.latest_decision_state == 'INACTIVE'
+        assert monitor_row.next_evaluation_at_utc is None
+
+
+def test_monitoring_endpoint_returns_active_and_managed_only_rows(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        def override_get_db():
+            db = SessionFactory()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        monkeypatch.setattr(settings, 'ADMIN_API_TOKEN', 'phase4-secret')
+
+        db = SessionFactory()
+        try:
+            first_payload = build_stock_payload()
+            second_payload = deepcopy(first_payload)
+            second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+            second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][1]]
+            second_payload['bot_payload']['symbols'][0]['priority_rank'] = 1
+            second_payload['ui_payload']['summary']['selected_count'] = 1
+            second_payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+            second_payload['ui_payload']['symbol_context'] = {'MSFT': second_payload['ui_payload']['symbol_context']['MSFT']}
+
+            watchlist_service.ingest_watchlist(db, first_payload, source='api')
+            db.add(
+                Position(
+                    account_id='paper',
+                    ticker='AAPL',
+                    shares=10,
+                    avg_entry_price=100.0,
+                    current_price=101.0,
+                    strategy='pullback_reclaim',
+                    entry_time=datetime.now(UTC),
+                    stop_loss=95.0,
+                    profit_target=110.0,
+                    peak_price=101.0,
+                    is_open=True,
+                )
+            )
+            db.commit()
+            watchlist_service.ingest_watchlist(db, second_payload, source='api')
+        finally:
+            db.close()
+
+        with TestClient(app) as client:
+            response = client.get('/api/watchlists/monitoring?scope=stocks_only')
+            assert response.status_code == 200
+            body = response.json()
+            assert body['scope'] == 'stocks_only'
+            assert body['summary']['activeCount'] == 1
+            assert body['summary']['managedOnlyCount'] == 1
+            assert len(body['rows']) == 2
+            assert body['rows'][0]['monitoring']['latestDecisionState'] in {'PENDING_EVALUATION', 'MONITOR_ONLY'}
+            assert any(row['managedOnly'] is True for row in body['rows'])
+
+        app.dependency_overrides.clear()

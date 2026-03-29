@@ -53,3 +53,15 @@ async def get_active_watchlist(
     if scope is not None and not payload:
         raise HTTPException(status_code=404, detail=f'No active watchlist found for scope {scope}.')
     return payload
+
+@router.get('/monitoring')
+async def get_watchlist_monitoring(
+    scope: Literal['stocks_only', 'crypto_only'] | None = Query(default=None),
+    include_inactive: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    payload = watchlist_service.get_monitoring_snapshot(db, scope=scope, include_inactive=include_inactive)
+    if scope is not None and not payload:
+        raise HTTPException(status_code=404, detail=f'No watchlist monitoring snapshot found for scope {scope}.')
+    return payload
+

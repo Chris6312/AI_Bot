@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.position import Position
+from app.models.watchlist_monitor_state import WatchlistMonitorState
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
@@ -57,10 +58,21 @@ ALLOWED_CRYPTO_RISK_FLAGS = {
     'low_conviction_news',
     'reversal_not_confirmed',
 }
+TIMEFRAME_INTERVAL_SECONDS = {
+    '5m': 300,
+    '15m': 900,
+    '1h': 3600,
+    '4h': 14400,
+    '1d': 86400,
+}
 WATCHLIST_SCOPE = Literal['stocks_only', 'crypto_only']
 ACTIVE = 'ACTIVE'
 MANAGED_ONLY = 'MANAGED_ONLY'
 INACTIVE = 'INACTIVE'
+PENDING_EVALUATION = 'PENDING_EVALUATION'
+MONITOR_ONLY = 'MONITOR_ONLY'
+INACTIVE_DECISION = 'INACTIVE'
+MONITORING_OFFSET_SECONDS = 20
 
 
 class WatchlistValidationError(ValueError):
@@ -268,6 +280,14 @@ def _normalize_dt(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _decision_for_status(status: str) -> tuple[str, str]:
+    if status == ACTIVE:
+        return PENDING_EVALUATION, 'Awaiting first deterministic template evaluation.'
+    if status == MANAGED_ONLY:
+        return MONITOR_ONLY, 'Symbol is no longer eligible for new entries but still has an open position to manage.'
+    return INACTIVE_DECISION, 'Symbol is inactive and no longer scheduled for evaluation.'
+
+
 class WatchlistService:
     def parse_payload(self, payload: dict[str, Any]) -> ParsedWatchlist:
         schema_version = str(payload.get('schema_version', '')).strip()
@@ -319,7 +339,7 @@ class WatchlistService:
 
         next_symbols = {symbol.symbol.upper() for symbol in parsed.bot_payload.symbols}
         self._deactivate_scope_uploads(db, parsed.scope)
-        self._reconcile_rows_before_new_upload(db, parsed.scope, next_symbols)
+        self._reconcile_rows_before_new_upload(db, parsed.scope, next_symbols, observed_at=now)
 
         upload = WatchlistUpload(
             upload_id=upload_id,
@@ -354,28 +374,34 @@ class WatchlistService:
             bot_payload_json=parsed.bot_payload.model_dump(mode='json'),
         )
         db.add(upload)
+        db.flush()
 
+        symbol_rows: list[WatchlistSymbol] = []
         for symbol in parsed.bot_payload.symbols:
-            db.add(
-                WatchlistSymbol(
-                    upload_id=upload_id,
-                    scope=parsed.scope,
-                    symbol=symbol.symbol,
-                    quote_currency=symbol.quote_currency,
-                    asset_class=symbol.asset_class,
-                    enabled=symbol.enabled,
-                    trade_direction=symbol.trade_direction,
-                    priority_rank=symbol.priority_rank,
-                    tier=symbol.tier,
-                    bias=symbol.bias,
-                    setup_template=symbol.setup_template,
-                    bot_timeframes=symbol.bot_timeframes,
-                    exit_template=symbol.exit_template,
-                    max_hold_hours=symbol.max_hold_hours,
-                    risk_flags=symbol.risk_flags,
-                    monitoring_status=ACTIVE,
-                )
+            row = WatchlistSymbol(
+                upload_id=upload_id,
+                scope=parsed.scope,
+                symbol=symbol.symbol,
+                quote_currency=symbol.quote_currency,
+                asset_class=symbol.asset_class,
+                enabled=symbol.enabled,
+                trade_direction=symbol.trade_direction,
+                priority_rank=symbol.priority_rank,
+                tier=symbol.tier,
+                bias=symbol.bias,
+                setup_template=symbol.setup_template,
+                bot_timeframes=symbol.bot_timeframes,
+                exit_template=symbol.exit_template,
+                max_hold_hours=symbol.max_hold_hours,
+                risk_flags=symbol.risk_flags,
+                monitoring_status=ACTIVE,
             )
+            db.add(row)
+            symbol_rows.append(row)
+        db.flush()
+
+        for row in symbol_rows:
+            self._upsert_monitor_state(db, row, observed_at=now)
 
         db.add(
             WatchlistUiContext(
@@ -391,6 +417,8 @@ class WatchlistService:
         return self.serialize_upload(db, upload)
 
     def reconcile_scope_statuses(self, db: Session, *, scope: WATCHLIST_SCOPE) -> dict[str, Any]:
+        observed_at = datetime.now(UTC)
+        self._backfill_missing_monitor_states(db, scope=scope, observed_at=observed_at)
         active_upload = self._get_latest_upload_row(db, scope=scope, active_only=True)
         active_symbols: set[str] = set()
         if active_upload is not None:
@@ -421,6 +449,7 @@ class WatchlistService:
             if row.monitoring_status != next_status:
                 row.monitoring_status = next_status
                 changed += 1
+            self._upsert_monitor_state(db, row, observed_at=observed_at)
 
         if changed:
             db.commit()
@@ -457,6 +486,59 @@ class WatchlistService:
             grouped[upload.scope] = self.serialize_upload(db, upload)
         return grouped
 
+    def get_monitoring_snapshot(
+        self,
+        db: Session,
+        *,
+        scope: WATCHLIST_SCOPE | None = None,
+        include_inactive: bool = False,
+    ) -> Any:
+        observed_at = datetime.now(UTC)
+        scopes: list[WATCHLIST_SCOPE] = [scope] if scope is not None else ['stocks_only', 'crypto_only']
+        result: dict[str, Any] = {}
+        for scope_value in scopes:
+            self._backfill_missing_monitor_states(db, scope=scope_value, observed_at=observed_at)
+            query = (
+                db.query(WatchlistMonitorState, WatchlistSymbol)
+                .join(WatchlistSymbol, WatchlistSymbol.id == WatchlistMonitorState.watchlist_symbol_id)
+                .filter(WatchlistMonitorState.scope == scope_value)
+            )
+            if not include_inactive:
+                query = query.filter(WatchlistMonitorState.monitoring_status.in_([ACTIVE, MANAGED_ONLY]))
+            pairs = query.order_by(
+                WatchlistMonitorState.monitoring_status.asc(),
+                WatchlistSymbol.priority_rank.asc(),
+                WatchlistSymbol.id.asc(),
+            ).all()
+            rows = [self._serialize_monitor_row(symbol_row, monitor_row) for monitor_row, symbol_row in pairs]
+            next_eval = min(
+                (row['monitoring']['nextEvaluationAtUtc'] for row in rows if row.get('monitoring') and row['monitoring']['nextEvaluationAtUtc']),
+                default=None,
+            )
+            last_eval = max(
+                (row['monitoring']['lastEvaluatedAtUtc'] for row in rows if row.get('monitoring') and row['monitoring']['lastEvaluatedAtUtc']),
+                default=None,
+            )
+            active_upload = self._get_latest_upload_row(db, scope=scope_value, active_only=True)
+            result[scope_value] = {
+                'scope': scope_value,
+                'capturedAtUtc': observed_at.isoformat(),
+                'activeUploadId': active_upload.upload_id if active_upload else None,
+                'summary': {
+                    'total': len(rows),
+                    'activeCount': sum(1 for row in rows if row['monitoringStatus'] == ACTIVE),
+                    'managedOnlyCount': sum(1 for row in rows if row['monitoringStatus'] == MANAGED_ONLY),
+                    'inactiveCount': sum(1 for row in rows if row['monitoringStatus'] == INACTIVE),
+                    'pendingEvaluationCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == PENDING_EVALUATION),
+                    'monitorOnlyCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == MONITOR_ONLY),
+                    'inactiveDecisionCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == INACTIVE_DECISION),
+                    'nextEvaluationAtUtc': next_eval,
+                    'lastEvaluatedAtUtc': last_eval,
+                },
+                'rows': rows,
+            }
+        return result[scope] if scope is not None else result
+
     def get_managed_only_rows(self, db: Session, *, scope: WATCHLIST_SCOPE) -> list[WatchlistSymbol]:
         return (
             db.query(WatchlistSymbol)
@@ -478,22 +560,35 @@ class WatchlistService:
     def serialize_upload(self, db: Session, upload: WatchlistUpload | None) -> dict[str, Any]:
         if upload is None:
             return {}
+        self._backfill_missing_monitor_states(db, scope=upload.scope, observed_at=datetime.now(UTC))
         symbols = (
             db.query(WatchlistSymbol)
             .filter(WatchlistSymbol.upload_id == upload.upload_id)
             .order_by(WatchlistSymbol.priority_rank.asc(), WatchlistSymbol.id.asc())
             .all()
         )
+        monitor_states = (
+            db.query(WatchlistMonitorState)
+            .filter(WatchlistMonitorState.watchlist_symbol_id.in_([row.id for row in symbols] or [-1]))
+            .all()
+        )
+        monitor_by_symbol_id = {row.watchlist_symbol_id: row for row in monitor_states}
         ui_context = (
             db.query(WatchlistUiContext)
             .filter(WatchlistUiContext.upload_id == upload.upload_id)
             .order_by(WatchlistUiContext.id.desc())
             .first()
         )
-        symbol_rows = [self._serialize_symbol_row(row) for row in symbols]
+        symbol_rows = [self._serialize_symbol_row(row, monitor_state=monitor_by_symbol_id.get(row.id)) for row in symbols]
         managed_only_rows = self.get_managed_only_rows(db, scope=upload.scope) if upload.is_active else []
+        managed_monitor_states = (
+            db.query(WatchlistMonitorState)
+            .filter(WatchlistMonitorState.watchlist_symbol_id.in_([row.id for row in managed_only_rows] or [-1]))
+            .all()
+        )
+        managed_monitor_by_symbol_id = {row.watchlist_symbol_id: row for row in managed_monitor_states}
         managed_only_symbols = [
-            self._serialize_symbol_row(row)
+            self._serialize_symbol_row(row, monitor_state=managed_monitor_by_symbol_id.get(row.id))
             for row in managed_only_rows
             if row.upload_id != upload.upload_id
         ]
@@ -525,6 +620,7 @@ class WatchlistService:
                 'managedOnlyCount': status_counts.get(MANAGED_ONLY, 0),
                 'inactiveCount': status_counts.get(INACTIVE, 0),
             },
+            'monitoringSummary': self.get_monitoring_snapshot(db, scope=upload.scope)['summary'],
             'uiPayload': {
                 'summary': (ui_context.summary_json if ui_context else {}),
                 'providerLimitations': (ui_context.provider_limitations_json if ui_context else []),
@@ -538,7 +634,14 @@ class WatchlistService:
             WatchlistUpload.is_active.is_(True),
         ).update({'is_active': False}, synchronize_session=False)
 
-    def _reconcile_rows_before_new_upload(self, db: Session, scope: WATCHLIST_SCOPE, next_symbols: set[str]) -> None:
+    def _reconcile_rows_before_new_upload(
+        self,
+        db: Session,
+        scope: WATCHLIST_SCOPE,
+        next_symbols: set[str],
+        *,
+        observed_at: datetime,
+    ) -> None:
         open_symbols = self._get_open_symbols(db, scope)
         candidate_rows = (
             db.query(WatchlistSymbol)
@@ -556,6 +659,7 @@ class WatchlistService:
                 row.monitoring_status = MANAGED_ONLY
             else:
                 row.monitoring_status = INACTIVE
+            self._upsert_monitor_state(db, row, observed_at=observed_at)
 
     def _get_latest_upload_row(
         self,
@@ -609,8 +713,119 @@ class WatchlistService:
             return MANAGED_ONLY
         return INACTIVE
 
+    def _backfill_missing_monitor_states(self, db: Session, *, scope: WATCHLIST_SCOPE, observed_at: datetime) -> None:
+        rows = db.query(WatchlistSymbol).filter(WatchlistSymbol.scope == scope).all()
+        changed = False
+        for row in rows:
+            if self._upsert_monitor_state(db, row, observed_at=observed_at):
+                changed = True
+        if changed:
+            db.commit()
+
+    def _upsert_monitor_state(self, db: Session, row: WatchlistSymbol, *, observed_at: datetime) -> bool:
+        monitor_state = (
+            db.query(WatchlistMonitorState)
+            .filter(WatchlistMonitorState.watchlist_symbol_id == row.id)
+            .first()
+        )
+        decision_state, decision_reason = _decision_for_status(row.monitoring_status)
+        interval_seconds = self._calculate_evaluation_interval_seconds(row.bot_timeframes or [])
+        next_evaluation_at = self._calculate_next_evaluation_at(observed_at, interval_seconds) if row.monitoring_status != INACTIVE else None
+        context = {
+            'setupTemplate': row.setup_template,
+            'exitTemplate': row.exit_template,
+            'botTimeframes': row.bot_timeframes,
+            'tradeDirection': row.trade_direction,
+            'bias': row.bias,
+            'tier': row.tier,
+            'riskFlags': row.risk_flags,
+            'maxHoldHours': row.max_hold_hours,
+        }
+        changed = False
+        if monitor_state is None:
+            monitor_state = WatchlistMonitorState(
+                watchlist_symbol_id=row.id,
+                upload_id=row.upload_id,
+                scope=row.scope,
+                symbol=row.symbol,
+                monitoring_status=row.monitoring_status,
+                latest_decision_state=decision_state,
+                latest_decision_reason=decision_reason,
+                decision_context_json=context,
+                required_timeframes_json=row.bot_timeframes,
+                evaluation_interval_seconds=interval_seconds,
+                last_decision_at_utc=observed_at,
+                last_evaluated_at_utc=None,
+                next_evaluation_at_utc=next_evaluation_at,
+                last_market_data_at_utc=None,
+            )
+            db.add(monitor_state)
+            return True
+
+        if monitor_state.monitoring_status != row.monitoring_status:
+            monitor_state.monitoring_status = row.monitoring_status
+            changed = True
+        if monitor_state.latest_decision_state != decision_state:
+            monitor_state.latest_decision_state = decision_state
+            changed = True
+        if monitor_state.latest_decision_reason != decision_reason:
+            monitor_state.latest_decision_reason = decision_reason
+            changed = True
+        if monitor_state.decision_context_json != context:
+            monitor_state.decision_context_json = context
+            changed = True
+        if monitor_state.required_timeframes_json != row.bot_timeframes:
+            monitor_state.required_timeframes_json = row.bot_timeframes
+            changed = True
+        if monitor_state.evaluation_interval_seconds != interval_seconds:
+            monitor_state.evaluation_interval_seconds = interval_seconds
+            changed = True
+        if monitor_state.next_evaluation_at_utc != next_evaluation_at:
+            monitor_state.next_evaluation_at_utc = next_evaluation_at
+            changed = True
+        if changed:
+            monitor_state.upload_id = row.upload_id
+            monitor_state.scope = row.scope
+            monitor_state.symbol = row.symbol
+            monitor_state.last_decision_at_utc = observed_at
+        return changed
+
     @staticmethod
-    def _serialize_symbol_row(row: WatchlistSymbol) -> dict[str, Any]:
+    def _calculate_evaluation_interval_seconds(timeframes: list[str]) -> int | None:
+        intervals = [TIMEFRAME_INTERVAL_SECONDS[item] for item in timeframes if item in TIMEFRAME_INTERVAL_SECONDS]
+        if not intervals:
+            return None
+        return min(intervals)
+
+    @staticmethod
+    def _calculate_next_evaluation_at(reference_time: datetime, interval_seconds: int | None) -> datetime | None:
+        if interval_seconds is None:
+            return None
+        base_time = _normalize_dt(reference_time)
+        epoch = int(base_time.timestamp())
+        next_boundary = ((epoch // interval_seconds) + 1) * interval_seconds
+        return datetime.fromtimestamp(next_boundary + MONITORING_OFFSET_SECONDS, tz=UTC)
+
+    def _serialize_monitor_row(self, row: WatchlistSymbol, monitor_state: WatchlistMonitorState | None) -> dict[str, Any]:
+        symbol_payload = self._serialize_symbol_row(row, monitor_state=monitor_state)
+        symbol_payload['managedOnly'] = row.monitoring_status == MANAGED_ONLY
+        return symbol_payload
+
+    @staticmethod
+    def _serialize_symbol_row(row: WatchlistSymbol, monitor_state: WatchlistMonitorState | None = None) -> dict[str, Any]:
+        monitoring_payload = None
+        if monitor_state is not None:
+            monitoring_payload = {
+                'latestDecisionState': monitor_state.latest_decision_state,
+                'latestDecisionReason': monitor_state.latest_decision_reason,
+                'decisionContext': monitor_state.decision_context_json or {},
+                'requiredTimeframes': monitor_state.required_timeframes_json or [],
+                'evaluationIntervalSeconds': monitor_state.evaluation_interval_seconds,
+                'lastDecisionAtUtc': monitor_state.last_decision_at_utc.isoformat() if monitor_state.last_decision_at_utc else None,
+                'lastEvaluatedAtUtc': monitor_state.last_evaluated_at_utc.isoformat() if monitor_state.last_evaluated_at_utc else None,
+                'nextEvaluationAtUtc': monitor_state.next_evaluation_at_utc.isoformat() if monitor_state.next_evaluation_at_utc else None,
+                'lastMarketDataAtUtc': monitor_state.last_market_data_at_utc.isoformat() if monitor_state.last_market_data_at_utc else None,
+            }
         return {
             'symbol': row.symbol,
             'quoteCurrency': row.quote_currency,
@@ -627,6 +842,7 @@ class WatchlistService:
             'riskFlags': row.risk_flags,
             'monitoringStatus': row.monitoring_status,
             'uploadId': row.upload_id,
+            'monitoring': monitoring_payload,
         }
 
 

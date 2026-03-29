@@ -6,3 +6,4 @@ from app.models.trade import Trade
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
+from app.models.watchlist_monitor_state import WatchlistMonitorState
