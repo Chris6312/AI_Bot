@@ -1,5 +1,6 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -31,14 +32,37 @@ class Settings(BaseSettings):
     # Discord
     DISCORD_BOT_TOKEN: str = ''
     DISCORD_TRADING_CHANNEL_ID: int = 0
-    DISCORD_WEBHOOK_URL: str = ''
     DISCORD_USER_ID: int = 0
+    # Removed: DISCORD_WEBHOOK_URL (no longer needed - AI doesn't post directly)
 
     # Database
     DATABASE_URL: str = 'sqlite:///./ai_bot.db'
     REDIS_URL: str = 'redis://localhost:6379'
 
-    # Safety
+    # ============================================
+    # GLOBAL POSITION SIZING
+    # ============================================
+    
+    # Primary sizing method (percentage or fixed)
+    POSITION_SIZE_PCT: float = 0.10              # 10% default per position
+    POSITION_SIZE_FIXED: Optional[float] = None  # None = use percentage, set dollar amount to override
+    
+    # Position limits
+    MAX_POSITIONS_PER_DECISION: int = 3          # Max trades in single screening
+    MIN_POSITION_USD: float = 1000.0             # Minimum position size
+    MAX_POSITION_PCT: float = 0.25               # Maximum position size (safety cap)
+    
+    # Asset-specific overrides (optional - if not set, uses global POSITION_SIZE_PCT)
+    STOCK_POSITION_SIZE_PCT: Optional[float] = None    # Override for stocks only
+    STOCK_MIN_POSITION_USD: Optional[float] = None     # Override min for stocks
+    
+    CRYPTO_POSITION_SIZE_PCT: Optional[float] = None   # Override for crypto only
+    CRYPTO_MIN_POSITION_USD: Optional[float] = None    # Override min for crypto
+
+    # ============================================
+    # SAFETY SETTINGS
+    # ============================================
+    
     SAFETY_MAX_TRADES_PER_DAY: int = 3
     SAFETY_MAX_POSITION_SIZE_PCT: float = 0.25
     SAFETY_MAX_DAILY_LOSS: float = 500.00
