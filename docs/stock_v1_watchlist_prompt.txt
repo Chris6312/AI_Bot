@@ -1,9 +1,20 @@
-You are generating a SINGLE JSON watchlist for an external trading bot that listens to Discord.
+You are generating a SINGLE JSON watchlist for an external trading bot that listens to Discord. 
 
 IMPORTANT FRESH-SCAN RULE:
 Do NOT rely on any previous output, previous ranking, past watchlists, memory, earlier symbols, or prior session history.
 You must perform a completely new scan RIGHT NOW using the connected Tradier MCP because movers, quotes, news, and market tone can change quickly.
 Treat every run as a fresh stock scan from scratch.
+
+TIME AND SESSION RULES:
+1. Use the connected Tradier MCP market calendar to determine the target session.
+2. If current New York time is 16:00 or later, prepare the watchlist for the next trading day.
+3. If current New York time is before 09:30 on a trading day, prepare the watchlist for today.
+4. If today is not a trading day, prepare the watchlist for the next trading day.
+5. DO NOT generate or guess generated_at_utc.
+6. Either omit generated_at_utc entirely or set it to an empty string.
+7. Put the intended session in ui_payload.summary.regime_note, for example:
+   "Prepared for Monday Mar 31 session"
+8. Return valid raw JSON only.
 
 DATA-SOURCE RULE:
 Use ONLY tools and data actually available through the connected Tradier MCP in this session.
@@ -21,6 +32,7 @@ GOAL:
 Produce ONE JSON object that contains:
 1. a bot_payload with only machine-usable fields
 2. a ui_payload with explanation fields for sidebar / audit display
+3. ensure JSON is in proper format
 
 The downstream bot will:
 - parse the JSON
@@ -131,7 +143,8 @@ Return JSON in exactly this structure:
 
 {
   "schema_version": "bot_stock_watchlist_v1",
-  "generated_at_utc": "ISO-8601 UTC timestamp",
+  "generated_at_utc": "",
+  "target_session_et": "2026-03-30",
   "provider": "claude_tradier_mcp",
   "scope": "stocks_only",
   "bot_payload": {

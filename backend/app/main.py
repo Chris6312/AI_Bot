@@ -24,6 +24,7 @@ from app.services.execution_lifecycle import execution_lifecycle
 from app.services.kraken_service import crypto_ledger
 from app.services.runtime_visibility import runtime_visibility_service
 from app.services.runtime_state import runtime_state
+from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
 from app.services.tradier_client import tradier_client
 
 
@@ -39,7 +40,14 @@ async def lifespan(app: FastAPI):
     Lifespan events for startup/shutdown
     """
     discord_task = None
+    watchlist_monitor_task = None
     from app.core.config import settings
+
+    if settings.WATCHLIST_MONITOR_ENABLED:
+        logger.info('🛰️ Starting watchlist monitoring orchestrator...')
+        watchlist_monitor_task = asyncio.create_task(watchlist_monitoring_orchestrator.run_loop())
+    else:
+        logger.info('Watchlist monitoring orchestrator startup skipped because it is disabled.')
 
     if settings.DISCORD_BOT_TOKEN:
         try:
@@ -53,6 +61,14 @@ async def lifespan(app: FastAPI):
         logger.info('Discord bot startup skipped because DISCORD_BOT_TOKEN is not configured.')
 
     yield  # Application is running
+
+    if watchlist_monitor_task is not None:
+        logger.info('Shutting down watchlist monitoring orchestrator...')
+        watchlist_monitor_task.cancel()
+        try:
+            await watchlist_monitor_task
+        except asyncio.CancelledError:
+            pass
 
     if discord_task is not None:
         logger.info('Shutting down Discord bot...')

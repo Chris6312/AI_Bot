@@ -6,7 +6,7 @@ import requests
 import json
 import logging
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 logger = logging.getLogger(__name__)

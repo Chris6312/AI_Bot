@@ -19,7 +19,15 @@ from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
 from app.services.control_plane import discord_decision_guard
-from app.services.kraken_service import crypto_ledger
+from app.services.kraken_service import crypto_ledger, kraken_service
+from app.services.tradier_client import tradier_client
+from app.services.template_evaluator import (
+    DATA_STALE,
+    ENTRY_CANDIDATE,
+    MONITOR_ONLY,
+    template_evaluation_service,
+)
+from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
 from app.services.watchlist_service import INACTIVE, MANAGED_ONLY, WatchlistValidationError, watchlist_service
 
 
@@ -621,5 +629,335 @@ def test_monitoring_endpoint_returns_active_and_managed_only_rows(tmp_path, monk
             assert len(body['rows']) == 2
             assert body['rows'][0]['monitoring']['latestDecisionState'] in {'PENDING_EVALUATION', 'MONITOR_ONLY'}
             assert any(row['managedOnly'] is True for row in body['rows'])
+
+        app.dependency_overrides.clear()
+
+
+
+def test_template_evaluator_promotes_stock_symbol_to_entry_candidate(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 101.75,
+                'prevclose': 100.0,
+                'open': 100.9,
+                'volume': 2_500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+
+        result = template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
+        snapshot = watchlist_service.get_monitoring_snapshot(db, scope='stocks_only')
+
+        assert result['summary']['entryCandidateCount'] == 1
+        assert snapshot['rows'][0]['monitoring']['latestDecisionState'] == ENTRY_CANDIDATE
+        assert snapshot['summary']['entryCandidateCount'] == 1
+
+
+def test_template_evaluator_marks_stale_stock_quote(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 101.75,
+                'prevclose': 100.0,
+                'open': 100.9,
+                'volume': 2_500_000,
+                '_fetched_at_utc': (datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
+            },
+        )
+
+        template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
+        snapshot = watchlist_service.get_monitoring_snapshot(db, scope='stocks_only')
+
+        assert snapshot['rows'][0]['monitoring']['latestDecisionState'] == DATA_STALE
+        assert snapshot['summary']['dataStaleCount'] == 1
+
+
+def test_template_evaluator_promotes_crypto_symbol_to_entry_candidate(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        now = datetime.now(UTC)
+        monkeypatch.setattr(
+            kraken_service,
+            'get_ticker',
+            lambda pair: {
+                'c': ['105.0'],
+                'a': ['105.2'],
+                'b': ['104.9'],
+                'v': ['1000', '1200'],
+                'o': ['100.0', '100.0'],
+                '_fetched_at_utc': now.isoformat(),
+            },
+        )
+        candles = []
+        base_ts = int((now - timedelta(minutes=75)).timestamp())
+        price = 100.0
+        for idx in range(6):
+            open_price = price + idx * 0.7
+            close_price = open_price + 1.2
+            candles.append({
+                'timestamp': base_ts + idx * 900,
+                'open': open_price,
+                'high': close_price + 0.2,
+                'low': open_price - 0.2,
+                'close': close_price,
+                'vwap': close_price,
+                'volume': 10 + idx,
+                'count': 1,
+            })
+        monkeypatch.setattr(kraken_service, 'get_ohlc', lambda pair, interval=15, limit=25: candles)
+
+        result = template_evaluation_service.evaluate_scope(db, scope='crypto_only', force=True)
+        snapshot = watchlist_service.get_monitoring_snapshot(db, scope='crypto_only')
+
+        assert result['summary']['entryCandidateCount'] == 1
+        assert snapshot['rows'][0]['monitoring']['latestDecisionState'] == ENTRY_CANDIDATE
+
+
+def test_template_evaluator_keeps_managed_only_rows_in_monitor_only(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        first_payload = build_stock_payload()
+        second_payload = deepcopy(first_payload)
+        second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][1]]
+        second_payload['bot_payload']['symbols'][0]['priority_rank'] = 1
+        second_payload['ui_payload']['summary']['selected_count'] = 1
+        second_payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        second_payload['ui_payload']['symbol_context'] = {'MSFT': second_payload['ui_payload']['symbol_context']['MSFT']}
+
+        watchlist_service.ingest_watchlist(db, first_payload, source='api')
+        db.add(
+            Position(
+                account_id='paper',
+                ticker='AAPL',
+                shares=10,
+                avg_entry_price=100.0,
+                current_price=101.0,
+                strategy='pullback_reclaim',
+                entry_time=datetime.now(UTC),
+                stop_loss=95.0,
+                profit_target=110.0,
+                peak_price=101.0,
+                is_open=True,
+            )
+        )
+        db.commit()
+        watchlist_service.ingest_watchlist(db, second_payload, source='api')
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 101.75,
+                'prevclose': 100.0,
+                'open': 100.9,
+                'volume': 2_500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+
+        template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
+        managed_row = next(row for row in watchlist_service.get_monitoring_snapshot(db, scope='stocks_only')['rows'] if row['symbol'] == 'AAPL')
+
+        assert managed_row['managedOnly'] is True
+        assert managed_row['monitoring']['latestDecisionState'] == MONITOR_ONLY
+
+
+def test_watchlist_evaluate_endpoint_returns_runner_summary(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 101.75,
+                'prevclose': 100.0,
+                'open': 100.9,
+                'volume': 2_500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+        monkeypatch.setattr(settings, 'ADMIN_API_TOKEN', 'phase44-token', raising=False)
+
+        def override_db():
+            try:
+                yield db
+            finally:
+                pass
+
+        app.dependency_overrides[get_db] = override_db
+        try:
+            client = TestClient(app)
+            response = client.post(
+                '/api/watchlists/evaluate?scope=stocks_only&force=true',
+                headers={'X-Admin-Token': 'phase44-token'},
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload['scope'] == 'stocks_only'
+        assert payload['summary']['entryCandidateCount'] == 1
+        assert payload['rows'][0]['latestDecisionState'] == ENTRY_CANDIDATE
+
+
+
+def test_due_run_orchestrator_evaluates_only_due_active_rows(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        first_payload = build_stock_payload()
+        second_payload = deepcopy(first_payload)
+        second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][1]]
+        second_payload['bot_payload']['symbols'][0]['priority_rank'] = 1
+        second_payload['ui_payload']['summary']['selected_count'] = 1
+        second_payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        second_payload['ui_payload']['symbol_context'] = {'MSFT': second_payload['ui_payload']['symbol_context']['MSFT']}
+
+        watchlist_service.ingest_watchlist(db, first_payload, source='api')
+        watchlist_service.ingest_watchlist(db, second_payload, source='api')
+
+        active_msft = (
+            db.query(WatchlistMonitorState)
+            .filter(WatchlistMonitorState.scope == 'stocks_only', WatchlistMonitorState.symbol == 'MSFT')
+            .order_by(WatchlistMonitorState.id.desc())
+            .first()
+        )
+        inactive_aapl = (
+            db.query(WatchlistMonitorState)
+            .filter(WatchlistMonitorState.scope == 'stocks_only', WatchlistMonitorState.symbol == 'AAPL')
+            .order_by(WatchlistMonitorState.id.asc())
+            .first()
+        )
+        assert active_msft is not None
+        assert inactive_aapl is not None
+        active_msft.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+        active_msft.latest_decision_state = 'WAITING_FOR_SETUP'
+        db.commit()
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 101.75,
+                'prevclose': 100.0,
+                'open': 100.9,
+                'volume': 2_500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+
+        result = watchlist_monitoring_orchestrator.run_due_once(db, scope='stocks_only', limit_per_scope=10)
+        db.refresh(active_msft)
+        db.refresh(inactive_aapl)
+
+        assert result['scope'] == 'stocks_only'
+        assert result['dueCountBefore'] == 1
+        assert result['evaluatedCount'] == 1
+        assert result['rows'][0]['symbol'] == 'MSFT'
+        assert result['dueCountAfter'] == 0
+        assert active_msft.last_evaluated_at_utc is not None
+        assert inactive_aapl.last_evaluated_at_utc is None
+
+
+
+def test_watchlist_orchestration_endpoint_reports_due_counts_and_runtime_state(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        def override_get_db():
+            db = SessionFactory()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        monkeypatch.setattr(settings, 'ADMIN_API_TOKEN', 'phase45-secret')
+        monkeypatch.setattr(settings, 'WATCHLIST_MONITOR_ENABLED', False)
+
+        db = SessionFactory()
+        try:
+            payload = build_stock_payload()
+            payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+            payload['ui_payload']['summary']['selected_count'] = 1
+            payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+            payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+            watchlist_service.ingest_watchlist(db, payload, source='api')
+            monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+            monitor_row.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+            db.commit()
+        finally:
+            db.close()
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 101.75,
+                'prevclose': 100.0,
+                'open': 100.9,
+                'volume': 2_500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+
+        with TestClient(app) as client:
+            status_response = client.get('/api/watchlists/orchestration?scope=stocks_only')
+            assert status_response.status_code == 200
+            status_body = status_response.json()
+            assert status_body['dueSnapshot']['dueCount'] == 1
+            assert status_body['dueSnapshot']['scope'] == 'stocks_only'
+
+            run_response = client.post(
+                '/api/watchlists/run-due?scope=stocks_only&limit_per_scope=5',
+                headers={'X-Admin-Token': 'phase45-secret'},
+            )
+            assert run_response.status_code == 200
+            run_body = run_response.json()
+            assert run_body['scope'] == 'stocks_only'
+            assert run_body['dueCountBefore'] == 1
+            assert run_body['evaluatedCount'] == 1
+            assert run_body['dueCountAfter'] == 0
 
         app.dependency_overrides.clear()

@@ -530,6 +530,12 @@ class WatchlistService:
                     'managedOnlyCount': sum(1 for row in rows if row['monitoringStatus'] == MANAGED_ONLY),
                     'inactiveCount': sum(1 for row in rows if row['monitoringStatus'] == INACTIVE),
                     'pendingEvaluationCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == PENDING_EVALUATION),
+                    'entryCandidateCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'ENTRY_CANDIDATE'),
+                    'waitingForSetupCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'WAITING_FOR_SETUP'),
+                    'dataStaleCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'DATA_STALE'),
+                    'dataUnavailableCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'DATA_UNAVAILABLE'),
+                    'biasConflictCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'BIAS_CONFLICT'),
+                    'evaluationBlockedCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'EVALUATION_BLOCKED'),
                     'monitorOnlyCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == MONITOR_ONLY),
                     'inactiveDecisionCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == INACTIVE_DECISION),
                     'nextEvaluationAtUtc': next_eval,
@@ -762,26 +768,38 @@ class WatchlistService:
             db.add(monitor_state)
             return True
 
-        if monitor_state.monitoring_status != row.monitoring_status:
+        status_changed = monitor_state.monitoring_status != row.monitoring_status
+        if status_changed:
             monitor_state.monitoring_status = row.monitoring_status
             changed = True
-        if monitor_state.latest_decision_state != decision_state:
+
+        required_timeframes_changed = monitor_state.required_timeframes_json != row.bot_timeframes
+        interval_changed = monitor_state.evaluation_interval_seconds != interval_seconds
+        should_reset_decision = status_changed or row.monitoring_status in {MANAGED_ONLY, INACTIVE}
+        if should_reset_decision and monitor_state.latest_decision_state != decision_state:
             monitor_state.latest_decision_state = decision_state
             changed = True
-        if monitor_state.latest_decision_reason != decision_reason:
+        if should_reset_decision and monitor_state.latest_decision_reason != decision_reason:
             monitor_state.latest_decision_reason = decision_reason
             changed = True
         if monitor_state.decision_context_json != context:
             monitor_state.decision_context_json = context
             changed = True
-        if monitor_state.required_timeframes_json != row.bot_timeframes:
+        if required_timeframes_changed:
             monitor_state.required_timeframes_json = row.bot_timeframes
             changed = True
-        if monitor_state.evaluation_interval_seconds != interval_seconds:
+        if interval_changed:
             monitor_state.evaluation_interval_seconds = interval_seconds
             changed = True
-        if monitor_state.next_evaluation_at_utc != next_evaluation_at:
-            monitor_state.next_evaluation_at_utc = next_evaluation_at
+
+        next_evaluation_update = monitor_state.next_evaluation_at_utc
+        if row.monitoring_status == INACTIVE:
+            next_evaluation_update = None
+        elif status_changed or required_timeframes_changed or interval_changed or monitor_state.next_evaluation_at_utc is None:
+            next_evaluation_update = next_evaluation_at
+
+        if monitor_state.next_evaluation_at_utc != next_evaluation_update:
+            monitor_state.next_evaluation_at_utc = next_evaluation_update
             changed = True
         if changed:
             monitor_state.upload_id = row.upload_id

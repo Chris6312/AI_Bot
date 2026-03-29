@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.services.control_plane import require_admin_token
+from app.services.template_evaluator import template_evaluation_service
+from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
 from app.services.watchlist_service import WatchlistValidationError, watchlist_service
 
 router = APIRouter(prefix='/watchlists', tags=['watchlists'])
@@ -65,3 +67,33 @@ async def get_watchlist_monitoring(
         raise HTTPException(status_code=404, detail=f'No watchlist monitoring snapshot found for scope {scope}.')
     return payload
 
+
+
+
+@router.get('/orchestration')
+async def get_watchlist_orchestration_status(
+    scope: Literal['stocks_only', 'crypto_only'] | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    return watchlist_monitoring_orchestrator.get_runtime_status(db, scope=scope)
+
+
+@router.post('/run-due')
+async def run_due_watchlist_monitoring(
+    scope: Literal['stocks_only', 'crypto_only'] | None = Query(default=None),
+    limit_per_scope: int = Query(default=25, ge=1, le=100),
+    _: bool = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+):
+    return watchlist_monitoring_orchestrator.run_due_once(db, scope=scope, limit_per_scope=limit_per_scope)
+
+
+@router.post('/evaluate')
+async def evaluate_watchlist_monitoring(
+    scope: Literal['stocks_only', 'crypto_only'] = Query(...),
+    limit: int = Query(default=25, ge=1, le=100),
+    force: bool = Query(default=False),
+    _: bool = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+):
+    return template_evaluation_service.evaluate_scope(db, scope=scope, limit=limit, force=force)

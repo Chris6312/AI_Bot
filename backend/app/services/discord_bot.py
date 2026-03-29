@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Dict, List, Optional
 
@@ -15,14 +16,45 @@ from app.core.config import settings
 from app.core.database import SessionLocal
 from app.services.control_plane import discord_decision_guard, get_control_plane_status, get_execution_gate_status
 from app.services.execution_lifecycle import execution_lifecycle
-from app.services.crypto_analyzer import crypto_analyzer
 from app.services.position_sizer import position_sizer
+
+try:
+    from app.services.crypto_analyzer import crypto_analyzer
+except ModuleNotFoundError as exc:
+    if exc.name != "ta":
+        raise
+    crypto_analyzer = None
+
 from app.services.runtime_state import runtime_state
 from app.services.pre_trade_gate import pre_trade_gate
 from app.services.tradier_client import TradierClient, tradier_client
 from app.services.watchlist_service import WatchlistValidationError, watchlist_service
 
 logger = logging.getLogger(__name__)
+
+
+if hasattr(commands, "command"):
+    discord_command = commands.command
+else:
+    def discord_command(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+
+def _require_crypto_analyzer():
+    if crypto_analyzer is None:
+        raise RuntimeError(
+            'Crypto analyzer dependencies are unavailable. Install backend requirements and ensure `ta` is installed.'
+        )
+    return crypto_analyzer
+
+
+@dataclass
+class DiscordPayloadEnvelope:
+    payload: Optional[Dict]
+    source_label: Optional[str] = None
+    error: Optional[str] = None
 
 
 class TradingBot(commands.Bot):
@@ -54,6 +86,32 @@ class TradingBot(commands.Bot):
         if settings.APP_ENV == 'production' and not self.daily_summary.is_running():
             self.daily_summary.start()
 
+    def _authorize_discord_message(self, message):
+        authorization = discord_decision_guard.authorize_message(message)
+        if authorization.authorized:
+            return authorization
+
+        message_channel_id = getattr(getattr(message, 'channel', None), 'id', None)
+        runtime_channel_id = self.trading_channel_id
+        if authorization.reason != 'Trading channel is not configured.':
+            return authorization
+        if not runtime_channel_id or message_channel_id != runtime_channel_id:
+            return authorization
+
+        author = getattr(message, 'author', None)
+        author_id = getattr(author, 'id', None)
+        if settings.DISCORD_USER_ID and author_id != settings.DISCORD_USER_ID:
+            return type(authorization)(False, 'Message author is not the authorized Discord user.')
+
+        allowed_roles = settings.discord_allowed_role_ids
+        if allowed_roles:
+            roles = getattr(author, 'roles', []) or []
+            role_ids = {getattr(role, 'id', 0) for role in roles}
+            if not role_ids.intersection(allowed_roles):
+                return type(authorization)(False, 'Message author is missing a required Discord role.')
+
+        return type(authorization)(True, 'accepted')
+
     async def on_message(self, message):
         if message.author == self.user:
             return
@@ -62,22 +120,25 @@ class TradingBot(commands.Bot):
 
         await self.process_commands(message)
 
-        content = message.content.strip()
-        if '{' not in content or '}' not in content:
+        if not self._message_might_contain_structured_payload(message):
             return
 
-        authorization = discord_decision_guard.authorize_message(message)
+        authorization = self._authorize_discord_message(message)
         if not authorization.authorized:
             logger.warning('Rejected Discord message before parsing: %s', authorization.reason)
             await message.add_reaction('⛔')
             await message.reply(f'Unauthorized decision message: {authorization.reason}')
             return
 
-        try:
-            json_start = content.index('{')
-            json_end = content.rindex('}') + 1
-            decision = json.loads(content[json_start:json_end])
+        envelope = await self._extract_structured_payload(message)
+        if envelope.payload is None:
+            if envelope.error:
+                await message.add_reaction('❌')
+                await message.reply(envelope.error)
+            return
 
+        try:
+            decision = envelope.payload
             if not isinstance(decision, dict):
                 await message.add_reaction('❌')
                 await message.reply('Invalid format - must be a JSON object')
@@ -92,9 +153,14 @@ class TradingBot(commands.Bot):
             payload_kind = self._classify_payload(decision)
 
             if payload_kind in {'BOT_STOCK_WATCHLIST_V1', 'BOT_WATCHLIST_V3'}:
-                logger.info('Processing %s watchlist upload from %s', payload_kind, message.author)
+                logger.info(
+                    'Processing %s watchlist upload from %s via %s',
+                    payload_kind,
+                    message.author,
+                    envelope.source_label,
+                )
                 await message.add_reaction('🧾')
-                await self._process_watchlist_upload(message, decision)
+                await self._process_watchlist_upload(message, decision, source_label=envelope.source_label)
             elif payload_kind == 'SCREENING':
                 logger.info('Processing SCREENING from %s', message.author)
                 await message.add_reaction('👀')
@@ -109,9 +175,6 @@ class TradingBot(commands.Bot):
                     f"Unknown decision type: `{payload_kind}`\n"
                     'Supported payloads: `SCREENING`, `CRYPTO_SCREENING`, `bot_stock_watchlist_v1`, `bot_watchlist_v3`'
                 )
-        except json.JSONDecodeError as exc:
-            await message.add_reaction('❌')
-            await message.reply(f'Invalid JSON format: {exc}')
         except Exception as exc:
             logger.error('Error processing message: %s', exc, exc_info=True)
             await message.add_reaction('❌')
@@ -119,7 +182,7 @@ class TradingBot(commands.Bot):
 
     async def process_user_command(self, message):
         try:
-            authorization = discord_decision_guard.authorize_message(message)
+            authorization = self._authorize_discord_message(message)
             if not authorization.authorized:
                 await message.add_reaction('⛔')
                 await message.reply(f'Unauthorized command message: {authorization.reason}')
@@ -185,7 +248,82 @@ class TradingBot(commands.Bot):
             return schema_version
         return str(payload.get('type', '')).upper().strip()
 
-    async def _process_watchlist_upload(self, message, payload: Dict):
+    def _message_might_contain_structured_payload(self, message) -> bool:
+        content = str(getattr(message, 'content', '') or '')
+        if '{' in content and '}' in content:
+            return True
+        return any(self._looks_like_json_attachment(attachment) for attachment in list(getattr(message, 'attachments', []) or []))
+
+    async def _extract_structured_payload(self, message) -> DiscordPayloadEnvelope:
+        content = str(getattr(message, 'content', '') or '').strip()
+        if '{' in content and '}' in content:
+            try:
+                json_start = content.index('{')
+                json_end = content.rindex('}') + 1
+                payload = json.loads(content[json_start:json_end])
+                return DiscordPayloadEnvelope(payload=payload, source_label='message content')
+            except json.JSONDecodeError as exc:
+                return DiscordPayloadEnvelope(
+                    payload=None,
+                    source_label='message content',
+                    error=f'Invalid JSON format: {exc}',
+                )
+
+        for attachment in list(getattr(message, 'attachments', []) or []):
+            if not self._looks_like_json_attachment(attachment):
+                continue
+            filename = getattr(attachment, 'filename', 'unknown')
+            try:
+                raw_bytes = await attachment.read()
+            except Exception as exc:
+                return DiscordPayloadEnvelope(
+                    payload=None,
+                    source_label=f'attachment:{filename}',
+                    error=f'Could not read JSON attachment `{filename}`: {exc}',
+                )
+
+            try:
+                text = raw_bytes.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                return DiscordPayloadEnvelope(
+                    payload=None,
+                    source_label=f'attachment:{filename}',
+                    error=f'JSON attachment `{filename}` must be UTF-8 encoded.',
+                )
+
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError as exc:
+                return DiscordPayloadEnvelope(
+                    payload=None,
+                    source_label=f'attachment:{filename}',
+                    error=f'Invalid JSON attachment `{filename}`: {exc}',
+                )
+
+            return DiscordPayloadEnvelope(payload=payload, source_label=f'attachment:{filename}')
+
+        return DiscordPayloadEnvelope(payload=None)
+
+    @staticmethod
+    def _looks_like_json_attachment(attachment) -> bool:
+        filename = str(getattr(attachment, 'filename', '') or '').lower()
+        content_type = str(getattr(attachment, 'content_type', '') or '').lower()
+        return (
+            filename.endswith(('.json', '.txt'))
+            or 'json' in content_type
+            or content_type.startswith('text/plain')
+        )
+
+    @staticmethod
+    def _format_watchlist_source_label(source_label: str | None) -> str:
+        if not source_label:
+            return 'Discord message'
+        if source_label.startswith('attachment:'):
+            filename = source_label.split(':', 1)[1] or 'unknown.json'
+            return f'attachment `{filename}`'
+        return source_label
+
+    async def _process_watchlist_upload(self, message, payload: Dict, *, source_label: str | None = None):
         db = SessionLocal()
         try:
             persisted = watchlist_service.ingest_watchlist(
@@ -208,9 +346,11 @@ class TradingBot(commands.Bot):
         finally:
             db.close()
 
+        source_note = self._format_watchlist_source_label(source_label)
         await message.add_reaction('✅')
         await message.reply(
             f"Accepted **{persisted['schemaVersion']}** watchlist for `{persisted['scope']}`\n"
+            f"Source: {source_note}\n"
             f"Symbols: {persisted['selectedCount']} | Regime: {persisted['marketRegime']}\n"
             f"Upload ID: `{persisted['uploadId']}` | Scan ID: `{persisted['scanId']}`"
         )
@@ -960,7 +1100,7 @@ class TradingBot(commands.Bot):
             )
         )
 
-    @commands.command(name='screen')
+    @discord_command(name='screen')
     async def crypto_screen(self, ctx):
         if ctx.author.id != settings.DISCORD_USER_ID:
             await ctx.send('❌ Unauthorized')
@@ -971,13 +1111,14 @@ class TradingBot(commands.Bot):
         await ctx.send('🔍 **Screening Kraken top 15 pairs for momentum...**')
 
         try:
-            results = crypto_analyzer.screen_for_momentum(
+            analyzer = _require_crypto_analyzer()
+            results = analyzer.screen_for_momentum(
                 min_change_24h=5.0,
                 min_volume_ratio=1.5,
                 rsi_min=50,
                 rsi_max=70,
             )
-            summary = crypto_analyzer.get_screening_summary(results)
+            summary = analyzer.get_screening_summary(results)
             await ctx.send(summary)
 
             if results:
@@ -1006,7 +1147,7 @@ class TradingBot(commands.Bot):
             logger.error('Screen command error: %s', exc, exc_info=True)
             await ctx.send(f'❌ **Error:** {exc}')
 
-    @commands.command(name='analyze')
+    @discord_command(name='analyze')
     async def crypto_analyze(self, ctx, pair: str = None):
         if ctx.author.id != settings.DISCORD_USER_ID:
             await ctx.send('❌ Unauthorized')
@@ -1021,7 +1162,7 @@ class TradingBot(commands.Bot):
         await ctx.send(f'🔍 **Analyzing {pair}...**')
 
         try:
-            analysis = crypto_analyzer.analyze_pair(pair)
+            analysis = _require_crypto_analyzer().analyze_pair(pair)
             if analysis['price'] == 0:
                 await ctx.send(f'❌ Could not fetch data for {pair}')
                 return
@@ -1062,7 +1203,7 @@ class TradingBot(commands.Bot):
             logger.error('Analyze command error: %s', exc, exc_info=True)
             await ctx.send(f'❌ **Error:** {exc}')
 
-    @commands.command(name='help')
+    @discord_command(name='help')
     async def show_help(self, ctx):
         if ctx.author.id != settings.DISCORD_USER_ID:
             return
