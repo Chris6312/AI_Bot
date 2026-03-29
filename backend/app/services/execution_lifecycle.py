@@ -121,6 +121,29 @@ class ExecutionLifecycleService:
         db.refresh(intent)
         return intent
 
+
+    def mark_rejected_by_gate(
+        self,
+        db: Session,
+        intent: OrderIntent,
+        *,
+        reason: str,
+        gate_payload: dict[str, Any] | None = None,
+    ) -> OrderIntent:
+        intent.status = 'REJECTED'
+        intent.rejection_reason = reason
+        self.record_event(
+            db,
+            intent,
+            event_type='PRE_TRADE_GATE_REJECTED',
+            status='REJECTED',
+            message=f'Pre-trade gate rejected {intent.symbol}: {reason}',
+            payload=gate_payload or {},
+        )
+        db.commit()
+        db.refresh(intent)
+        return intent
+
     def record_event(
         self,
         db: Session,

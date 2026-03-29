@@ -6,10 +6,12 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
+from app.core.database import get_db
 from app.services.control_plane import ensure_execution_armed, require_admin_token
 from app.services.kraken_service import TOP_30_PAIRS, crypto_ledger, kraken_service
-from app.services.trade_validator import trade_validator
+from app.services.pre_trade_gate import pre_trade_gate
 
 router = APIRouter(prefix="/crypto", tags=["crypto"])
 
@@ -85,7 +87,11 @@ async def get_top_pairs():
 
 
 @router.post("/trade")
-async def execute_crypto_trade(trade: CryptoTradeRequest, _: bool = Depends(require_admin_token)):
+async def execute_crypto_trade(
+    trade: CryptoTradeRequest,
+    _: bool = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+):
     """Execute a paper crypto trade"""
     try:
         ensure_execution_armed()
@@ -97,17 +103,33 @@ async def execute_crypto_trade(trade: CryptoTradeRequest, _: bool = Depends(requ
         if trade.pair not in TOP_30_PAIRS:
             raise HTTPException(status_code=400, detail=f"Invalid pair: {trade.pair}")
 
-        is_valid, validation_message = trade_validator.validate_crypto_trade(trade.pair, trade.amount)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=validation_message)
+        ledger = crypto_ledger.get_ledger()
+        gate = await pre_trade_gate.evaluate_crypto_order(
+            pair=trade.pair,
+            amount=trade.amount,
+            account={
+                'cash': ledger['balance'],
+                'buyingPower': ledger['balance'],
+                'portfolioValue': ledger.get('equity', ledger['balance']),
+            },
+            db=db,
+            execution_source='HTTP_ADMIN_CRYPTO',
+            decision_context={'requestedSide': trade_side},
+        )
+        if not gate.allowed:
+            raise HTTPException(status_code=400, detail=gate.rejection_reason)
 
         ohlcv_pair = TOP_30_PAIRS[trade.pair]
+        execution_price = trade.price or float(gate.market_data.get('currentPrice') or 0.0)
+        if execution_price <= 0:
+            raise HTTPException(status_code=400, detail='Current market price unavailable after pre-trade gate approval.')
+
         result = crypto_ledger.execute_trade(
             pair=trade.pair,
             ohlcv_pair=ohlcv_pair,
             side=trade_side,
             amount=trade.amount,
-            price=trade.price
+            price=execution_price,
         )
 
         if result.get('status') == 'REJECTED':

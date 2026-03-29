@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -92,11 +93,15 @@ class TradierClient:
         if isinstance(raw_quotes, dict):
             raw_quotes = [raw_quotes]
 
-        return {
-            str(quote.get("symbol", "")).upper(): quote
-            for quote in raw_quotes
-            if isinstance(quote, dict) and quote.get("symbol")
-        }
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        normalized_quotes: dict[str, dict[str, Any]] = {}
+        for quote in raw_quotes:
+            if not isinstance(quote, dict) or not quote.get('symbol'):
+                continue
+            enriched = dict(quote)
+            enriched.setdefault('_fetched_at_utc', fetched_at)
+            normalized_quotes[str(quote.get('symbol', '')).upper()] = enriched
+        return normalized_quotes
 
     async def get_quotes_async(self, symbols: list[str], mode: str | None = None) -> dict[str, dict[str, Any]]:
         loop = asyncio.get_running_loop()

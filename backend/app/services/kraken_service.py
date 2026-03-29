@@ -80,12 +80,16 @@ class KrakenAPIService:
         result = self._api_call('Ticker', {'pair': pair})
         
         if result and pair in result:
-            return result[pair]
+            ticker = dict(result[pair])
+            ticker.setdefault('_fetched_at_utc', datetime.now(timezone.utc).isoformat())
+            return ticker
         
         # Try alternative pair name
         for alt_pair in result.keys() if result else []:
             if pair in alt_pair or alt_pair in pair:
-                return result[alt_pair]
+                ticker = dict(result[alt_pair])
+                ticker.setdefault('_fetched_at_utc', datetime.now(timezone.utc).isoformat())
+                return ticker
         
         return None
     

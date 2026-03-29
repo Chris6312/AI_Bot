@@ -18,8 +18,7 @@ from app.services.execution_lifecycle import execution_lifecycle
 from app.services.crypto_analyzer import crypto_analyzer
 from app.services.position_sizer import position_sizer
 from app.services.runtime_state import runtime_state
-from app.services.safety_validator import SafetyValidator
-from app.services.trade_validator import trade_validator
+from app.services.pre_trade_gate import pre_trade_gate
 from app.services.tradier_client import TradierClient, tradier_client
 
 logger = logging.getLogger(__name__)
@@ -36,7 +35,6 @@ class TradingBot(commands.Bot):
 
         self.trading_channel_id = settings.DISCORD_TRADING_CHANNEL_ID
         self.tradier = TradierClient()
-        self.safety = SafetyValidator()
         self.executions: dict[str, list[dict]] = {}
 
     async def on_ready(self):
@@ -216,87 +214,35 @@ class TradingBot(commands.Bot):
                 await message.reply('❌ No valid positions after safety checks')
                 return
 
-            validation_results = []
-            valid_positions = []
-
-            for pos in positions:
-                ticker = pos['ticker']
-                shares = int(pos.get('shares') or 0)
-                is_valid, validation_msg = trade_validator.validate_stock_trade(ticker, shares, mode)
-
-                validation_results.append(
-                    {
-                        'ticker': ticker,
-                        'valid': is_valid,
-                        'reason': validation_msg,
-                    }
-                )
-
-                if is_valid:
-                    valid_positions.append(pos)
-                else:
-                    logger.warning('Stock validation failed for %s: %s', ticker, validation_msg)
-
-            if not valid_positions:
-                rejection_msg = '❌ **All stock trades failed validation:**\n\n'
-                for result in validation_results:
-                    rejection_msg += f"• **{result['ticker']}**: {result['reason']}\n"
-
-                await message.add_reaction('⛔')
-                await message.reply(rejection_msg)
-                return
-
-            if len(valid_positions) < len(positions):
-                warning_msg = '⚠️ **Some stock trades rejected by validation:**\n\n'
-                for result in validation_results:
-                    if not result['valid']:
-                        warning_msg += f"• **{result['ticker']}**: {result['reason']}\n"
-
-                warning_msg += f"\n**Proceeding with {len(valid_positions)} valid trade(s)**"
-                await message.reply(warning_msg)
-
             db = SessionLocal()
             try:
-                safety_candidates = []
-                for pos in valid_positions:
-                    ticker = str(pos.get('ticker', '')).upper()
-                    shares = int(pos.get('shares') or 0)
-                    estimated_value = float(pos.get('estimated_value') or (prices.get(ticker, 0.0) * shares))
-                    safety_candidates.append({
-                        'ticker': ticker,
-                        'shares': shares,
-                        'estimated_value': estimated_value,
-                    })
-
-                safety_result = await self.safety.validate(
-                    {
-                        'candidates': safety_candidates,
-                        'vix': decision_data.get('vix', 0),
-                    },
-                    account,
-                    db,
-                    account_id=str(account.get('accountId') or settings.TRADIER_ACCOUNT_ID or 'TRADIER'),
-                    asset_class='stock',
-                )
-                if not safety_result.get('safe'):
-                    await message.add_reaction('⛔')
-                    await message.reply(f"❌ Safety gate rejected stock decision: {safety_result.get('reason', 'Unknown reason')}")
-                    return
-
                 await message.add_reaction('⚡')
-                result = await self._execute_stock_positions(valid_positions, mode, db)
+                result = await self._execute_stock_positions(
+                    positions,
+                    mode,
+                    db,
+                    account=account,
+                    decision_data=decision_data,
+                )
 
                 if not result:
                     await message.add_reaction('⛔')
-                    await message.reply('❌ No stock orders were submitted')
+                    await message.reply('❌ No stock orders were evaluated')
                     return
 
-                confirmed_fills = [trade for trade in result if int(trade.get('filled_shares') or 0) > 0]
+                accepted_orders = [trade for trade in result if str(trade.get('status') or '').upper() != 'REJECTED']
+                if not accepted_orders:
+                    formatted = self._format_stock_result(result)
+                    await message.add_reaction('⛔')
+                    await message.reply(f"❌ **Pre-trade gate rejected all stock orders**\n{formatted}")
+                    return
+
+                confirmed_fills = [trade for trade in accepted_orders if int(trade.get('filled_shares') or 0) > 0]
                 if not confirmed_fills:
                     await message.add_reaction('⏳')
 
                 execution_id = f"exec_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-                self.executions[execution_id] = result
+                self.executions[execution_id] = accepted_orders
 
                 formatted = self._format_stock_result(result)
                 reply = await message.reply(
@@ -307,7 +253,7 @@ class TradingBot(commands.Bot):
                 )
 
                 await reply.add_reaction('❌')
-                await self._handle_cancellation_window(reply, execution_id, result, trade_type='stock', mode=mode)
+                await self._handle_cancellation_window(reply, execution_id, accepted_orders, trade_type='stock', mode=mode)
             finally:
                 db.close()
 
@@ -324,7 +270,7 @@ class TradingBot(commands.Bot):
                 await message.reply(f'Execution blocked ({gate.state}): {gate.reason}')
                 return
 
-            from app.services.kraken_service import TOP_30_PAIRS, crypto_ledger, kraken_service
+            from app.services.kraken_service import crypto_ledger
 
             candidates = decision_data.get('candidates', [])
             valid, reason = position_sizer.validate_candidate_count(candidates)
@@ -339,13 +285,8 @@ class TradingBot(commands.Bot):
             prices = {}
             for candidate in candidates:
                 pair = candidate.get('pair')
-                ohlcv_pair = TOP_30_PAIRS.get(pair)
-                if not pair or not ohlcv_pair:
-                    continue
-
-                ticker = kraken_service.get_ticker(ohlcv_pair)
-                if ticker and 'c' in ticker:
-                    prices[pair] = float(ticker['c'][0])
+                if pair and candidate.get('price'):
+                    prices[pair] = float(candidate['price'])
 
             positions = position_sizer.calculate_crypto_positions(candidates, balance, prices=prices)
             positions = [position for position in positions if float(position.get('amount') or 0) > 0]
@@ -355,89 +296,27 @@ class TradingBot(commands.Bot):
                 await message.reply('❌ No valid positions after safety checks')
                 return
 
-            validation_results = []
-            valid_positions = []
-
-            for pos in positions:
-                pair = pos['pair']
-                amount = float(pos.get('amount') or 0)
-                is_valid, validation_msg = trade_validator.validate_crypto_trade(pair, amount)
-
-                validation_results.append(
-                    {
-                        'pair': pair,
-                        'valid': is_valid,
-                        'reason': validation_msg,
-                    }
-                )
-
-                if is_valid:
-                    valid_positions.append(pos)
-                else:
-                    logger.warning('Validation failed for %s: %s', pair, validation_msg)
-
-            if not valid_positions:
-                rejection_msg = '❌ **All trades failed validation:**\n\n'
-                for result in validation_results:
-                    rejection_msg += f"• **{result['pair']}**: {result['reason']}\n"
-
-                await message.add_reaction('⛔')
-                await message.reply(rejection_msg)
-                return
-
-            if len(valid_positions) < len(positions):
-                warning_msg = '⚠️ **Some trades rejected by validation:**\n\n'
-                for result in validation_results:
-                    if not result['valid']:
-                        warning_msg += f"• **{result['pair']}**: {result['reason']}\n"
-
-                warning_msg += f"\n**Proceeding with {len(valid_positions)} valid trade(s)**"
-                await message.reply(warning_msg)
-
             db = SessionLocal()
             try:
-                safety_candidates = []
-                for pos in valid_positions:
-                    pair = str(pos.get('pair', ''))
-                    amount = float(pos.get('amount') or 0)
-                    estimated_value = float(pos.get('estimated_value') or (prices.get(pair, 0.0) * amount))
-                    safety_candidates.append({
-                        'pair': pair,
-                        'amount': amount,
-                        'estimated_value': estimated_value,
-                    })
-
-                safety_result = await self.safety.validate(
-                    {
-                        'candidates': safety_candidates,
-                        'vix': decision_data.get('vix', 0),
-                    },
-                    {
-                        'cash': balance,
-                        'buyingPower': balance,
-                        'portfolioValue': ledger.get('equity', balance),
-                    },
-                    db,
-                    account_id='CRYPTO_PAPER',
-                    asset_class='crypto',
-                )
-                if not safety_result.get('safe'):
-                    await message.add_reaction('⛔')
-                    await message.reply(f"❌ Safety gate rejected crypto decision: {safety_result.get('reason', 'Unknown reason')}")
-                    return
+                await message.add_reaction('⚡')
+                result = await self._execute_crypto_positions(positions, db=db, decision_data=decision_data)
             finally:
                 db.close()
 
-            await message.add_reaction('⚡')
-            result = await self._execute_crypto_positions(valid_positions)
-
             if not result:
                 await message.add_reaction('⛔')
-                await message.reply('❌ No crypto orders were executed')
+                await message.reply('❌ No crypto orders were evaluated')
+                return
+
+            executed_trades = [trade for trade in result if str(trade.get('status') or '').upper() == 'FILLED']
+            if not executed_trades:
+                formatted = self._format_crypto_result(result)
+                await message.add_reaction('⛔')
+                await message.reply(f"❌ **Pre-trade gate rejected all crypto trades**\n{formatted}")
                 return
 
             execution_id = f"exec_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-            self.executions[execution_id] = result
+            self.executions[execution_id] = executed_trades
 
             formatted = self._format_crypto_result(result)
             remaining_balance = crypto_ledger.get_ledger()['balance']
@@ -450,7 +329,7 @@ class TradingBot(commands.Bot):
             )
 
             await reply.add_reaction('❌')
-            await self._handle_cancellation_window(reply, execution_id, result, trade_type='crypto')
+            await self._handle_cancellation_window(reply, execution_id, executed_trades, trade_type='crypto')
 
         except Exception as exc:
             logger.error('Error processing crypto decision: %s', exc, exc_info=True)
@@ -473,27 +352,88 @@ class TradingBot(commands.Bot):
 
         return prices
 
-    async def _execute_stock_positions(self, positions: List[Dict], mode: str, db) -> List[Dict]:
+    async def _execute_stock_positions(
+        self,
+        positions: List[Dict],
+        mode: str,
+        db,
+        *,
+        account: Dict,
+        decision_data: Dict | None = None,
+    ) -> List[Dict]:
         results = []
         account_id = self.tradier.get_account_snapshot(mode).get('accountId') or self.tradier._credentials_for_mode(mode)['account_id']
 
         for pos in positions:
-            gate = get_execution_gate_status()
-            if not gate.allowed:
-                logger.warning('Stock execution loop stopped because control plane is %s: %s', gate.state, gate.reason)
-                break
-
-            ticker = pos['ticker']
-            quote = await self.tradier.get_quote_async(ticker, mode=mode)
-            current_price = float(quote.get('last') or quote.get('close') or 0)
+            gate = await pre_trade_gate.evaluate_stock_order(
+                ticker=str(pos.get('ticker') or '').upper(),
+                shares=int(pos.get('shares') or 0),
+                mode=mode,
+                account=account,
+                db=db,
+                execution_source='DISCORD_SCREENING',
+                decision_context=decision_data or {},
+            )
+            ticker = str(pos.get('ticker') or '').upper()
             shares = int(pos.get('shares') or 0)
+            gate_payload = gate.to_dict()
+            current_price = float(gate.market_data.get('currentPrice') or 0.0)
+
+            if not gate.allowed:
+                reject_intent = execution_lifecycle.create_order_intent(
+                    db,
+                    account_id=str(account_id),
+                    asset_class='stock',
+                    symbol=ticker,
+                    side='BUY',
+                    requested_quantity=shares,
+                    requested_price=current_price or None,
+                    execution_source='DISCORD_SCREENING',
+                    context={
+                        'mode': mode,
+                        'positionPct': pos.get('position_pct'),
+                        'estimatedValue': pos.get('estimated_value'),
+                        'gate': gate_payload,
+                    },
+                )
+                execution_lifecycle.mark_rejected_by_gate(
+                    db,
+                    reject_intent,
+                    reason=gate.rejection_reason or 'Pre-trade gate rejected the order.',
+                    gate_payload=gate_payload,
+                )
+                results.append(
+                    {
+                        'ticker': ticker,
+                        'requested_shares': shares,
+                        'filled_shares': 0,
+                        'entry_price': current_price or None,
+                        'value': 0.0,
+                        'position_pct': pos.get('position_pct'),
+                        'order_id': None,
+                        'intent_id': reject_intent.intent_id,
+                        'status': 'REJECTED',
+                        'reason': gate.rejection_reason,
+                    }
+                )
+                continue
 
             if current_price <= 0:
                 logger.error('%s: Could not get price, skipping', ticker)
-                continue
-
-            if shares <= 0:
-                logger.warning('%s: Calculated 0 shares, skipping', ticker)
+                results.append(
+                    {
+                        'ticker': ticker,
+                        'requested_shares': shares,
+                        'filled_shares': 0,
+                        'entry_price': None,
+                        'value': 0.0,
+                        'position_pct': pos.get('position_pct'),
+                        'order_id': None,
+                        'intent_id': None,
+                        'status': 'REJECTED',
+                        'reason': 'Current price unavailable after gate approval.',
+                    }
+                )
                 continue
 
             intent = execution_lifecycle.create_order_intent(
@@ -509,6 +449,7 @@ class TradingBot(commands.Bot):
                     'mode': mode,
                     'positionPct': pos.get('position_pct'),
                     'estimatedValue': pos.get('estimated_value'),
+                    'gate': gate_payload,
                 },
             )
 
@@ -528,7 +469,7 @@ class TradingBot(commands.Bot):
                     event_type='ORDER_SUBMISSION_FAILED',
                     status='REJECTED',
                     message=f'Order submission failed for {ticker}: {exc}',
-                    payload={'error': str(exc)},
+                    payload={'error': str(exc), 'gate': gate_payload},
                 )
                 intent.status = 'REJECTED'
                 intent.rejection_reason = str(exc)
@@ -600,53 +541,90 @@ class TradingBot(commands.Bot):
 
         return snapshot
 
-    async def _execute_crypto_positions(self, positions: List[Dict]) -> List[Dict]:
-        from app.services.kraken_service import TOP_30_PAIRS, crypto_ledger, kraken_service
+    async def _execute_crypto_positions(self, positions: List[Dict], *, db, decision_data: Dict | None = None) -> List[Dict]:
+        from app.services.kraken_service import TOP_30_PAIRS, crypto_ledger
 
         results = []
+        ledger = crypto_ledger.get_ledger()
+        account = {
+            'cash': ledger['balance'],
+            'buyingPower': ledger['balance'],
+            'portfolioValue': ledger.get('equity', ledger['balance']),
+        }
 
         for pos in positions:
-            gate = get_execution_gate_status()
-            if not gate.allowed:
-                logger.warning('Crypto execution loop stopped because control plane is %s: %s', gate.state, gate.reason)
-                break
+            pair = str(pos.get('pair') or '')
+            amount = float(pos.get('amount') or 0)
+            gate = await pre_trade_gate.evaluate_crypto_order(
+                pair=pair,
+                amount=amount,
+                account=account,
+                db=db,
+                execution_source='DISCORD_SCREENING',
+                decision_context=decision_data or {},
+            )
 
-            pair = pos['pair']
-            ohlcv_pair = TOP_30_PAIRS.get(pair)
-            if not ohlcv_pair:
-                logger.error('Unknown pair: %s', pair)
+            if not gate.allowed:
+                results.append(
+                    {
+                        'pair': pair,
+                        'amount': amount,
+                        'price': float(gate.market_data.get('currentPrice') or 0),
+                        'value': 0.0,
+                        'position_pct': pos.get('position_pct'),
+                        'status': 'REJECTED',
+                        'reason': gate.rejection_reason,
+                    }
+                )
                 continue
 
-            if pos.get('amount') is None:
-                ticker = kraken_service.get_ticker(ohlcv_pair)
-                if not ticker or 'c' not in ticker:
-                    logger.error('%s: Could not get price, skipping', pair)
-                    continue
-
-                current_price = float(ticker['c'][0])
-                crypto_amount = pos['estimated_value'] / current_price
-            else:
-                crypto_amount = float(pos['amount'])
-                ticker = kraken_service.get_ticker(ohlcv_pair)
-                current_price = float(ticker['c'][0]) if ticker and 'c' in ticker else 0.0
+            ohlcv_pair = TOP_30_PAIRS.get(pair)
+            current_price = float(gate.market_data.get('currentPrice') or 0.0)
+            if not ohlcv_pair or current_price <= 0:
+                results.append(
+                    {
+                        'pair': pair,
+                        'amount': amount,
+                        'price': 0.0,
+                        'value': 0.0,
+                        'position_pct': pos.get('position_pct'),
+                        'status': 'REJECTED',
+                        'reason': 'Current market price unavailable after gate approval.',
+                    }
+                )
+                continue
 
             trade = crypto_ledger.execute_trade(
                 pair=pair,
                 ohlcv_pair=ohlcv_pair,
                 side='BUY',
-                amount=crypto_amount,
-                price=current_price if current_price > 0 else None,
+                amount=amount,
+                price=current_price,
             )
 
             if trade.get('status') == 'FILLED':
                 results.append(
                     {
                         'pair': pair,
-                        'amount': crypto_amount,
+                        'amount': amount,
                         'price': float(trade.get('price', current_price) or 0),
                         'value': float(trade.get('total', pos.get('estimated_value') or 0) or 0),
                         'position_pct': pos.get('position_pct'),
                         'trade_id': trade.get('id'),
+                        'status': 'FILLED',
+                        'reason': '',
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        'pair': pair,
+                        'amount': amount,
+                        'price': current_price,
+                        'value': 0.0,
+                        'position_pct': pos.get('position_pct'),
+                        'status': str(trade.get('status') or 'REJECTED').upper(),
+                        'reason': trade.get('reason', 'Trade rejected'),
                     }
                 )
 
@@ -717,11 +695,19 @@ class TradingBot(commands.Bot):
 
         for trade in result:
             pct_str = f", {trade['position_pct'] * 100:.0f}%" if trade.get('position_pct') else ''
-            lines.append(
-                f"• **{trade['pair']}**: {trade['amount']:.4f} @ ${trade['price']:.2f} "
-                f"(${trade['value']:,.2f}{pct_str})"
-            )
-            total_value += trade['value']
+            status = str(trade.get('status') or 'UNKNOWN').upper()
+            reason = trade.get('reason')
+            if status == 'FILLED':
+                lines.append(
+                    f"• **{trade['pair']}**: {trade['amount']:.4f} @ ${float(trade.get('price') or 0):.2f} "
+                    f"(${float(trade.get('value') or 0):,.2f}{pct_str}) [{status}]"
+                )
+                total_value += float(trade.get('value') or 0)
+            else:
+                suffix = f" - {reason}" if reason else ''
+                lines.append(
+                    f"• **{trade['pair']}**: {trade['amount']:.4f} [{status}]{suffix}"
+                )
 
         summary = '\n'.join(lines)
         if total_value > 0:
