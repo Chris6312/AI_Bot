@@ -2,11 +2,14 @@
 Crypto API Router
 Handles all crypto-related endpoints (Kraken integration)
 """
-from fastapi import APIRouter, HTTPException, Query
-from typing import List, Optional
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from app.services.kraken_service import crypto_ledger, kraken_service, TOP_30_PAIRS
+from app.services.control_plane import ensure_execution_armed, require_admin_token
+from app.services.kraken_service import TOP_30_PAIRS, crypto_ledger, kraken_service
+from app.services.trade_validator import trade_validator
 
 router = APIRouter(prefix="/crypto", tags=["crypto"])
 
@@ -82,29 +85,36 @@ async def get_top_pairs():
 
 
 @router.post("/trade")
-async def execute_crypto_trade(trade: CryptoTradeRequest):
+async def execute_crypto_trade(trade: CryptoTradeRequest, _: bool = Depends(require_admin_token)):
     """Execute a paper crypto trade"""
     try:
-        # Validate pair
+        ensure_execution_armed()
+
+        trade_side = trade.side.upper().strip()
+        if trade_side not in {'BUY', 'SELL'}:
+            raise HTTPException(status_code=400, detail=f'Invalid side: {trade.side}')
+
         if trade.pair not in TOP_30_PAIRS:
             raise HTTPException(status_code=400, detail=f"Invalid pair: {trade.pair}")
-        
+
+        is_valid, validation_message = trade_validator.validate_crypto_trade(trade.pair, trade.amount)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=validation_message)
+
         ohlcv_pair = TOP_30_PAIRS[trade.pair]
-        
-        # Execute trade
         result = crypto_ledger.execute_trade(
             pair=trade.pair,
             ohlcv_pair=ohlcv_pair,
-            side=trade.side,
+            side=trade_side,
             amount=trade.amount,
             price=trade.price
         )
-        
+
         if result.get('status') == 'REJECTED':
             raise HTTPException(status_code=400, detail=result.get('reason'))
-        
+
         return result
-        
+
     except HTTPException:
         raise
     except Exception as e:

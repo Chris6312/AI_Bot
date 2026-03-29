@@ -11,17 +11,16 @@ from datetime import datetime, time, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.routers import crypto
+from app.services.control_plane import get_control_plane_status, require_admin_token
 from app.services.kraken_service import crypto_ledger
 from app.services.runtime_state import runtime_state
 from app.services.tradier_client import tradier_client
 
-# Import Discord bot
-from app.services.discord_bot import start_discord_bot
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,26 +33,36 @@ async def lifespan(app: FastAPI):
     """
     Lifespan events for startup/shutdown
     """
-    # Startup: Start Discord bot
-    logger.info("🤖 Starting Discord bot...")
-    discord_task = asyncio.create_task(start_discord_bot())
-    
+    discord_task = None
+    from app.core.config import settings
+
+    if settings.DISCORD_BOT_TOKEN:
+        try:
+            from app.services.discord_bot import start_discord_bot
+        except ModuleNotFoundError as exc:
+            logger.warning('Discord bot startup skipped because dependency import failed: %s', exc)
+        else:
+            logger.info('🤖 Starting Discord bot...')
+            discord_task = asyncio.create_task(start_discord_bot())
+    else:
+        logger.info('Discord bot startup skipped because DISCORD_BOT_TOKEN is not configured.')
+
     yield  # Application is running
-    
-    # Shutdown: Cancel Discord bot
-    logger.info("Shutting down Discord bot...")
-    discord_task.cancel()
-    try:
-        await discord_task
-    except asyncio.CancelledError:
-        pass
+
+    if discord_task is not None:
+        logger.info('Shutting down Discord bot...')
+        discord_task.cancel()
+        try:
+            await discord_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
     title='AI Trading Bot API',
     description='Stock (Tradier) and Crypto (Kraken) AI Trading System',
     version='3.0.0',
-    lifespan=lifespan,  # Add lifespan manager
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -90,9 +99,26 @@ async def health():
     return {'status': 'healthy'}
 
 
+@app.get('/ready')
+async def ready():
+    control_plane = get_control_plane_status()
+    return {
+        'status': 'ready' if control_plane['authorizationReady'] else 'degraded',
+        'controlPlane': control_plane,
+        'stockCapabilities': {
+            'paperReady': tradier_client.is_ready('PAPER'),
+            'liveReady': tradier_client.is_ready('LIVE'),
+        },
+        'cryptoCapabilities': {
+            'paperReady': True,
+            'liveReady': False,
+        },
+    }
+
+
 @app.get('/api/status')
 async def get_status():
-    state = runtime_state.touch()
+    state = runtime_state.get()
     return {
         'running': state.running,
         'mode': state.stock_mode,
@@ -108,17 +134,23 @@ async def get_status():
             'paperReady': True,
             'liveReady': False,
         },
+        'controlPlane': get_control_plane_status(),
     }
 
 
+@app.get('/api/control-state')
+async def get_control_state():
+    return get_control_plane_status()
+
+
 @app.post('/api/control/toggle')
-async def toggle_bot(request: ToggleRequest):
+async def toggle_bot(request: ToggleRequest, _: bool = Depends(require_admin_token)):
     state = runtime_state.set_running(request.enabled)
     return {'success': True, 'running': state.running, 'lastHeartbeat': state.last_heartbeat}
 
 
 @app.post('/api/control/stock-mode')
-async def set_stock_mode(request: StockModeRequest):
+async def set_stock_mode(request: StockModeRequest, _: bool = Depends(require_admin_token)):
     try:
         state = runtime_state.set_stock_mode(request.mode)
     except ValueError as exc:
@@ -127,7 +159,7 @@ async def set_stock_mode(request: StockModeRequest):
 
 
 @app.post('/api/control/safety-override')
-async def toggle_safety(request: ToggleRequest):
+async def toggle_safety(request: ToggleRequest, _: bool = Depends(require_admin_token)):
     state = runtime_state.set_safety_require_market_hours(request.enabled)
     return {
         'success': True,

@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     APP_ENV: str = 'development'
     SECRET_KEY: str = 'change-this-secret'
     LOG_LEVEL: str = 'INFO'
+    ADMIN_API_TOKEN: str = ''
 
     # Tradier legacy fallback
     TRADIER_API_KEY: str = ''
@@ -33,6 +34,9 @@ class Settings(BaseSettings):
     DISCORD_BOT_TOKEN: str = ''
     DISCORD_TRADING_CHANNEL_ID: int = 0
     DISCORD_USER_ID: int = 0
+    DISCORD_ALLOWED_ROLE_IDS: str = ''
+    DISCORD_DECISION_MAX_AGE_SECONDS: int = 900
+    DISCORD_REQUIRE_DECISION_TIMESTAMP: bool = True
     # Removed: DISCORD_WEBHOOK_URL (no longer needed - AI doesn't post directly)
 
     # Database
@@ -42,27 +46,27 @@ class Settings(BaseSettings):
     # ============================================
     # GLOBAL POSITION SIZING
     # ============================================
-    
+
     # Primary sizing method (percentage or fixed)
     POSITION_SIZE_PCT: float = 0.10              # 10% default per position
     POSITION_SIZE_FIXED: Optional[float] = None  # None = use percentage, set dollar amount to override
-    
+
     # Position limits
     MAX_POSITIONS_PER_DECISION: int = 3          # Max trades in single screening
     MIN_POSITION_USD: float = 1000.0             # Minimum position size
     MAX_POSITION_PCT: float = 0.25               # Maximum position size (safety cap)
-    
+
     # Asset-specific overrides (optional - if not set, uses global POSITION_SIZE_PCT)
     STOCK_POSITION_SIZE_PCT: Optional[float] = None    # Override for stocks only
     STOCK_MIN_POSITION_USD: Optional[float] = None     # Override min for stocks
-    
+
     CRYPTO_POSITION_SIZE_PCT: Optional[float] = None   # Override for crypto only
     CRYPTO_MIN_POSITION_USD: Optional[float] = None    # Override min for crypto
 
     # ============================================
     # SAFETY SETTINGS
     # ============================================
-    
+
     SAFETY_MAX_TRADES_PER_DAY: int = 3
     SAFETY_MAX_POSITION_SIZE_PCT: float = 0.25
     SAFETY_MAX_DAILY_LOSS: float = 500.00
@@ -91,6 +95,23 @@ class Settings(BaseSettings):
     @property
     def backup_root_path(self) -> Path:
         return Path(self.BACKUP_ROOT_DIR).resolve()
+
+    @property
+    def discord_allowed_role_ids(self) -> set[int]:
+        values: set[int] = set()
+        for part in self.DISCORD_ALLOWED_ROLE_IDS.split(','):
+            candidate = part.strip()
+            if not candidate:
+                continue
+            try:
+                values.add(int(candidate))
+            except ValueError:
+                continue
+        return values
+
+    @property
+    def admin_api_ready(self) -> bool:
+        return bool(self.ADMIN_API_TOKEN.strip())
 
     def paper_tradier_credentials(self) -> dict[str, str]:
         api_key = self.TRADIER_PAPER_API_KEY or self.TRADIER_API_KEY
