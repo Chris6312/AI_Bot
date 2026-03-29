@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app.routers import crypto
+from app.routers import crypto, watchlists
 from app.core.database import get_db
 from app.models.order_intent import OrderIntent
 from app.services.control_plane import get_control_plane_status, require_admin_token
@@ -79,6 +79,7 @@ app.add_middleware(
 )
 
 app.include_router(crypto.router, prefix='/api')
+app.include_router(watchlists.router, prefix='/api')
 
 
 class ToggleRequest(BaseModel):

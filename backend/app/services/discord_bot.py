@@ -20,6 +20,7 @@ from app.services.position_sizer import position_sizer
 from app.services.runtime_state import runtime_state
 from app.services.pre_trade_gate import pre_trade_gate
 from app.services.tradier_client import TradierClient, tradier_client
+from app.services.watchlist_service import WatchlistValidationError, watchlist_service
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +73,6 @@ class TradingBot(commands.Bot):
             await message.reply(f'Unauthorized decision message: {authorization.reason}')
             return
 
-        gate = get_execution_gate_status()
-        if not gate.allowed:
-            await message.add_reaction('🛑')
-            await message.reply(f'Execution blocked ({gate.state}): {gate.reason}')
-            return
-
         try:
             json_start = content.index('{')
             json_end = content.rindex('}') + 1
@@ -94,21 +89,25 @@ class TradingBot(commands.Bot):
                 await message.reply(reason)
                 return
 
-            decision_type = str(decision.get('type', '')).upper()
+            payload_kind = self._classify_payload(decision)
 
-            if decision_type == 'SCREENING':
+            if payload_kind in {'BOT_STOCK_WATCHLIST_V1', 'BOT_WATCHLIST_V3'}:
+                logger.info('Processing %s watchlist upload from %s', payload_kind, message.author)
+                await message.add_reaction('🧾')
+                await self._process_watchlist_upload(message, decision)
+            elif payload_kind == 'SCREENING':
                 logger.info('Processing SCREENING from %s', message.author)
                 await message.add_reaction('👀')
                 await self._process_stock_decision(message, decision)
-            elif decision_type == 'CRYPTO_SCREENING':
+            elif payload_kind == 'CRYPTO_SCREENING':
                 logger.info('Processing CRYPTO_SCREENING from %s', message.author)
                 await message.add_reaction('👀')
                 await self._process_crypto_decision(message, decision)
             else:
                 await message.add_reaction('❓')
                 await message.reply(
-                    f"Unknown decision type: `{decision_type}`\n"
-                    'Supported types: `SCREENING` (stocks), `CRYPTO_SCREENING` (crypto)'
+                    f"Unknown decision type: `{payload_kind}`\n"
+                    'Supported payloads: `SCREENING`, `CRYPTO_SCREENING`, `bot_stock_watchlist_v1`, `bot_watchlist_v3`'
                 )
         except json.JSONDecodeError as exc:
             await message.add_reaction('❌')
@@ -178,6 +177,43 @@ class TradingBot(commands.Bot):
             logger.error('Error processing AI decision: %s', exc, exc_info=True)
             await message.add_reaction('❌')
             await message.reply(f'**Error:** {str(exc)}')
+
+    @staticmethod
+    def _classify_payload(payload: Dict) -> str:
+        schema_version = str(payload.get('schema_version', '')).upper().strip()
+        if schema_version in {'BOT_STOCK_WATCHLIST_V1', 'BOT_WATCHLIST_V3'}:
+            return schema_version
+        return str(payload.get('type', '')).upper().strip()
+
+    async def _process_watchlist_upload(self, message, payload: Dict):
+        db = SessionLocal()
+        try:
+            persisted = watchlist_service.ingest_watchlist(
+                db,
+                payload,
+                source='discord',
+                source_user_id=str(getattr(message.author, 'id', '')) or None,
+                source_channel_id=str(getattr(message.channel, 'id', '')) or None,
+                source_message_id=str(getattr(message, 'id', '')) or None,
+            )
+        except WatchlistValidationError as exc:
+            await message.add_reaction('❌')
+            await message.reply(f'Watchlist validation failed: {exc}')
+            return
+        except Exception as exc:
+            logger.error('Error ingesting watchlist upload: %s', exc, exc_info=True)
+            await message.add_reaction('❌')
+            await message.reply(f'Watchlist ingest failed: {exc}')
+            return
+        finally:
+            db.close()
+
+        await message.add_reaction('✅')
+        await message.reply(
+            f"Accepted **{persisted['schemaVersion']}** watchlist for `{persisted['scope']}`\n"
+            f"Symbols: {persisted['selectedCount']} | Regime: {persisted['marketRegime']}\n"
+            f"Upload ID: `{persisted['uploadId']}` | Scan ID: `{persisted['scanId']}`"
+        )
 
     async def _process_stock_decision(self, message, decision_data: Dict):
         try:

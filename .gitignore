@@ -69,8 +69,6 @@ Thumbs.db
 # Project specific
 .temp_scripts/
 scripts/.runtime/
-backend/alembic/versions/*.py
-!backend/alembic/versions/__init__.py
 
 # Sensitive
 *.key

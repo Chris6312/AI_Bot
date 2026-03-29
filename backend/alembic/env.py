@@ -5,6 +5,8 @@ from app.core.database import Base
 from app.models.account import Account
 from app.models.position import Position
 from app.models.trade import Trade
+from app.models.order_intent import OrderIntent
+from app.models.order_event import OrderEvent
 
 config = context.config
 fileConfig(config.config_file_name)
@@ -23,3 +25,7 @@ def run_migrations_online():
             context.run_migrations()
 
 run_migrations_online()
+
+from app.models.watchlist_upload import WatchlistUpload
+from app.models.watchlist_symbol import WatchlistSymbol
+from app.models.watchlist_ui_context import WatchlistUiContext

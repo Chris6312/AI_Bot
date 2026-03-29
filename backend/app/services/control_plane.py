@@ -21,7 +21,7 @@ _SUPPORTED_DECISION_TYPES = {
     'BOT_STOCK_WATCHLIST_V1',
     'BOT_WATCHLIST_V3',
 }
-_TIMESTAMP_FIELDS = ('generated_at', 'timestamp', 'created_at', 'decision_time')
+_TIMESTAMP_FIELDS = ('generated_at_utc', 'generated_at', 'timestamp', 'created_at', 'decision_time')
 
 
 @dataclass(frozen=True)
@@ -87,7 +87,7 @@ class DiscordDecisionGuard:
         return DiscordAuthorizationResult(True)
 
     def validate_and_register(self, message: Any, payload: dict[str, Any]) -> tuple[bool, str]:
-        decision_type = str(payload.get('type', '')).upper().strip()
+        decision_type = str(payload.get('type') or payload.get('schema_version') or '').upper().strip()
         if decision_type not in _SUPPORTED_DECISION_TYPES:
             return False, f'Unsupported decision type: {decision_type or "(missing)"}'
 
