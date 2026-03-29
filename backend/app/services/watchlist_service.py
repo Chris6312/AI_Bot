@@ -10,9 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.models.position import Position
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
+from app.services.kraken_service import crypto_ledger
 
 ALLOWED_SETUP_TEMPLATES = {
     'breakout_retest',
@@ -56,6 +58,9 @@ ALLOWED_CRYPTO_RISK_FLAGS = {
     'reversal_not_confirmed',
 }
 WATCHLIST_SCOPE = Literal['stocks_only', 'crypto_only']
+ACTIVE = 'ACTIVE'
+MANAGED_ONLY = 'MANAGED_ONLY'
+INACTIVE = 'INACTIVE'
 
 
 class WatchlistValidationError(ValueError):
@@ -312,14 +317,9 @@ class WatchlistService:
         expires_at = freshness['generatedAtUtc'] + timedelta(hours=max(1, int(settings.WATCHLIST_DEFAULT_EXPIRY_HOURS)))
         now = freshness['observedAtUtc']
 
-        db.query(WatchlistUpload).filter(
-            WatchlistUpload.scope == parsed.scope,
-            WatchlistUpload.is_active.is_(True),
-        ).update({'is_active': False}, synchronize_session=False)
-        db.query(WatchlistSymbol).filter(
-            WatchlistSymbol.scope == parsed.scope,
-            WatchlistSymbol.monitoring_status == 'ACTIVE',
-        ).update({'monitoring_status': 'INACTIVE'}, synchronize_session=False)
+        next_symbols = {symbol.symbol.upper() for symbol in parsed.bot_payload.symbols}
+        self._deactivate_scope_uploads(db, parsed.scope)
+        self._reconcile_rows_before_new_upload(db, parsed.scope, next_symbols)
 
         upload = WatchlistUpload(
             upload_id=upload_id,
@@ -373,7 +373,7 @@ class WatchlistService:
                     exit_template=symbol.exit_template,
                     max_hold_hours=symbol.max_hold_hours,
                     risk_flags=symbol.risk_flags,
-                    monitoring_status='ACTIVE',
+                    monitoring_status=ACTIVE,
                 )
             )
 
@@ -390,15 +390,63 @@ class WatchlistService:
         db.refresh(upload)
         return self.serialize_upload(db, upload)
 
+    def reconcile_scope_statuses(self, db: Session, *, scope: WATCHLIST_SCOPE) -> dict[str, Any]:
+        active_upload = self._get_latest_upload_row(db, scope=scope, active_only=True)
+        active_symbols: set[str] = set()
+        if active_upload is not None:
+            active_symbols = {
+                row.symbol.upper()
+                for row in db.query(WatchlistSymbol).filter(WatchlistSymbol.upload_id == active_upload.upload_id).all()
+            }
+
+        open_symbols = self._get_open_symbols(db, scope)
+        candidate_rows = (
+            db.query(WatchlistSymbol)
+            .filter(
+                WatchlistSymbol.scope == scope,
+                WatchlistSymbol.monitoring_status.in_([ACTIVE, MANAGED_ONLY]),
+            )
+            .all()
+        )
+
+        changed = 0
+        for row in candidate_rows:
+            next_status = self._resolve_row_status(
+                row_upload_id=row.upload_id,
+                active_upload_id=active_upload.upload_id if active_upload else None,
+                symbol=row.symbol,
+                active_symbols=active_symbols,
+                open_symbols=open_symbols,
+            )
+            if row.monitoring_status != next_status:
+                row.monitoring_status = next_status
+                changed += 1
+
+        if changed:
+            db.commit()
+            if active_upload is not None:
+                db.refresh(active_upload)
+        else:
+            db.rollback()
+
+        active_upload = self._get_latest_upload_row(db, scope=scope, active_only=True)
+        managed_only_rows = self.get_managed_only_rows(db, scope=scope)
+        status_counts = self.get_scope_status_counts(db, scope=scope)
+        return {
+            'scope': scope,
+            'activeUploadId': active_upload.upload_id if active_upload else None,
+            'managedOnlyCount': len(managed_only_rows),
+            'statusCounts': status_counts,
+            'changedRows': changed,
+        }
+
     def get_latest_upload(self, db: Session, *, scope: WATCHLIST_SCOPE | None = None, active_only: bool = False) -> Any:
         query = db.query(WatchlistUpload)
         if scope is not None:
             query = query.filter(WatchlistUpload.scope == scope)
         if active_only:
             query = query.filter(WatchlistUpload.is_active.is_(True))
-        uploads = (
-            query.order_by(WatchlistUpload.received_at_utc.desc(), WatchlistUpload.id.desc()).all()
-        )
+        uploads = query.order_by(WatchlistUpload.received_at_utc.desc(), WatchlistUpload.id.desc()).all()
         if scope is not None:
             upload = uploads[0] if uploads else None
             return self.serialize_upload(db, upload) if upload else None
@@ -408,6 +456,24 @@ class WatchlistService:
                 continue
             grouped[upload.scope] = self.serialize_upload(db, upload)
         return grouped
+
+    def get_managed_only_rows(self, db: Session, *, scope: WATCHLIST_SCOPE) -> list[WatchlistSymbol]:
+        return (
+            db.query(WatchlistSymbol)
+            .filter(
+                WatchlistSymbol.scope == scope,
+                WatchlistSymbol.monitoring_status == MANAGED_ONLY,
+            )
+            .order_by(WatchlistSymbol.priority_rank.asc(), WatchlistSymbol.id.asc())
+            .all()
+        )
+
+    def get_scope_status_counts(self, db: Session, *, scope: WATCHLIST_SCOPE) -> dict[str, int]:
+        rows = db.query(WatchlistSymbol).filter(WatchlistSymbol.scope == scope).all()
+        counts = {ACTIVE: 0, MANAGED_ONLY: 0, INACTIVE: 0}
+        for row in rows:
+            counts[row.monitoring_status] = counts.get(row.monitoring_status, 0) + 1
+        return counts
 
     def serialize_upload(self, db: Session, upload: WatchlistUpload | None) -> dict[str, Any]:
         if upload is None:
@@ -424,25 +490,14 @@ class WatchlistService:
             .order_by(WatchlistUiContext.id.desc())
             .first()
         )
-        symbol_rows = [
-            {
-                'symbol': row.symbol,
-                'quoteCurrency': row.quote_currency,
-                'assetClass': row.asset_class,
-                'enabled': row.enabled,
-                'tradeDirection': row.trade_direction,
-                'priorityRank': row.priority_rank,
-                'tier': row.tier,
-                'bias': row.bias,
-                'setupTemplate': row.setup_template,
-                'botTimeframes': row.bot_timeframes,
-                'exitTemplate': row.exit_template,
-                'maxHoldHours': row.max_hold_hours,
-                'riskFlags': row.risk_flags,
-                'monitoringStatus': row.monitoring_status,
-            }
-            for row in symbols
+        symbol_rows = [self._serialize_symbol_row(row) for row in symbols]
+        managed_only_rows = self.get_managed_only_rows(db, scope=upload.scope) if upload.is_active else []
+        managed_only_symbols = [
+            self._serialize_symbol_row(row)
+            for row in managed_only_rows
+            if row.upload_id != upload.upload_id
         ]
+        status_counts = self.get_scope_status_counts(db, scope=upload.scope)
         return {
             'uploadId': upload.upload_id,
             'scanId': upload.scan_id,
@@ -464,11 +519,114 @@ class WatchlistService:
             'isActive': upload.is_active,
             'validation': upload.validation_result_json or {},
             'symbols': symbol_rows,
+            'managedOnlySymbols': managed_only_symbols,
+            'statusSummary': {
+                'activeCount': status_counts.get(ACTIVE, 0),
+                'managedOnlyCount': status_counts.get(MANAGED_ONLY, 0),
+                'inactiveCount': status_counts.get(INACTIVE, 0),
+            },
             'uiPayload': {
                 'summary': (ui_context.summary_json if ui_context else {}),
                 'providerLimitations': (ui_context.provider_limitations_json if ui_context else []),
                 'symbolContext': (ui_context.symbol_context_json if ui_context else {}),
             },
+        }
+
+    def _deactivate_scope_uploads(self, db: Session, scope: WATCHLIST_SCOPE) -> None:
+        db.query(WatchlistUpload).filter(
+            WatchlistUpload.scope == scope,
+            WatchlistUpload.is_active.is_(True),
+        ).update({'is_active': False}, synchronize_session=False)
+
+    def _reconcile_rows_before_new_upload(self, db: Session, scope: WATCHLIST_SCOPE, next_symbols: set[str]) -> None:
+        open_symbols = self._get_open_symbols(db, scope)
+        candidate_rows = (
+            db.query(WatchlistSymbol)
+            .filter(
+                WatchlistSymbol.scope == scope,
+                WatchlistSymbol.monitoring_status.in_([ACTIVE, MANAGED_ONLY]),
+            )
+            .all()
+        )
+        for row in candidate_rows:
+            symbol = str(row.symbol or '').upper()
+            if symbol in next_symbols:
+                row.monitoring_status = INACTIVE
+            elif symbol in open_symbols:
+                row.monitoring_status = MANAGED_ONLY
+            else:
+                row.monitoring_status = INACTIVE
+
+    def _get_latest_upload_row(
+        self,
+        db: Session,
+        *,
+        scope: WATCHLIST_SCOPE,
+        active_only: bool,
+    ) -> WatchlistUpload | None:
+        query = db.query(WatchlistUpload).filter(WatchlistUpload.scope == scope)
+        if active_only:
+            query = query.filter(WatchlistUpload.is_active.is_(True))
+        return query.order_by(WatchlistUpload.received_at_utc.desc(), WatchlistUpload.id.desc()).first()
+
+    def _get_open_symbols(self, db: Session, scope: WATCHLIST_SCOPE) -> set[str]:
+        if scope == 'stocks_only':
+            return self._get_open_stock_symbols(db)
+        return self._get_open_crypto_symbols()
+
+    def _get_open_stock_symbols(self, db: Session) -> set[str]:
+        rows = db.query(Position).filter(Position.is_open.is_(True)).all()
+        return {str(row.ticker or '').upper() for row in rows if str(row.ticker or '').strip()}
+
+    def _get_open_crypto_symbols(self) -> set[str]:
+        open_symbols: set[str] = set()
+        try:
+            positions = crypto_ledger.get_positions()
+        except Exception:
+            positions = []
+        for position in positions:
+            raw_pair = str(position.get('pair') or position.get('symbol') or '').upper().strip()
+            if not raw_pair:
+                continue
+            open_symbols.add(raw_pair)
+            if '/' in raw_pair:
+                open_symbols.add(raw_pair.split('/', 1)[0])
+        return open_symbols
+
+    def _resolve_row_status(
+        self,
+        *,
+        row_upload_id: str,
+        active_upload_id: str | None,
+        symbol: str,
+        active_symbols: set[str],
+        open_symbols: set[str],
+    ) -> str:
+        symbol_value = str(symbol or '').upper()
+        if active_upload_id and row_upload_id == active_upload_id:
+            return ACTIVE
+        if symbol_value in open_symbols and symbol_value not in active_symbols:
+            return MANAGED_ONLY
+        return INACTIVE
+
+    @staticmethod
+    def _serialize_symbol_row(row: WatchlistSymbol) -> dict[str, Any]:
+        return {
+            'symbol': row.symbol,
+            'quoteCurrency': row.quote_currency,
+            'assetClass': row.asset_class,
+            'enabled': row.enabled,
+            'tradeDirection': row.trade_direction,
+            'priorityRank': row.priority_rank,
+            'tier': row.tier,
+            'bias': row.bias,
+            'setupTemplate': row.setup_template,
+            'botTimeframes': row.bot_timeframes,
+            'exitTemplate': row.exit_template,
+            'maxHoldHours': row.max_hold_hours,
+            'riskFlags': row.risk_flags,
+            'monitoringStatus': row.monitoring_status,
+            'uploadId': row.upload_id,
         }
 
 

@@ -24,6 +24,15 @@ async def ingest_watchlist(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@router.post('/reconcile-status')
+async def reconcile_watchlist_status(
+    scope: Literal['stocks_only', 'crypto_only'] = Query(...),
+    _: bool = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+):
+    return watchlist_service.reconcile_scope_statuses(db, scope=scope)
+
+
 @router.get('/latest')
 async def get_latest_watchlist(
     scope: Literal['stocks_only', 'crypto_only'] | None = Query(default=None),
