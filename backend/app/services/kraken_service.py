@@ -11,23 +11,38 @@ from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
-# Top 15 liquid crypto pairs (display name -> API pair mapping)
-TOP_15_PAIRS = {
-    'BTC/USD': 'XXBTZUSD',
-    'ETH/USD': 'XETHZUSD',
-    'SOL/USD': 'SOLUSD',
-    'XRP/USD': 'XXRPZUSD',
+# Top 30 liquid crypto pairs (display name -> API pair mapping)
+TOP_30_PAIRS = {
     'ADA/USD': 'ADAUSD',
-    'AVAX/USD': 'AVAXUSD',
-    'DOT/USD': 'DOTUSD',
-    'MATIC/USD': 'POLUSDT',
-    'LINK/USD': 'LINKUSD',
-    'UNI/USD': 'UNIUSD',
-    'ATOM/USD': 'ATOMUSD',
-    'LTC/USD': 'XLTCZUSD',
-    'BCH/USD': 'BCHUSD',
-    'ALGO/USD': 'ALGOUSD',
-    'XLM/USD': 'XXLMZUSD',
+    'BTC/EUR': 'XXBTZEUR',
+    'BTC/GBP': 'XXBTZGBP',
+    'BTC/USD': 'XXBTZUSD',
+    'BTC/USDC': 'XBTUSDC',
+    'BTC/USDT': 'XBTUSDT',
+    'DOGE/USD': 'XDGUSD',
+    'ETH/EUR': 'XETHZEUR',
+    'ETH/USD': 'XETHZUSD',
+    'ETH/USDC': 'ETHUSDC',
+    'ETH/USDT': 'ETHUSDT',
+    'HYPE/USD': 'HYPEUSD',
+    'PAXG/USD': 'PAXGUSD',
+    'SOL/EUR': 'SOLEUR',
+    'SOL/USD': 'SOLUSD',
+    'SOL/USDC': 'SOLUSDC',
+    'SUI/USD': 'SUIUSD',
+    'TAO/EUR': 'TAOEUR',
+    'TAO/USD': 'TAOUSD',
+    'USDC/EUR': 'USDCEUR',
+    'USDC/GBP': 'USDCGBP',
+    'USDC/USD': 'USDCUSD',
+    'USDC/USDT': 'USDCUSDT',
+    'USDT/EUR': 'USDTEUR',
+    'USDT/USD': 'USDTZUSD',
+    'TRX/USD': 'TRXUSD',
+    'XMR/USDT': 'XMRUSDT',
+    'XRP/EUR': 'XXRPZEUR',
+    'XRP/USD': 'XXRPZUSD',
+    'ZEC/USD': 'XZECZUSD'
 }
 
 
@@ -260,12 +275,12 @@ class CryptoPaperLedger:
             return positions
         
         pairs_to_check = list(self.positions.keys())
-        ohlcv_pairs = [TOP_15_PAIRS.get(p) for p in pairs_to_check]
+        ohlcv_pairs = [TOP_30_PAIRS.get(p) for p in pairs_to_check]
         
         prices = self.kraken.get_prices(ohlcv_pairs)
         
         for pair, pos in self.positions.items():
-            ohlcv_pair = TOP_15_PAIRS[pair]
+            ohlcv_pair = TOP_30_PAIRS[pair]
             current_price = prices.get(ohlcv_pair, 0)
             
             if current_price == 0:

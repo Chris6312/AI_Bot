@@ -17,7 +17,7 @@ from app.services.crypto_analyzer import crypto_analyzer
 def main():
     """Run crypto momentum screening"""
     
-    print("🔍 Screening Kraken top 15 pairs for momentum...\n")
+    print("🔍 Screening Kraken top 30 pairs for momentum...\n")
     
     # Screen with configurable criteria
     results = crypto_analyzer.screen_for_momentum(

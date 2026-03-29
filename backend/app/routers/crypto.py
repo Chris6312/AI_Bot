@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional
 from pydantic import BaseModel
 
-from app.services.kraken_service import crypto_ledger, kraken_service, TOP_15_PAIRS
+from app.services.kraken_service import crypto_ledger, kraken_service, TOP_30_PAIRS
 
 router = APIRouter(prefix="/crypto", tags=["crypto"])
 
@@ -77,7 +77,7 @@ async def get_top_pairs():
     """Get top 15 liquid crypto pairs"""
     return [
         {"display": display, "ohlcv": ohlcv}
-        for display, ohlcv in TOP_15_PAIRS.items()
+        for display, ohlcv in TOP_30_PAIRS.items()
     ]
 
 
@@ -86,10 +86,10 @@ async def execute_crypto_trade(trade: CryptoTradeRequest):
     """Execute a paper crypto trade"""
     try:
         # Validate pair
-        if trade.pair not in TOP_15_PAIRS:
+        if trade.pair not in TOP_30_PAIRS:
             raise HTTPException(status_code=400, detail=f"Invalid pair: {trade.pair}")
         
-        ohlcv_pair = TOP_15_PAIRS[trade.pair]
+        ohlcv_pair = TOP_30_PAIRS[trade.pair]
         
         # Execute trade
         result = crypto_ledger.execute_trade(
