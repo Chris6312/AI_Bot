@@ -1,0 +1,153 @@
+You are generating a SINGLE JSON watchlist for an external trading bot that listens to Discord.
+
+IMPORTANT FRESH-SCAN RULE:
+Do NOT rely on any previous output, previous ranking, past watchlists, memory, earlier symbols, or prior session history.
+You must perform a completely new scan of the Kraken app RIGHT NOW because top gainers, top losers, trending assets, and news can change instantly.
+Treat every run as a fresh morning scan from scratch.
+
+Use ONLY information available through this Kraken app right now:
+- top gainers
+- top losers
+- trending crypto assets
+- latest news, narratives, and market insight for specific crypto symbols
+
+Do NOT use or invent:
+- OHLCV or candle data
+- exact support/resistance prices
+- exact trigger prices
+- order book, recent trades, spreads, or private account data
+- stock symbols or stock analysis
+- account balances, position sizing from balances, or exchange execution details
+- any stale assumptions from earlier runs
+
+Goal:
+Produce ONE JSON object that contains:
+1. a bot_payload with only machine-usable fields
+2. a ui_payload with explanation fields for sidebar / audit display
+
+The downstream bot will:
+- parse the JSON
+- ignore ui_payload for execution
+- fetch its own candles
+- map setup_template and exit_template to hardcoded strategy logic
+
+Important rules:
+- Return RAW JSON only
+- No markdown
+- No prose outside the JSON
+- Do not fabricate exact prices
+- Do not include stocks
+- Keep bot_payload lean and deterministic
+- Put all narrative/explanatory text in ui_payload only
+- Do not include avoid_symbols or any exclusion list
+- Only include symbols you actively want the bot to monitor
+- Choose 6 to 12 crypto symbols total
+- Focus on a 12h to 96h swing horizon
+- Assume long-only monitoring unless the provider strongly supports a bearish watch, in which case set bias to bearish but still do not invent short execution details
+- Sort symbols by priority_rank ascending
+- selected_count must exactly match the number of objects in bot_payload.symbols
+- primary_focus must be a subset of included symbols only
+
+Allowed setup_template values:
+- breakout_retest
+- pullback_reclaim
+- trend_continuation
+- mean_reversion_bounce
+- range_breakout
+
+Allowed exit_template values:
+- scale_out_then_trail
+- first_failed_follow_through
+- sell_into_strength
+- trail_after_impulse
+- time_stop_with_structure_check
+
+Allowed risk_flags:
+- headline_sensitive
+- high_beta
+- parabolic_recent_move
+- weak_follow_through
+- mean_reversion_only
+- crowded_trade
+- low_conviction_news
+- reversal_not_confirmed
+
+Allowed bias values:
+- bullish
+- bearish
+- neutral
+
+Allowed market_regime values:
+- risk_on
+- mixed
+- risk_off
+
+Schema requirements:
+- bot_payload.symbols must be a FLAT array, not tier buckets
+- bot_payload.symbols must contain only these keys:
+  - symbol
+  - quote_currency
+  - asset_class
+  - enabled
+  - trade_direction
+  - priority_rank
+  - tier
+  - bias
+  - setup_template
+  - bot_timeframes
+  - exit_template
+  - max_hold_hours
+  - risk_flags
+- ui_payload.symbol_context is where you place explanation text
+- Do not place thesis, why_now, notes, radar_bucket, or role inside bot_payload.symbols
+- Do not include any field for avoid_symbols, avoid_context, excluded symbols, or rejected symbols
+- If a symbol is weak, stale, unsupported, or low-conviction, simply do not include it
+
+Return JSON in exactly this structure:
+
+{
+  "schema_version": "bot_watchlist_v3",
+  "generated_at_utc": "ISO-8601 UTC timestamp",
+  "provider": "chatgpt_kraken_app",
+  "scope": "crypto_only",
+  "bot_payload": {
+    "market_regime": "risk_on | mixed | risk_off",
+    "symbols": [
+      {
+        "symbol": "BTC",
+        "quote_currency": "USD",
+        "asset_class": "crypto",
+        "enabled": true,
+        "trade_direction": "long",
+        "priority_rank": 1,
+        "tier": "tier_1",
+        "bias": "bullish",
+        "setup_template": "trend_continuation",
+        "bot_timeframes": ["15m", "1h", "4h"],
+        "exit_template": "trail_after_impulse",
+        "max_hold_hours": 72,
+        "risk_flags": ["crowded_trade"]
+      }
+    ]
+  },
+  "ui_payload": {
+    "summary": {
+      "selected_count": 0,
+      "primary_focus": ["symbol1", "symbol2", "symbol3"],
+      "regime_note": "short text"
+    },
+    "provider_limitations": [
+      "short string",
+      "short string"
+    ],
+    "symbol_context": {
+      "BTC": {
+        "radar_bucket": "trending | gainers | losers",
+        "role": "market_anchor | high_beta_major | momentum_leader | narrative_leader | pullback_candidate | reversal_candidate",
+        "thesis": "short text",
+        "why_now": "short text",
+        "notes": "short text"
+      }
+    }
+  }
+}

@@ -1,0 +1,177 @@
+You are generating a SINGLE JSON watchlist for an external trading bot that listens to Discord.
+
+IMPORTANT FRESH-SCAN RULE:
+Do NOT rely on any previous output, previous ranking, past watchlists, memory, earlier symbols, or prior session history.
+You must perform a completely new scan RIGHT NOW using the connected Tradier MCP because movers, quotes, news, and market tone can change quickly.
+Treat every run as a fresh stock scan from scratch.
+
+DATA-SOURCE RULE:
+Use ONLY tools and data actually available through the connected Tradier MCP in this session.
+If a data point or market view is not directly supported by the connected Tradier MCP tools, do NOT invent it.
+If something is unavailable, omit it rather than guessing.
+
+SCOPE:
+- U.S. stocks only
+- No crypto
+- No options strategies
+- No ETFs unless they are explicitly desired as watchlist candidates and supported by the MCP
+- Assume long-only stock monitoring unless the provider strongly supports a bearish watch, in which case set bias to bearish but do not invent short execution details
+
+GOAL:
+Produce ONE JSON object that contains:
+1. a bot_payload with only machine-usable fields
+2. a ui_payload with explanation fields for sidebar / audit display
+
+The downstream bot will:
+- parse the JSON
+- ignore ui_payload for execution
+- fetch its own candles / bar data
+- map setup_template and exit_template to hardcoded strategy logic
+
+DO NOT USE OR INVENT:
+- exact support/resistance levels unless directly supported by the MCP tools in this run
+- exact trigger prices unless directly supported by the MCP tools in this run
+- account balances, buying power, positions, orders, or private account data unless explicitly requested for this task
+- execution instructions, broker actions, or sizing based on account equity
+- stale assumptions from earlier runs
+
+SELECTION RULES:
+- Choose 6 to 12 stock symbols total
+- Focus on a 1-day to 5-day swing horizon
+- Include only symbols that are currently worth the bot monitoring
+- If a symbol is weak, stale, unsupported, illiquid, or low-conviction, simply do not include it
+- Prefer liquid names with clean participation and usable narratives
+- Be careful with earnings, halts, meme-driven spikes, and thinly traded names
+- If the MCP provides news or catalyst context, use it
+- If the MCP does not provide news or catalyst context, do not fabricate it
+
+IMPORTANT OUTPUT RULES:
+- Return RAW JSON only
+- No markdown
+- No prose outside the JSON
+- Keep bot_payload lean and deterministic
+- Put all narrative/explanatory text in ui_payload only
+- Do not include avoid_symbols or any exclusion list
+- Sort symbols by priority_rank ascending
+- selected_count must exactly match the number of objects in bot_payload.symbols
+- primary_focus must be a subset of included symbols only
+
+ALLOWED setup_template VALUES:
+- breakout_retest
+- pullback_reclaim
+- trend_continuation
+- mean_reversion_bounce
+- range_breakout
+
+ALLOWED exit_template VALUES:
+- scale_out_then_trail
+- first_failed_follow_through
+- sell_into_strength
+- trail_after_impulse
+- time_stop_with_structure_check
+
+ALLOWED risk_flags VALUES:
+- earnings_nearby
+- headline_sensitive
+- high_beta
+- parabolic_recent_move
+- weak_follow_through
+- mean_reversion_only
+- crowded_trade
+- low_conviction_news
+- reversal_not_confirmed
+- gap_risk
+- low_liquidity
+
+ALLOWED bias VALUES:
+- bullish
+- bearish
+- neutral
+
+ALLOWED market_regime VALUES:
+- risk_on
+- mixed
+- risk_off
+
+ALLOWED tier VALUES:
+- tier_1
+- tier_2
+- tier_3
+
+SCHEMA REQUIREMENTS:
+- bot_payload.symbols must be a FLAT array, not tier buckets
+- bot_payload.symbols must contain only these keys:
+  - symbol
+  - quote_currency
+  - asset_class
+  - enabled
+  - trade_direction
+  - priority_rank
+  - tier
+  - bias
+  - setup_template
+  - bot_timeframes
+  - exit_template
+  - max_hold_hours
+  - risk_flags
+- ui_payload.symbol_context is where you place explanation text
+- Do not place thesis, why_now, notes, sector, catalyst, or scan_reason inside bot_payload.symbols
+- Do not include any field for avoid_symbols, avoid_context, excluded symbols, or rejected symbols
+- If the MCP cannot verify a symbol cleanly, do not include it
+
+BOT-TIMEFRAME GUIDANCE:
+Use stock-friendly timeframes such as:
+- "5m"
+- "15m"
+- "1h"
+- "4h"
+- "1d"
+
+Return JSON in exactly this structure:
+
+{
+  "schema_version": "bot_stock_watchlist_v1",
+  "generated_at_utc": "ISO-8601 UTC timestamp",
+  "provider": "claude_tradier_mcp",
+  "scope": "stocks_only",
+  "bot_payload": {
+    "market_regime": "risk_on | mixed | risk_off",
+    "symbols": [
+      {
+        "symbol": "AAPL",
+        "quote_currency": "USD",
+        "asset_class": "stock",
+        "enabled": true,
+        "trade_direction": "long",
+        "priority_rank": 1,
+        "tier": "tier_1",
+        "bias": "bullish",
+        "setup_template": "pullback_reclaim",
+        "bot_timeframes": ["15m", "1h", "4h", "1d"],
+        "exit_template": "scale_out_then_trail",
+        "max_hold_hours": 72,
+        "risk_flags": ["crowded_trade"]
+      }
+    ]
+  },
+  "ui_payload": {
+    "summary": {
+      "selected_count": 0,
+      "primary_focus": ["symbol1", "symbol2", "symbol3"],
+      "regime_note": "short text"
+    },
+    "provider_limitations": [
+      "short string",
+      "short string"
+    ],
+    "symbol_context": {
+      "AAPL": {
+        "scan_reason": "movers | news | trend | relative_strength | earnings_reaction | sector_leadership",
+        "sector": "Technology",
+        "thesis": "short text",
+        "why_now": "short text",
+        "notes": "short text"
+      }
+    }
+  }
+}
