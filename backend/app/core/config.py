@@ -74,6 +74,8 @@ class Settings(BaseSettings):
     SAFETY_GRACE_PERIOD_SECONDS: int = 30
     SAFETY_ALLOW_OVERRIDE: bool = True
     SAFETY_REQUIRE_MARKET_HOURS: bool = True
+    ORDER_FILL_CONFIRM_RETRIES: int = 3
+    ORDER_FILL_CONFIRM_DELAY_SECONDS: float = 1.0
 
     # Risk
     STOP_LOSS_PCT: float = 0.015

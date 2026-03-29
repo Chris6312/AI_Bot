@@ -145,6 +145,44 @@ class TradierClient:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.place_order_sync, ticker, qty, side, mode, order_type, duration)
 
+    def get_order_sync(self, order_id: str, mode: str | None = None) -> dict[str, Any]:
+        creds = self._credentials_for_mode(mode)
+        return self._request_json(
+            "GET",
+            f"accounts/{creds['account_id']}/orders/{order_id}",
+            mode=mode,
+        )
+
+    async def get_order_async(self, order_id: str, mode: str | None = None) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.get_order_sync, order_id, mode)
+
+    @staticmethod
+    def extract_order_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        order = payload.get("order")
+        return order if isinstance(order, dict) else payload
+
+    def normalize_order_response(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        order = self.extract_order_payload(payload)
+        status = str(order.get("status") or "UNKNOWN").upper()
+        requested_quantity = _coalesce_numeric(order, ["quantity", "qty"])
+        filled_quantity = _coalesce_numeric(order, ["exec_quantity", "filled_quantity", "filled_qty"])
+        avg_fill_price = _coalesce_numeric(
+            order,
+            ["avg_fill_price", "avg_execution_price", "avg_price", "last_fill_price"],
+        )
+        return {
+            "id": str(order.get("id") or "") or None,
+            "status": status,
+            "requested_quantity": requested_quantity,
+            "filled_quantity": filled_quantity,
+            "avg_fill_price": avg_fill_price,
+            "is_terminal": status in {"FILLED", "REJECTED", "CANCELED", "CANCELLED", "ERROR", "FAILED"},
+            "raw": payload or {},
+        }
+
     def get_positions_sync(self, mode: str | None = None) -> list[dict[str, Any]]:
         creds = self._credentials_for_mode(mode)
         payload = self._request_json("GET", f"accounts/{creds['account_id']}/positions", mode=mode)
