@@ -13,8 +13,8 @@ from discord.ext import commands, tasks
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models.position import Position
 from app.services.control_plane import discord_decision_guard, get_control_plane_status, get_execution_gate_status
+from app.services.execution_lifecycle import execution_lifecycle
 from app.services.crypto_analyzer import crypto_analyzer
 from app.services.position_sizer import position_sizer
 from app.services.runtime_state import runtime_state
@@ -288,18 +288,22 @@ class TradingBot(commands.Bot):
 
                 if not result:
                     await message.add_reaction('⛔')
-                    await message.reply('❌ No stock orders were executed')
+                    await message.reply('❌ No stock orders were submitted')
                     return
+
+                confirmed_fills = [trade for trade in result if int(trade.get('filled_shares') or 0) > 0]
+                if not confirmed_fills:
+                    await message.add_reaction('⏳')
 
                 execution_id = f"exec_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
                 self.executions[execution_id] = result
 
                 formatted = self._format_stock_result(result)
                 reply = await message.reply(
-                    f"✅ **STOCK TRADES EXECUTED ({mode})** (ID: `{execution_id}`)\n"
+                    f"✅ **STOCK ORDER LIFECYCLE ({mode})** (ID: `{execution_id}`)\n"
                     f"{formatted}\n\n"
                     f"Cash used for sizing: ${cash_available:,.2f}\n"
-                    f"React with ❌ within {settings.SAFETY_GRACE_PERIOD_SECONDS}s to CANCEL"
+                    f"React with ❌ within {settings.SAFETY_GRACE_PERIOD_SECONDS}s to unwind confirmed fills only"
                 )
 
                 await reply.add_reaction('❌')
@@ -492,45 +496,109 @@ class TradingBot(commands.Bot):
                 logger.warning('%s: Calculated 0 shares, skipping', ticker)
                 continue
 
-            order = await self.tradier.place_order_async(
-                ticker=ticker,
-                qty=shares,
-                side='buy',
-                mode=mode,
-                order_type='market',
+            intent = execution_lifecycle.create_order_intent(
+                db,
+                account_id=str(account_id),
+                asset_class='stock',
+                symbol=ticker,
+                side='BUY',
+                requested_quantity=shares,
+                requested_price=current_price,
+                execution_source='DISCORD_SCREENING',
+                context={
+                    'mode': mode,
+                    'positionPct': pos.get('position_pct'),
+                    'estimatedValue': pos.get('estimated_value'),
+                },
             )
 
-            position = Position(
-                account_id=account_id,
-                ticker=ticker,
-                shares=shares,
-                avg_entry_price=current_price,
-                current_price=current_price,
+            try:
+                order = await self.tradier.place_order_async(
+                    ticker=ticker,
+                    qty=shares,
+                    side='buy',
+                    mode=mode,
+                    order_type='market',
+                )
+                execution_lifecycle.record_submission(db, intent, order)
+            except Exception as exc:
+                execution_lifecycle.record_event(
+                    db,
+                    intent,
+                    event_type='ORDER_SUBMISSION_FAILED',
+                    status='REJECTED',
+                    message=f'Order submission failed for {ticker}: {exc}',
+                    payload={'error': str(exc)},
+                )
+                intent.status = 'REJECTED'
+                intent.rejection_reason = str(exc)
+                db.commit()
+                db.refresh(intent)
+                results.append(
+                    {
+                        'ticker': ticker,
+                        'requested_shares': shares,
+                        'filled_shares': 0,
+                        'entry_price': None,
+                        'value': 0.0,
+                        'position_pct': pos.get('position_pct'),
+                        'order_id': None,
+                        'intent_id': intent.intent_id,
+                        'status': intent.status,
+                        'reason': str(exc),
+                    }
+                )
+                continue
+
+            confirmed_order = await self._confirm_stock_order(order, mode=mode)
+            intent = execution_lifecycle.refresh_from_order_snapshot(db, intent, confirmed_order)
+            fill_record = execution_lifecycle.materialize_stock_fill(
+                db,
+                intent,
                 strategy='AI_SCREENING',
-                entry_time=datetime.utcnow(),
                 stop_loss=current_price * (1 - settings.STOP_LOSS_PCT),
                 profit_target=current_price * (1 + settings.PROFIT_TARGET_PCT),
-                peak_price=current_price,
                 trailing_stop=current_price * (1 - settings.TRAILING_STOP_PCT),
-                is_open=True,
+                current_price=current_price,
             )
-            db.add(position)
-            db.commit()
 
-            order_payload = order.get('order', {}) if isinstance(order.get('order'), dict) else order
+            filled_shares = int(fill_record['filled_shares']) if fill_record else int(round(float(intent.filled_quantity or 0.0)))
+            entry_price = float(fill_record['avg_fill_price']) if fill_record else (float(intent.avg_fill_price) if intent.avg_fill_price is not None else None)
             results.append(
                 {
                     'ticker': ticker,
-                    'shares': shares,
-                    'entry_price': current_price,
-                    'value': shares * current_price,
+                    'requested_shares': shares,
+                    'filled_shares': filled_shares,
+                    'shares': filled_shares,
+                    'entry_price': entry_price,
+                    'value': (filled_shares * entry_price) if entry_price is not None and filled_shares > 0 else 0.0,
                     'position_pct': pos.get('position_pct'),
-                    'order_id': order_payload.get('id', 'n/a'),
-                    'status': order_payload.get('status', 'filled'),
+                    'order_id': intent.submitted_order_id,
+                    'intent_id': intent.intent_id,
+                    'status': intent.status,
+                    'reason': intent.rejection_reason,
                 }
             )
 
         return results
+
+    async def _confirm_stock_order(self, order_snapshot: Dict, mode: str) -> Dict:
+        snapshot = order_snapshot
+        normalized = self.tradier.normalize_order_response(snapshot)
+        order_id = normalized.get('id')
+
+        if normalized.get('is_terminal') or normalized.get('filled_quantity', 0) > 0 or not order_id:
+            return snapshot
+
+        attempts = max(int(settings.ORDER_FILL_CONFIRM_RETRIES), 0)
+        for _ in range(attempts):
+            await asyncio.sleep(float(settings.ORDER_FILL_CONFIRM_DELAY_SECONDS))
+            snapshot = await self.tradier.get_order_async(str(order_id), mode=mode)
+            normalized = self.tradier.normalize_order_response(snapshot)
+            if normalized.get('is_terminal') or normalized.get('filled_quantity', 0) > 0:
+                break
+
+        return snapshot
 
     async def _execute_crypto_positions(self, positions: List[Dict]) -> List[Dict]:
         from app.services.kraken_service import TOP_30_PAIRS, crypto_ledger, kraken_service
@@ -617,15 +685,30 @@ class TradingBot(commands.Bot):
 
         for trade in result:
             pct_str = f", {trade['position_pct'] * 100:.0f}%" if trade.get('position_pct') else ''
-            lines.append(
-                f"• **{trade['ticker']}**: {trade['shares']} shares @ ${trade['entry_price']:.2f} "
-                f"(${trade['value']:,.2f}{pct_str}) [Order #{trade['order_id']}]"
-            )
-            total_value += trade['value']
+            requested = int(trade.get('requested_shares') or trade.get('shares') or 0)
+            filled = int(trade.get('filled_shares') or 0)
+            status = str(trade.get('status') or 'UNKNOWN').upper()
+            order_id = trade.get('order_id') or 'n/a'
+            intent_id = trade.get('intent_id') or 'n/a'
+            reason = trade.get('reason')
+
+            if filled > 0 and trade.get('entry_price') is not None:
+                lines.append(
+                    f"• **{trade['ticker']}**: {filled}/{requested} filled @ ${float(trade['entry_price']):.2f} "
+                    f"(${float(trade.get('value') or 0):,.2f}{pct_str}) [{status}] "
+                    f"[Intent `{intent_id}` / Order #{order_id}]"
+                )
+                total_value += float(trade.get('value') or 0)
+            else:
+                pending_reason = f" - {reason}" if reason else ''
+                lines.append(
+                    f"• **{trade['ticker']}**: 0/{requested} filled [{status}] "
+                    f"[Intent `{intent_id}` / Order #{order_id}]{pending_reason}"
+                )
 
         summary = '\n'.join(lines)
         if total_value > 0:
-            summary += f'\n\n**Total:** ${total_value:,.2f}'
+            summary += f'\n\n**Confirmed fill value:** ${total_value:,.2f}'
         return summary
 
     def _format_crypto_result(self, result: List[Dict]) -> str:
@@ -686,24 +769,132 @@ class TradingBot(commands.Bot):
             )
 
     async def _cancel_stock_execution(self, result: List[Dict], mode: str = 'PAPER') -> str:
+        from app.models.order_intent import OrderIntent
+
         cancel_results = []
+        db = SessionLocal()
 
-        for trade in result:
-            ticker = trade['ticker']
-            shares = trade['shares']
+        try:
+            for trade in result:
+                ticker = str(trade.get('ticker') or '').upper()
+                intent_id = trade.get('intent_id')
+                entry_intent = None
+                if intent_id:
+                    entry_intent = db.query(OrderIntent).filter(OrderIntent.intent_id == intent_id).first()
 
-            exit_order = await self.tradier.place_order_async(
-                ticker=ticker,
-                qty=shares,
-                side='sell',
-                mode=mode,
-                order_type='market',
-            )
+                try:
+                    broker_shares = self.tradier.get_position_quantity_sync(ticker, mode=mode)
+                except Exception as exc:
+                    logger.warning('Could not fetch broker position quantity for %s: %s', ticker, exc)
+                    broker_shares = 0
 
-            order_payload = exit_order.get('order', {}) if isinstance(exit_order.get('order'), dict) else exit_order
-            cancel_results.append(
-                f"• **{ticker}**: Sold {shares} shares [Order #{order_payload.get('id', 'n/a')}]"
-            )
+                fallback_shares = int(
+                    round(
+                        float(
+                            (entry_intent.filled_quantity if entry_intent else 0)
+                            or trade.get('filled_shares')
+                            or trade.get('shares')
+                            or 0
+                        )
+                    )
+                )
+                shares = broker_shares or fallback_shares
+
+                if shares <= 0:
+                    if entry_intent is not None:
+                        execution_lifecycle.record_event(
+                            db,
+                            entry_intent,
+                            event_type='EXIT_SKIPPED_NO_OPEN_SHARES',
+                            status=entry_intent.status,
+                            message=f'No broker-confirmed open shares remained for {ticker}',
+                            payload={'brokerOpenShares': broker_shares, 'fallbackShares': fallback_shares},
+                        )
+                        db.commit()
+                        db.refresh(entry_intent)
+                    cancel_results.append(f"• **{ticker}**: No broker-confirmed open shares to unwind")
+                    continue
+
+                linked_position_id = entry_intent.position_id if entry_intent else None
+                linked_trade_id = entry_intent.trade_id if entry_intent else None
+                linked_account_id = (entry_intent.account_id if entry_intent else None) or str(
+                    self.tradier.get_account_snapshot(mode).get('accountId')
+                    or self.tradier._credentials_for_mode(mode)['account_id']
+                )
+
+                exit_intent = execution_lifecycle.create_exit_intent(
+                    db,
+                    account_id=linked_account_id,
+                    asset_class='stock',
+                    symbol=ticker,
+                    requested_quantity=shares,
+                    requested_price=float(trade.get('entry_price') or 0) or None,
+                    execution_source='DISCORD_CANCEL_WINDOW',
+                    position_id=linked_position_id,
+                    trade_id=linked_trade_id,
+                    linked_intent_id=intent_id,
+                    context={
+                        'mode': mode,
+                        'exitTrigger': 'SAFETY_CANCEL_WINDOW',
+                        'brokerOpenShares': broker_shares,
+                        'fallbackShares': fallback_shares,
+                    },
+                )
+
+                try:
+                    exit_order = await self.tradier.place_order_async(
+                        ticker=ticker,
+                        qty=shares,
+                        side='sell',
+                        mode=mode,
+                        order_type='market',
+                    )
+                    execution_lifecycle.record_submission(db, exit_intent, exit_order)
+                except Exception as exc:
+                    execution_lifecycle.record_event(
+                        db,
+                        exit_intent,
+                        event_type='ORDER_SUBMISSION_FAILED',
+                        status='REJECTED',
+                        message=f'Exit order submission failed for {ticker}: {exc}',
+                        payload={'error': str(exc)},
+                    )
+                    exit_intent.status = 'REJECTED'
+                    exit_intent.rejection_reason = str(exc)
+                    db.commit()
+                    db.refresh(exit_intent)
+                    cancel_results.append(f"• **{ticker}**: Exit submit failed ({exc})")
+                    continue
+
+                confirmed_exit = await self._confirm_stock_order(exit_order, mode=mode)
+                exit_intent = execution_lifecycle.refresh_from_order_snapshot(db, exit_intent, confirmed_exit)
+                exit_record = execution_lifecycle.materialize_stock_exit(
+                    db,
+                    exit_intent,
+                    current_price=None,
+                    exit_trigger='SAFETY_CANCEL_WINDOW',
+                )
+
+                order_payload = exit_order.get('order', {}) if isinstance(exit_order.get('order'), dict) else exit_order
+                closed_shares = int(exit_record['closed_shares']) if exit_record else int(round(float(exit_intent.filled_quantity or 0.0)))
+                remaining_shares = int(exit_record['remaining_shares']) if exit_record else max(shares - closed_shares, 0)
+
+                if closed_shares <= 0:
+                    cancel_results.append(
+                        f"• **{ticker}**: Exit submitted against {shares} broker-confirmed shares, but no confirmed exit fill yet [Order #{order_payload.get('id', 'n/a')}]"
+                    )
+                    continue
+
+                if remaining_shares > 0:
+                    cancel_results.append(
+                        f"• **{ticker}**: Sold {closed_shares} shares from broker-confirmed {shares}; {remaining_shares} still open [Order #{order_payload.get('id', 'n/a')}]"
+                    )
+                else:
+                    cancel_results.append(
+                        f"• **{ticker}**: Sold {closed_shares} shares using broker-confirmed quantity [Order #{order_payload.get('id', 'n/a')}]"
+                    )
+        finally:
+            db.close()
 
         return '\n'.join(cancel_results)
 

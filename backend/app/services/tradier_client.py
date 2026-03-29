@@ -195,6 +195,22 @@ class TradierClient:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.get_positions_sync, mode)
 
+    def get_position_quantity_sync(self, symbol: str, mode: str | None = None) -> int:
+        target = str(symbol or "").upper()
+        if not target:
+            return 0
+
+        for position in self.get_positions_sync(mode):
+            if str(position.get("symbol", "")).upper() != target:
+                continue
+            quantity = abs(_coalesce_numeric(position, ["quantity", "qty", "shares", "share_quantity"]))
+            return int(round(quantity))
+        return 0
+
+    async def get_position_quantity_async(self, symbol: str, mode: str | None = None) -> int:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.get_position_quantity_sync, symbol, mode)
+
     def get_account_snapshot(self, mode: str | None = None) -> dict[str, Any]:
         selected_mode = (mode or "PAPER").upper()
         if not self.is_ready(selected_mode):

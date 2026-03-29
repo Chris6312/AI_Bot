@@ -66,6 +66,61 @@ class ExecutionLifecycleService:
         db.refresh(intent)
         return intent
 
+    def create_exit_intent(
+        self,
+        db: Session,
+        *,
+        account_id: str,
+        asset_class: str,
+        symbol: str,
+        requested_quantity: float,
+        requested_price: float | None,
+        execution_source: str,
+        position_id: int | None,
+        trade_id: int | None,
+        linked_intent_id: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> OrderIntent:
+        merged_context = dict(context or {})
+        merged_context.update(
+            {
+                'intentRole': 'EXIT',
+                'linkedIntentId': linked_intent_id,
+                'linkedPositionId': position_id,
+                'linkedTradeId': trade_id,
+            }
+        )
+        intent = self.create_order_intent(
+            db,
+            account_id=account_id,
+            asset_class=asset_class,
+            symbol=symbol,
+            side='SELL',
+            requested_quantity=requested_quantity,
+            requested_price=requested_price,
+            execution_source=execution_source,
+            context=merged_context,
+        )
+        intent.position_id = position_id
+        intent.trade_id = trade_id
+        db.commit()
+        db.refresh(intent)
+        self.record_event(
+            db,
+            intent,
+            event_type='EXIT_INTENT_LINKED',
+            status=intent.status,
+            message=f"Linked exit intent for {intent.symbol}",
+            payload={
+                'linkedIntentId': linked_intent_id,
+                'positionId': position_id,
+                'tradeId': trade_id,
+            },
+        )
+        db.commit()
+        db.refresh(intent)
+        return intent
+
     def record_event(
         self,
         db: Session,
@@ -243,6 +298,130 @@ class ExecutionLifecycleService:
             'avg_fill_price': entry_price,
         }
 
+    def materialize_stock_exit(
+        self,
+        db: Session,
+        intent: OrderIntent,
+        *,
+        current_price: float | None,
+        exit_trigger: str,
+    ) -> dict[str, Any] | None:
+        filled_shares = int(round(float(intent.filled_quantity or 0.0)))
+        if filled_shares <= 0:
+            return None
+
+        position = self._resolve_position(db, intent)
+        trade = self._resolve_trade(db, intent)
+        if position is None or trade is None:
+            self.record_event(
+                db,
+                intent,
+                event_type='EXIT_RECONCILE_SKIPPED',
+                status=intent.status,
+                message=f"Could not reconcile exit for {intent.symbol} because no linked position/trade was found",
+                payload={'positionId': intent.position_id, 'tradeId': intent.trade_id},
+            )
+            db.commit()
+            db.refresh(intent)
+            return None
+
+        open_shares = int(position.shares or 0)
+        if open_shares <= 0 or not position.is_open:
+            self.record_event(
+                db,
+                intent,
+                event_type='EXIT_RECONCILE_SKIPPED',
+                status=intent.status,
+                message=f"Position for {intent.symbol} is already flat",
+                payload={'positionId': position.id, 'tradeId': trade.id},
+            )
+            db.commit()
+            db.refresh(intent)
+            return None
+
+        applied_shares = min(filled_shares, open_shares)
+        if applied_shares <= 0:
+            return None
+
+        exit_price = float(
+            intent.avg_fill_price
+            or current_price
+            or position.current_price
+            or position.avg_entry_price
+            or intent.requested_price
+            or 0.0
+        )
+        exit_time = intent.last_fill_at or intent.first_fill_at or intent.submitted_at or _utcnow()
+        remaining_shares = max(open_shares - applied_shares, 0)
+
+        position.current_price = exit_price
+        position.shares = remaining_shares
+        if remaining_shares <= 0:
+            position.is_open = False
+            position.unrealized_pnl = 0.0
+            position.unrealized_pnl_pct = 0.0
+        else:
+            unrealized = (exit_price - float(position.avg_entry_price or 0.0)) * remaining_shares
+            position.unrealized_pnl = unrealized
+            position.unrealized_pnl_pct = (
+                (unrealized / (float(position.avg_entry_price or 0.0) * remaining_shares) * 100.0)
+                if position.avg_entry_price and remaining_shares > 0
+                else 0.0
+            )
+
+        partial_history = self._build_partial_exit_history(trade, intent, applied_shares, exit_price, exit_time, remaining_shares)
+        trade.exit_reasoning = partial_history
+
+        if remaining_shares <= 0:
+            entry_cost_closed = float(trade.entry_price or 0.0) * applied_shares
+            exit_proceeds = exit_price * applied_shares
+            gross_pnl = exit_proceeds - entry_cost_closed
+            trade.exit_time = exit_time
+            trade.exit_price = exit_price
+            trade.exit_proceeds = exit_proceeds
+            trade.exit_trigger = exit_trigger
+            trade.exit_order_id = intent.submitted_order_id
+            trade.gross_pnl = gross_pnl
+            trade.net_pnl = gross_pnl
+            trade.return_pct = (gross_pnl / entry_cost_closed * 100.0) if entry_cost_closed else 0.0
+            trade.duration_minutes = self._duration_minutes(trade.entry_time, exit_time)
+            intent.status = 'CLOSED'
+            event_type = 'POSITION_CLOSED'
+            message = f"Closed {intent.symbol} using confirmed exit quantity {applied_shares}"
+        else:
+            event_type = 'POSITION_REDUCED'
+            message = (
+                f"Reduced {intent.symbol} by confirmed exit quantity {applied_shares}; "
+                f"{remaining_shares} shares remain open"
+            )
+
+        self.record_event(
+            db,
+            intent,
+            event_type=event_type,
+            status=intent.status,
+            message=message,
+            payload={
+                'positionId': position.id,
+                'tradeId': trade.id,
+                'closedShares': applied_shares,
+                'remainingShares': remaining_shares,
+                'exitPrice': exit_price,
+                'exitTrigger': exit_trigger,
+            },
+            event_time=exit_time,
+        )
+        db.commit()
+        db.refresh(intent)
+        return {
+            'position_id': position.id,
+            'trade_id': trade.id,
+            'closed_shares': applied_shares,
+            'remaining_shares': remaining_shares,
+            'exit_price': exit_price,
+            'status': intent.status,
+        }
+
     def serialize_intent(self, intent: OrderIntent, *, db: Session | None = None) -> dict[str, Any]:
         events: list[OrderEvent] = []
         if db is not None:
@@ -356,6 +535,68 @@ class ExecutionLifecycleService:
         if status == 'CANCELED':
             return f"Order canceled for {intent.symbol}"
         return f"Order pending for {intent.symbol}"
+
+    def _resolve_position(self, db: Session, intent: OrderIntent) -> Position | None:
+        position_id = intent.position_id or (intent.context_json or {}).get('linkedPositionId')
+        if position_id:
+            return db.query(Position).filter(Position.id == position_id).first()
+        return (
+            db.query(Position)
+            .filter(Position.account_id == intent.account_id, Position.ticker == intent.symbol, Position.is_open.is_(True))
+            .order_by(Position.id.desc())
+            .first()
+        )
+
+    def _resolve_trade(self, db: Session, intent: OrderIntent) -> Trade | None:
+        trade_id = intent.trade_id or (intent.context_json or {}).get('linkedTradeId')
+        if trade_id:
+            return db.query(Trade).filter(Trade.id == trade_id).first()
+        return (
+            db.query(Trade)
+            .filter(Trade.account_id == intent.account_id, Trade.ticker == intent.symbol)
+            .order_by(Trade.id.desc())
+            .first()
+        )
+
+    def _build_partial_exit_history(
+        self,
+        trade: Trade,
+        intent: OrderIntent,
+        applied_shares: int,
+        exit_price: float,
+        exit_time: datetime,
+        remaining_shares: int,
+    ) -> dict[str, Any]:
+        reasoning = trade.exit_reasoning if isinstance(trade.exit_reasoning, dict) else {}
+        partial_exits = list(reasoning.get('partialExits', []))
+        partial_exits.append(
+            {
+                'intentId': intent.intent_id,
+                'orderId': intent.submitted_order_id,
+                'closedShares': applied_shares,
+                'remainingShares': remaining_shares,
+                'exitPrice': exit_price,
+                'eventTime': exit_time.isoformat(),
+                'status': intent.status,
+                'trigger': (intent.context_json or {}).get('exitTrigger'),
+            }
+        )
+        reasoning.update(
+            {
+                'partialExits': partial_exits,
+                'lastExitIntentId': intent.intent_id,
+                'lastRemainingShares': remaining_shares,
+            }
+        )
+        return reasoning
+
+    def _duration_minutes(self, start: datetime | None, end: datetime | None) -> int | None:
+        if start is None or end is None:
+            return None
+        try:
+            return max(int((end - start).total_seconds() // 60), 0)
+        except TypeError:
+            return None
 
 
 execution_lifecycle = ExecutionLifecycleService()
