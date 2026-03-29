@@ -92,7 +92,8 @@ class DiscordDecisionGuard:
             return False, f'Unsupported decision type: {decision_type or "(missing)"}'
 
         generated_at = self._extract_timestamp(payload)
-        if settings.DISCORD_REQUIRE_DECISION_TIMESTAMP and generated_at is None:
+        is_watchlist_payload = decision_type in {'BOT_STOCK_WATCHLIST_V1', 'BOT_WATCHLIST_V3'}
+        if settings.DISCORD_REQUIRE_DECISION_TIMESTAMP and generated_at is None and not is_watchlist_payload:
             return False, 'Decision JSON is missing a freshness timestamp.'
         if generated_at is not None:
             max_age = max(1, int(settings.DISCORD_DECISION_MAX_AGE_SECONDS))

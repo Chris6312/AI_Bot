@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -47,11 +48,13 @@ def build_session_factory(tmp_path) -> Iterator[sessionmaker]:
         engine.dispose()
 
 
-def build_stock_payload() -> dict:
-    generated_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
-    return {
+def build_stock_payload(*, generated_at: str | None = None, target_session_et: str | None = None) -> dict:
+    generated_at_value = generated_at
+    if generated_at_value is None:
+        generated_at_value = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    payload = {
         'schema_version': 'bot_stock_watchlist_v1',
-        'generated_at_utc': generated_at,
+        'generated_at_utc': generated_at_value,
         'provider': 'claude_tradier_mcp',
         'scope': 'stocks_only',
         'bot_payload': {
@@ -114,6 +117,9 @@ def build_stock_payload() -> dict:
             },
         },
     }
+    if target_session_et is not None:
+        payload['target_session_et'] = target_session_et
+    return payload
 
 
 def build_crypto_payload() -> dict:
@@ -183,6 +189,10 @@ def build_crypto_payload() -> dict:
             },
         },
     }
+
+
+def current_target_session_et() -> str:
+    return watchlist_service.resolve_watchlist_timing(generated_at=None, target_session_et=None)['targetSessionEt']
 
 
 def test_watchlist_service_ingests_stock_watchlist_and_persists_rows(tmp_path) -> None:
@@ -353,6 +363,42 @@ def test_crypto_removed_symbol_becomes_managed_only_from_open_ledger_position(tm
         assert historical_btc is not None
         assert historical_btc.monitoring_status == MANAGED_ONLY
         assert active_payload['managedOnlySymbols'][0]['symbol'] == 'BTC'
+
+
+def test_watchlist_service_auto_stamps_blank_generated_at_and_persists_target_session(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload(generated_at='', target_session_et=current_target_session_et())
+
+        persisted = watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        assert persisted['generatedAtUtc'] is not None
+        assert persisted['generatedAtUtcSource'] == 'auto_stamped'
+        assert persisted['targetSessionEt'] == payload['target_session_et']
+        assert persisted['targetSessionSource'] == 'provided'
+        assert persisted['validation']['freshness']['generatedAtUtcSource'] == 'auto_stamped'
+        assert persisted['watchlistExpiresAtUtc'] is not None
+
+
+def test_watchlist_service_rejects_target_session_too_far_ahead(tmp_path) -> None:
+    timing = watchlist_service.resolve_watchlist_timing(generated_at=None, target_session_et=None)
+    future_session = (datetime.fromisoformat(timing['nextAllowedSessionEt']) + timedelta(days=3)).date().isoformat()
+    payload = build_stock_payload(generated_at='', target_session_et=future_session)
+
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        with pytest.raises(WatchlistValidationError, match='target_session_et is too far ahead'):
+            watchlist_service.ingest_watchlist(db, payload, source='api')
+
+
+def test_discord_guard_accepts_watchlist_schema_version_without_generated_at_utc() -> None:
+    payload = build_stock_payload(generated_at='', target_session_et=current_target_session_et())
+    message = SimpleNamespace(id=654321)
+
+    accepted, reason = discord_decision_guard.validate_and_register(message, payload)
+
+    assert accepted is True
+    assert reason == 'accepted'
 
 
 def test_watchlist_service_rejects_stale_payload() -> None:

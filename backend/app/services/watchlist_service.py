@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -73,6 +74,7 @@ PENDING_EVALUATION = 'PENDING_EVALUATION'
 MONITOR_ONLY = 'MONITOR_ONLY'
 INACTIVE_DECISION = 'INACTIVE'
 MONITORING_OFFSET_SECONDS = 20
+EASTERN_TZ = ZoneInfo('America/New_York')
 
 
 class WatchlistValidationError(ValueError):
@@ -225,9 +227,31 @@ class CryptoBotPayload(_BaseModel):
         return value
 
 
-class StockWatchlistPayload(_BaseModel):
+class WatchlistEnvelopeBase(_BaseModel):
+    generated_at_utc: datetime | None = None
+    target_session_et: date | None = None
+
+    @field_validator('generated_at_utc', mode='before')
+    @classmethod
+    def _normalize_generated_at_utc(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator('target_session_et', mode='before')
+    @classmethod
+    def _normalize_target_session_et(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+
+class StockWatchlistPayload(WatchlistEnvelopeBase):
     schema_version: Literal['bot_stock_watchlist_v1']
-    generated_at_utc: datetime
     provider: str
     scope: Literal['stocks_only']
     bot_payload: StockBotPayload
@@ -239,9 +263,8 @@ class StockWatchlistPayload(_BaseModel):
         return self
 
 
-class CryptoWatchlistPayload(_BaseModel):
+class CryptoWatchlistPayload(WatchlistEnvelopeBase):
     schema_version: Literal['bot_watchlist_v3']
-    generated_at_utc: datetime
     provider: str
     scope: Literal['crypto_only']
     bot_payload: CryptoBotPayload
@@ -280,6 +303,35 @@ def _normalize_dt(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _is_business_day(value: date) -> bool:
+    return value.weekday() < 5
+
+
+def _next_business_day(value: date) -> date:
+    candidate = value
+    while True:
+        candidate += timedelta(days=1)
+        if _is_business_day(candidate):
+            return candidate
+
+
+def _derive_target_session_et(reference_time: datetime) -> date:
+    local_time = _normalize_dt(reference_time).astimezone(EASTERN_TZ)
+    session_date = local_time.date()
+    if not _is_business_day(session_date):
+        while not _is_business_day(session_date):
+            session_date += timedelta(days=1)
+        return session_date
+    if local_time.timetz().replace(tzinfo=None) >= time(hour=16, minute=0):
+        return _next_business_day(session_date)
+    return session_date
+
+
+def _target_session_expiry_utc(target_session: date) -> datetime:
+    session_start_et = datetime.combine(target_session, time.min, tzinfo=EASTERN_TZ)
+    return session_start_et.astimezone(UTC) + timedelta(hours=max(1, int(settings.WATCHLIST_DEFAULT_EXPIRY_HOURS)))
+
+
 def _decision_for_status(status: str) -> tuple[str, str]:
     if status == ACTIVE:
         return PENDING_EVALUATION, 'Awaiting first deterministic template evaluation.'
@@ -314,6 +366,58 @@ class WatchlistService:
             'observedAtUtc': now,
             'ageSeconds': max(0, int(age_seconds)),
             'maxAgeSeconds': max_age,
+            'generatedAtUtcSource': 'provided',
+        }
+
+    def validate_target_session(self, target_session: date, *, reference_time: datetime) -> dict[str, Any]:
+        expected_session = _derive_target_session_et(reference_time)
+        next_session = _next_business_day(expected_session)
+        if target_session < expected_session:
+            raise WatchlistValidationError(
+                f'Watchlist target_session_et is stale ({target_session.isoformat()}); expected {expected_session.isoformat()} or later.'
+            )
+        if target_session > next_session:
+            raise WatchlistValidationError(
+                f'Watchlist target_session_et is too far ahead ({target_session.isoformat()}); expected {expected_session.isoformat()} or {next_session.isoformat()}.'
+            )
+        return {
+            'targetSessionEt': target_session.isoformat(),
+            'expectedSessionEt': expected_session.isoformat(),
+            'nextAllowedSessionEt': next_session.isoformat(),
+        }
+
+    def resolve_watchlist_timing(
+        self,
+        *,
+        generated_at: datetime | None,
+        target_session_et: date | None,
+    ) -> dict[str, Any]:
+        observed_at = datetime.now(UTC)
+        session_reference = generated_at or observed_at
+        freshness: dict[str, Any]
+        if generated_at is not None:
+            freshness = self.validate_freshness(generated_at)
+            observed_at = freshness['observedAtUtc']
+            effective_generated_at = freshness['generatedAtUtc']
+        else:
+            effective_generated_at = observed_at
+            freshness = {
+                'generatedAtUtc': effective_generated_at,
+                'observedAtUtc': observed_at,
+                'ageSeconds': 0,
+                'maxAgeSeconds': max(60, int(settings.WATCHLIST_MAX_AGE_SECONDS)),
+                'generatedAtUtcSource': 'auto_stamped',
+            }
+
+        effective_target_session = target_session_et or _derive_target_session_et(session_reference)
+        target_session_validation = self.validate_target_session(effective_target_session, reference_time=observed_at)
+        target_session_validation['targetSessionSource'] = 'provided' if target_session_et is not None else 'derived'
+        target_session_validation['referenceTimeUtc'] = _normalize_dt(session_reference).isoformat()
+
+        return {
+            **freshness,
+            **target_session_validation,
+            'watchlistExpiresAtUtc': _target_session_expiry_utc(effective_target_session),
         }
 
     def ingest_watchlist(
@@ -327,15 +431,18 @@ class WatchlistService:
         source_message_id: str | None = None,
     ) -> dict[str, Any]:
         parsed = self.parse_payload(payload)
-        freshness = self.validate_freshness(parsed.generated_at_utc)
+        timing = self.resolve_watchlist_timing(
+            generated_at=parsed.generated_at_utc,
+            target_session_et=parsed.target_session_et,
+        )
 
         payload_hash = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
         ).hexdigest()
         upload_id = f'wlu_{uuid.uuid4().hex[:20]}'
         scan_id = f'scan_{uuid.uuid4().hex[:20]}'
-        expires_at = freshness['generatedAtUtc'] + timedelta(hours=max(1, int(settings.WATCHLIST_DEFAULT_EXPIRY_HOURS)))
-        now = freshness['observedAtUtc']
+        expires_at = timing['watchlistExpiresAtUtc']
+        now = timing['observedAtUtc']
 
         next_symbols = {symbol.symbol.upper() for symbol in parsed.bot_payload.symbols}
         self._deactivate_scope_uploads(db, parsed.scope)
@@ -352,7 +459,7 @@ class WatchlistService:
             source_channel_id=source_channel_id,
             source_message_id=source_message_id,
             payload_hash=payload_hash,
-            generated_at_utc=freshness['generatedAtUtc'],
+            generated_at_utc=timing['generatedAtUtc'],
             received_at_utc=now,
             watchlist_expires_at_utc=expires_at,
             validation_status='valid',
@@ -362,15 +469,21 @@ class WatchlistService:
             is_active=True,
             validation_result_json={
                 'freshness': {
-                    'generatedAtUtc': freshness['generatedAtUtc'].isoformat(),
-                    'observedAtUtc': freshness['observedAtUtc'].isoformat(),
-                    'ageSeconds': freshness['ageSeconds'],
-                    'maxAgeSeconds': freshness['maxAgeSeconds'],
+                    'generatedAtUtc': timing['generatedAtUtc'].isoformat(),
+                    'observedAtUtc': timing['observedAtUtc'].isoformat(),
+                    'ageSeconds': timing['ageSeconds'],
+                    'maxAgeSeconds': timing['maxAgeSeconds'],
+                    'generatedAtUtcSource': timing['generatedAtUtcSource'],
                 },
+                'targetSessionEt': timing['targetSessionEt'],
+                'expectedSessionEt': timing['expectedSessionEt'],
+                'nextAllowedSessionEt': timing['nextAllowedSessionEt'],
+                'targetSessionSource': timing['targetSessionSource'],
+                'referenceTimeUtc': timing['referenceTimeUtc'],
                 'selectedCount': len(parsed.bot_payload.symbols),
                 'primaryFocus': parsed.ui_payload.summary.primary_focus,
             },
-            raw_payload_json=payload,
+            raw_payload_json={**payload, 'target_session_et': timing['targetSessionEt']},
             bot_payload_json=parsed.bot_payload.model_dump(mode='json'),
         )
         db.add(upload)
@@ -599,6 +712,9 @@ class WatchlistService:
             if row.upload_id != upload.upload_id
         ]
         status_counts = self.get_scope_status_counts(db, scope=upload.scope)
+        validation_payload = upload.validation_result_json or {}
+        freshness_payload = validation_payload.get('freshness', {})
+        target_session_et = validation_payload.get('targetSessionEt') or (upload.raw_payload_json or {}).get('target_session_et')
         return {
             'uploadId': upload.upload_id,
             'scanId': upload.scan_id,
@@ -611,6 +727,9 @@ class WatchlistService:
             'sourceMessageId': upload.source_message_id,
             'payloadHash': upload.payload_hash,
             'generatedAtUtc': upload.generated_at_utc.isoformat() if upload.generated_at_utc else None,
+            'generatedAtUtcSource': freshness_payload.get('generatedAtUtcSource'),
+            'targetSessionEt': target_session_et,
+            'targetSessionSource': validation_payload.get('targetSessionSource'),
             'receivedAtUtc': upload.received_at_utc.isoformat() if upload.received_at_utc else None,
             'watchlistExpiresAtUtc': upload.watchlist_expires_at_utc.isoformat() if upload.watchlist_expires_at_utc else None,
             'validationStatus': upload.validation_status,
