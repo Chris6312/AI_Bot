@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -9,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.services.control_plane import get_execution_gate_status
 from app.services.kraken_service import TOP_30_PAIRS, kraken_service
+from app.services.runtime_visibility import runtime_visibility_service
 from app.services.safety_validator import SafetyValidator
 from app.services.trade_validator import trade_validator
 from app.services.tradier_client import tradier_client
@@ -50,6 +50,20 @@ class PreTradeGateService:
     def __init__(self) -> None:
         self.safety = SafetyValidator()
 
+    def _record_decision(
+        self,
+        decision: PreTradeGateDecision,
+        *,
+        execution_source: str,
+        context: dict[str, Any] | None = None,
+    ) -> PreTradeGateDecision:
+        runtime_visibility_service.record_gate_decision(
+            decision,
+            execution_source=execution_source,
+            context=context,
+        )
+        return decision
+
     async def evaluate_stock_order(
         self,
         *,
@@ -63,6 +77,11 @@ class PreTradeGateService:
     ) -> PreTradeGateDecision:
         symbol = str(ticker or '').upper().strip()
         selected_mode = str(mode or 'PAPER').upper()
+        context = {
+            'mode': selected_mode,
+            'requestedQuantity': int(shares or 0),
+            'decisionContext': decision_context or {},
+        }
         checks: list[PreTradeGateCheck] = []
 
         control_gate = get_execution_gate_status()
@@ -75,7 +94,15 @@ class PreTradeGateService:
             )
         )
         if not control_gate.allowed:
-            return self._reject('stock', symbol, control_gate.state, checks, control_gate.reason)
+            return self._reject(
+                'stock',
+                symbol,
+                control_gate.state,
+                checks,
+                control_gate.reason,
+                execution_source=execution_source,
+                context=context,
+            )
 
         broker_ready = tradier_client.is_ready(selected_mode)
         checks.append(
@@ -87,7 +114,15 @@ class PreTradeGateService:
             )
         )
         if not broker_ready:
-            return self._reject('stock', symbol, 'REJECTED', checks, checks[-1].reason)
+            return self._reject(
+                'stock',
+                symbol,
+                'REJECTED',
+                checks,
+                checks[-1].reason,
+                execution_source=execution_source,
+                context=context,
+            )
 
         quote = tradier_client.get_quote_sync(symbol, mode=selected_mode)
         validation = trade_validator.validate_stock_trade_with_quote(symbol, shares, selected_mode, quote=quote)
@@ -104,7 +139,15 @@ class PreTradeGateService:
             )
         )
         if not validation['valid']:
-            return self._reject('stock', symbol, 'REJECTED', checks, validation['reason'])
+            return self._reject(
+                'stock',
+                symbol,
+                'REJECTED',
+                checks,
+                validation['reason'],
+                execution_source=execution_source,
+                context=context,
+            )
 
         quote_age_seconds = float(validation.get('quote_age_seconds') or 0.0)
         quote_fresh = quote_age_seconds <= float(settings.PRE_TRADE_STOCK_QUOTE_MAX_AGE_SECONDS)
@@ -127,7 +170,15 @@ class PreTradeGateService:
             )
         )
         if not quote_fresh:
-            return self._reject('stock', symbol, 'REJECTED', checks, checks[-1].reason)
+            return self._reject(
+                'stock',
+                symbol,
+                'REJECTED',
+                checks,
+                checks[-1].reason,
+                execution_source=execution_source,
+                context=context,
+            )
 
         estimated_value = float(validation.get('trade_value') or 0.0)
         account_id = str(
@@ -164,26 +215,38 @@ class PreTradeGateService:
             )
         )
         if not safety_ok:
-            return self._reject('stock', symbol, 'REJECTED', checks, checks[-1].reason)
+            return self._reject(
+                'stock',
+                symbol,
+                'REJECTED',
+                checks,
+                checks[-1].reason,
+                execution_source=execution_source,
+                context=context,
+            )
 
-        return PreTradeGateDecision(
-            allowed=True,
-            asset_class='stock',
-            symbol=symbol,
-            state='READY',
-            checks=checks,
-            market_data={
-                'currentPrice': validation.get('price'),
-                'quoteFetchedAtUtc': validation.get('quote_fetched_at'),
-                'quoteAgeSeconds': quote_age_seconds,
-                'volume': validation.get('volume'),
-                'spreadPct': validation.get('spread_pct'),
-            },
-            risk_data={
-                'estimatedValue': estimated_value,
-                'mode': selected_mode,
-                'accountId': account_id,
-            },
+        return self._record_decision(
+            PreTradeGateDecision(
+                allowed=True,
+                asset_class='stock',
+                symbol=symbol,
+                state='READY',
+                checks=checks,
+                market_data={
+                    'currentPrice': validation.get('price'),
+                    'quoteFetchedAtUtc': validation.get('quote_fetched_at'),
+                    'quoteAgeSeconds': quote_age_seconds,
+                    'volume': validation.get('volume'),
+                    'spreadPct': validation.get('spread_pct'),
+                },
+                risk_data={
+                    'estimatedValue': estimated_value,
+                    'mode': selected_mode,
+                    'accountId': account_id,
+                },
+            ),
+            execution_source=execution_source,
+            context=context,
         )
 
     async def evaluate_crypto_order(
@@ -197,6 +260,10 @@ class PreTradeGateService:
         decision_context: dict[str, Any] | None = None,
     ) -> PreTradeGateDecision:
         symbol = str(pair or '').upper().strip()
+        context = {
+            'requestedAmount': float(amount or 0.0),
+            'decisionContext': decision_context or {},
+        }
         checks: list[PreTradeGateCheck] = []
 
         control_gate = get_execution_gate_status()
@@ -209,7 +276,15 @@ class PreTradeGateService:
             )
         )
         if not control_gate.allowed:
-            return self._reject('crypto', symbol, control_gate.state, checks, control_gate.reason)
+            return self._reject(
+                'crypto',
+                symbol,
+                control_gate.state,
+                checks,
+                control_gate.reason,
+                execution_source=execution_source,
+                context=context,
+            )
 
         supported_pair = symbol in TOP_30_PAIRS
         checks.append(
@@ -221,7 +296,15 @@ class PreTradeGateService:
             )
         )
         if not supported_pair:
-            return self._reject('crypto', symbol, 'REJECTED', checks, checks[-1].reason)
+            return self._reject(
+                'crypto',
+                symbol,
+                'REJECTED',
+                checks,
+                checks[-1].reason,
+                execution_source=execution_source,
+                context=context,
+            )
 
         ohlcv_pair = TOP_30_PAIRS[symbol]
         ticker = kraken_service.get_ticker(ohlcv_pair)
@@ -240,7 +323,15 @@ class PreTradeGateService:
             )
         )
         if not validation['valid']:
-            return self._reject('crypto', symbol, 'REJECTED', checks, validation['reason'])
+            return self._reject(
+                'crypto',
+                symbol,
+                'REJECTED',
+                checks,
+                validation['reason'],
+                execution_source=execution_source,
+                context=context,
+            )
 
         ticker_age_seconds = float(validation.get('ticker_age_seconds') or 0.0)
         ticker_fresh = ticker_age_seconds <= float(settings.PRE_TRADE_CRYPTO_TICKER_MAX_AGE_SECONDS)
@@ -263,7 +354,15 @@ class PreTradeGateService:
             )
         )
         if not ticker_fresh:
-            return self._reject('crypto', symbol, 'REJECTED', checks, checks[-1].reason)
+            return self._reject(
+                'crypto',
+                symbol,
+                'REJECTED',
+                checks,
+                checks[-1].reason,
+                execution_source=execution_source,
+                context=context,
+            )
 
         continuity = self._validate_candle_continuity(candles, interval_minutes=5)
         checks.append(
@@ -278,7 +377,15 @@ class PreTradeGateService:
             )
         )
         if not continuity['valid']:
-            return self._reject('crypto', symbol, 'REJECTED', checks, continuity['reason'])
+            return self._reject(
+                'crypto',
+                symbol,
+                'REJECTED',
+                checks,
+                continuity['reason'],
+                execution_source=execution_source,
+                context=context,
+            )
 
         estimated_value = float(validation.get('trade_value') or 0.0)
         safety_payload = {
@@ -309,26 +416,38 @@ class PreTradeGateService:
             )
         )
         if not safety_ok:
-            return self._reject('crypto', symbol, 'REJECTED', checks, checks[-1].reason)
+            return self._reject(
+                'crypto',
+                symbol,
+                'REJECTED',
+                checks,
+                checks[-1].reason,
+                execution_source=execution_source,
+                context=context,
+            )
 
-        return PreTradeGateDecision(
-            allowed=True,
-            asset_class='crypto',
-            symbol=symbol,
-            state='READY',
-            checks=checks,
-            market_data={
-                'currentPrice': validation.get('price'),
-                'tickerFetchedAtUtc': validation.get('ticker_fetched_at'),
-                'tickerAgeSeconds': ticker_age_seconds,
-                'volumeUsd24h': validation.get('volume_usd'),
-                'spreadPct': validation.get('spread_pct'),
-                'ohlcvPair': ohlcv_pair,
-            },
-            risk_data={
-                'estimatedValue': estimated_value,
-                'accountId': 'CRYPTO_PAPER',
-            },
+        return self._record_decision(
+            PreTradeGateDecision(
+                allowed=True,
+                asset_class='crypto',
+                symbol=symbol,
+                state='READY',
+                checks=checks,
+                market_data={
+                    'currentPrice': validation.get('price'),
+                    'tickerFetchedAtUtc': validation.get('ticker_fetched_at'),
+                    'tickerAgeSeconds': ticker_age_seconds,
+                    'volumeUsd24h': validation.get('volume_usd'),
+                    'spreadPct': validation.get('spread_pct'),
+                    'ohlcvPair': ohlcv_pair,
+                },
+                risk_data={
+                    'estimatedValue': estimated_value,
+                    'accountId': 'CRYPTO_PAPER',
+                },
+            ),
+            execution_source=execution_source,
+            context=context,
         )
 
     def _validate_candle_continuity(self, candles: list[dict[str, Any]], *, interval_minutes: int) -> dict[str, Any]:
@@ -359,9 +478,7 @@ class PreTradeGateService:
             if gap > max_allowed_gap:
                 return {
                     'valid': False,
-                    'reason': (
-                        f'Candle continuity broken ({gap}s gap > {max_allowed_gap}s threshold)'
-                    ),
+                    'reason': f'Candle continuity broken ({gap}s gap > {max_allowed_gap}s threshold)',
                     'largest_gap_seconds': gap,
                 }
 
@@ -374,14 +491,21 @@ class PreTradeGateService:
         state: str,
         checks: list[PreTradeGateCheck],
         reason: str,
+        *,
+        execution_source: str,
+        context: dict[str, Any] | None = None,
     ) -> PreTradeGateDecision:
-        return PreTradeGateDecision(
-            allowed=False,
-            asset_class=asset_class,
-            symbol=symbol,
-            state=state,
-            rejection_reason=reason,
-            checks=checks,
+        return self._record_decision(
+            PreTradeGateDecision(
+                allowed=False,
+                asset_class=asset_class,
+                symbol=symbol,
+                state=state,
+                rejection_reason=reason,
+                checks=checks,
+            ),
+            execution_source=execution_source,
+            context=context,
         )
 
 

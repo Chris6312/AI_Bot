@@ -1,5 +1,90 @@
 export type TradingMode = 'LIVE' | 'PAPER'
 
+export interface ControlPlaneStatus {
+  state: 'LOCKED' | 'READ_ONLY' | 'PAUSED' | 'ARMED' | string
+  reason: string
+  runtimeRunning: boolean
+  adminApiReady: boolean
+  discordAuthReady: boolean
+  authorizationReady: boolean
+  lastHeartbeat: string
+}
+
+export interface ExecutionGateStatus {
+  allowed: boolean
+  state: string
+  reason: string
+  statusCode: number
+}
+
+export interface DependencyCheck {
+  name: string
+  state: 'READY' | 'DEGRADED' | 'MISSING' | string
+  ready: boolean
+  reason: string
+  checkedAtUtc: string
+  details: Record<string, unknown>
+}
+
+export interface DependencyVisibility {
+  observedAtUtc: string
+  expiresAtUtc: string
+  summary: {
+    readyCount: number
+    degradedCount: number
+    missingCount: number
+    criticalReady: boolean
+  }
+  checks: {
+    tradierPaper: DependencyCheck
+    tradierLive: DependencyCheck
+    krakenMarketData: DependencyCheck
+  }
+}
+
+export interface GateCheck {
+  name: string
+  passed: boolean
+  reason: string
+  details: Record<string, unknown>
+}
+
+export interface GateDecisionRecord {
+  recordedAtUtc: string
+  allowed: boolean
+  assetClass: 'stock' | 'crypto' | string
+  symbol: string
+  state: string
+  rejectionReason: string
+  executionSource: string
+  checks: GateCheck[]
+  marketData: Record<string, unknown>
+  riskData: Record<string, unknown>
+  context: Record<string, unknown>
+}
+
+export interface GateSnapshot {
+  capturedAtUtc: string
+  summary: {
+    total: number
+    allowedCount: number
+    rejectedCount: number
+    lastDecision: GateDecisionRecord | null
+    lastAllowed: GateDecisionRecord | null
+    lastRejected: GateDecisionRecord | null
+  }
+  recent: GateDecisionRecord[]
+  recentRejections: GateDecisionRecord[]
+}
+
+export interface RuntimeVisibility {
+  capturedAtUtc: string
+  controlPlane: ControlPlaneStatus
+  executionGate: ExecutionGateStatus
+  dependencies: DependencyVisibility
+  gate: GateSnapshot
+}
+
 export interface StockPosition {
   symbol: string
   shares: number
@@ -98,6 +183,14 @@ export interface BotStatus {
   cryptoCapabilities: {
     paperReady: boolean
     liveReady: boolean
+  }
+  controlPlane: ControlPlaneStatus
+  executionGate: ExecutionGateStatus
+  runtimeVisibility: {
+    gateSummary: GateSnapshot['summary']
+    dependencySummary: DependencyVisibility['summary']
+    lastDecision: GateDecisionRecord | null
+    lastRejected: GateDecisionRecord | null
   }
 }
 

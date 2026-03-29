@@ -12,12 +12,17 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.routers import crypto
+from app.core.database import get_db
+from app.models.order_intent import OrderIntent
 from app.services.control_plane import get_control_plane_status, require_admin_token
+from app.services.execution_lifecycle import execution_lifecycle
 from app.services.kraken_service import crypto_ledger
+from app.services.runtime_visibility import runtime_visibility_service
 from app.services.runtime_state import runtime_state
 from app.services.tradier_client import tradier_client
 
@@ -96,15 +101,22 @@ async def root():
 
 @app.get('/health')
 async def health():
-    return {'status': 'healthy'}
+    dependencies = runtime_visibility_service.get_dependency_status()
+    return {
+        'status': 'healthy' if dependencies['summary']['criticalReady'] else 'degraded',
+        'dependencies': dependencies,
+    }
 
 
 @app.get('/ready')
-async def ready():
+async def ready(force_refresh: bool = Query(False)):
     control_plane = get_control_plane_status()
+    dependencies = runtime_visibility_service.get_dependency_status(force_refresh=force_refresh)
+    readiness_ok = bool(control_plane['authorizationReady'] and dependencies['summary']['criticalReady'])
     return {
-        'status': 'ready' if control_plane['authorizationReady'] else 'degraded',
+        'status': 'ready' if readiness_ok else 'degraded',
         'controlPlane': control_plane,
+        'dependencies': dependencies,
         'stockCapabilities': {
             'paperReady': tradier_client.is_ready('PAPER'),
             'liveReady': tradier_client.is_ready('LIVE'),
@@ -119,6 +131,7 @@ async def ready():
 @app.get('/api/status')
 async def get_status():
     state = runtime_state.get()
+    runtime_visibility = runtime_visibility_service.get_runtime_snapshot(limit=5)
     return {
         'running': state.running,
         'mode': state.stock_mode,
@@ -134,13 +147,28 @@ async def get_status():
             'paperReady': True,
             'liveReady': False,
         },
-        'controlPlane': get_control_plane_status(),
+        'controlPlane': runtime_visibility['controlPlane'],
+        'executionGate': runtime_visibility['executionGate'],
+        'runtimeVisibility': {
+            'gateSummary': runtime_visibility['gate']['summary'],
+            'dependencySummary': runtime_visibility['dependencies']['summary'],
+            'lastDecision': runtime_visibility['gate']['summary']['lastDecision'],
+            'lastRejected': runtime_visibility['gate']['summary']['lastRejected'],
+        },
     }
 
 
 @app.get('/api/control-state')
 async def get_control_state():
     return get_control_plane_status()
+
+
+@app.get('/api/runtime-visibility')
+async def get_runtime_visibility(
+    limit: int = Query(10, ge=1, le=50),
+    force_refresh: bool = Query(False),
+):
+    return runtime_visibility_service.get_runtime_snapshot(limit=limit, force_refresh=force_refresh)
 
 
 @app.post('/api/control/toggle')
@@ -187,9 +215,18 @@ async def get_stock_positions():
 
 
 @app.get('/api/stocks/history')
-async def get_stock_history(limit: int = Query(50, ge=1, le=500)):
-    # Placeholder until order history ingestion is added.
-    return []
+async def get_stock_history(
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    intents = (
+        db.query(OrderIntent)
+        .filter(OrderIntent.asset_class == 'stock')
+        .order_by(OrderIntent.created_at.desc(), OrderIntent.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [execution_lifecycle.serialize_intent(intent, db=db) for intent in intents]
 
 
 @app.get('/api/ai/decisions')
