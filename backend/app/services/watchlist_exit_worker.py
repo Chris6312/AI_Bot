@@ -17,6 +17,7 @@ from app.models.trade import Trade
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.market_sessions import get_scope_session_status
 from app.services.runtime_state import runtime_state
+from app.services.trade_validator import trade_validator
 from app.services.tradier_client import tradier_client
 from app.services.watchlist_service import watchlist_service
 
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 ACTIVE_EXIT_INTENT_STATUSES = {'READY', 'SUBMITTED', 'PARTIALLY_FILLED', 'FILLED'}
 TERMINAL_EXIT_INTENT_STATUSES = {'REJECTED', 'CLOSED', 'CANCELED', 'CANCELLED', 'ERROR', 'FAILED'}
 EXIT_TRIGGER = 'TIME_STOP_EXPIRED'
+STOP_LOSS_TRIGGER = 'STOP_LOSS_BREACH'
+TRAILING_STOP_TRIGGER = 'TRAILING_STOP_BREACH'
 EXECUTION_SOURCE = 'WATCHLIST_EXIT_WORKER'
 SUPPORTED_SCOPE = 'stocks_only'
 
@@ -50,6 +53,8 @@ class WatchlistExitWorkerService:
     def get_status(self, db: Session) -> dict[str, Any]:
         observed_at = datetime.now(UTC)
         due_rows = self._get_due_rows(db)
+        expired_rows = [row for row in due_rows if row.get('positionState', {}).get('positionExpired')]
+        protective_rows = [row for row in due_rows if row.get('positionState', {}).get('protectiveExitPending')]
         session = get_scope_session_status(SUPPORTED_SCOPE, observed_at)
         session_open = bool(getattr(session, 'session_open', False))
         eligible_due = len(due_rows) if session_open else 0
@@ -69,10 +74,16 @@ class WatchlistExitWorkerService:
             'consecutiveFailures': self._runtime.consecutive_failures,
             'lastRunSummary': self._runtime.last_run_summary,
             'summary': {
-                'expiredPositionCount': len(due_rows),
-                'eligibleExpiredCount': eligible_due,
-                'blockedExpiredCount': blocked_due,
-                'managedOnlyExpiredCount': sum(1 for row in due_rows if row.get('managedOnly')),
+                'candidateExitCount': len(due_rows),
+                'expiredPositionCount': len(expired_rows),
+                'protectiveExitCount': len(protective_rows),
+                'eligibleExpiredCount': len(expired_rows) if session_open else 0,
+                'blockedExpiredCount': 0 if session_open else len(expired_rows),
+                'eligibleProtectiveCount': len(protective_rows) if session_open else 0,
+                'blockedProtectiveCount': 0 if session_open else len(protective_rows),
+                'eligibleExitCount': eligible_due,
+                'blockedExitCount': blocked_due,
+                'managedOnlyExpiredCount': sum(1 for row in expired_rows if row.get('managedOnly')),
                 'alreadyInProgressCount': sum(1 for row in due_rows if self._has_active_exit_intent(db, row)),
             },
             'rows': [
@@ -81,6 +92,8 @@ class WatchlistExitWorkerService:
                     'managedOnly': bool(row.get('managedOnly')),
                     'positionState': row.get('positionState', {}),
                     'monitoringStatus': row.get('monitoringStatus'),
+                    'exitTrigger': self._primary_exit_trigger(row),
+                    'exitReasons': self._build_exit_reasons(row),
                     'exitAlreadyInProgress': self._has_active_exit_intent(db, row),
                 }
                 for row in due_rows
@@ -107,8 +120,9 @@ class WatchlistExitWorkerService:
         limit: int = 25,
     ) -> dict[str, Any]:
         observed_at = datetime.now(UTC)
-        due_rows = self._get_due_rows(db)[: max(1, int(limit))]
         runtime = runtime_state.get()
+        refreshed_price_count = self._refresh_open_position_prices(db, mode=runtime.stock_mode)
+        due_rows = self._get_due_rows(db)[: max(1, int(limit))]
         session = get_scope_session_status(SUPPORTED_SCOPE, observed_at)
         result: dict[str, Any] = {
             'scope': SUPPORTED_SCOPE,
@@ -119,7 +133,9 @@ class WatchlistExitWorkerService:
             'brokerReady': tradier_client.is_ready(runtime.stock_mode),
             'session': session.to_dict(),
             'summary': {
-                'expiredPositionCount': len(due_rows),
+                'expiredPositionCount': sum(1 for row in due_rows if row.get('positionState', {}).get('positionExpired')),
+                'protectiveExitCount': sum(1 for row in due_rows if row.get('positionState', {}).get('protectiveExitPending')),
+                'refreshedPriceCount': refreshed_price_count,
                 'candidateCount': 0,
                 'submittedCount': 0,
                 'closedCount': 0,
@@ -245,7 +261,8 @@ class WatchlistExitWorkerService:
             trade_id=self._resolve_trade_id_for_position(db, position),
             linked_intent_id=str(position.execution_id or '').strip() or None,
             context={
-                'exitTrigger': EXIT_TRIGGER,
+                'exitTrigger': candidate.get('exitTrigger') or EXIT_TRIGGER,
+                'exitReasons': candidate.get('exitReasons') or [],
                 'mode': mode,
                 'fallbackQuantity': fallback_quantity,
                 'brokerQuantity': broker_quantity,
@@ -268,7 +285,7 @@ class WatchlistExitWorkerService:
                 db,
                 exit_intent,
                 current_price=float(position.current_price or 0.0) or None,
-                exit_trigger=EXIT_TRIGGER,
+                exit_trigger=str(candidate.get('exitTrigger') or EXIT_TRIGGER),
             )
         except Exception as exc:
             execution_lifecycle.record_event(
@@ -277,7 +294,7 @@ class WatchlistExitWorkerService:
                 event_type='EXIT_SUBMISSION_FAILED',
                 status='REJECTED',
                 message=f'Watchlist exit worker failed for {position.ticker}: {exc}',
-                payload={'error': str(exc), 'exitTrigger': EXIT_TRIGGER},
+                payload={'error': str(exc), 'exitTrigger': candidate.get('exitTrigger') or EXIT_TRIGGER},
             )
             exit_intent.status = 'REJECTED'
             exit_intent.rejection_reason = str(exc)
@@ -340,7 +357,12 @@ class WatchlistExitWorkerService:
     def _get_due_rows(self, db: Session) -> list[dict[str, Any]]:
         snapshot = watchlist_service.get_exit_readiness_snapshot(db, scope=SUPPORTED_SCOPE, expiring_within_hours=24)
         rows = list(snapshot.get('rows', []))
-        return [row for row in rows if row.get('positionState', {}).get('positionExpired')]
+        return [
+            row
+            for row in rows
+            if row.get('positionState', {}).get('positionExpired')
+            or row.get('positionState', {}).get('protectiveExitPending')
+        ]
 
     def _build_candidate_row(self, db: Session, row: dict[str, Any]) -> dict[str, Any]:
         payload = {
@@ -350,6 +372,8 @@ class WatchlistExitWorkerService:
             'positionId': row.get('positionState', {}).get('positionId'),
             'positionState': row.get('positionState', {}),
             'exitTemplate': row.get('exitTemplate'),
+            'exitTrigger': self._primary_exit_trigger(row),
+            'exitReasons': self._build_exit_reasons(row),
             'action': None,
             'reason': None,
         }
@@ -393,6 +417,104 @@ class WatchlistExitWorkerService:
             return int(tradier_client.get_position_quantity_sync(symbol, mode=mode) or 0)
         except Exception:
             return 0
+
+    @staticmethod
+    def _build_exit_reasons(row: dict[str, Any]) -> list[str]:
+        position_state = row.get('positionState', {}) if isinstance(row, dict) else {}
+        reasons = list(position_state.get('protectiveExitReasons') or [])
+        if position_state.get('positionExpired'):
+            reasons.append(EXIT_TRIGGER)
+        ordered: list[str] = []
+        for reason in reasons:
+            if reason and reason not in ordered:
+                ordered.append(str(reason))
+        return ordered
+
+    @classmethod
+    def _primary_exit_trigger(cls, row: dict[str, Any]) -> str:
+        reasons = cls._build_exit_reasons(row)
+        for preferred in (STOP_LOSS_TRIGGER, TRAILING_STOP_TRIGGER, EXIT_TRIGGER):
+            if preferred in reasons:
+                return preferred
+        return reasons[0] if reasons else EXIT_TRIGGER
+
+    @staticmethod
+    def _refresh_open_position_prices(db: Session, *, mode: str) -> int:
+        if not tradier_client.is_ready(mode):
+            return 0
+        positions = (
+            db.query(Position)
+            .filter(Position.is_open.is_(True))
+            .order_by(Position.id.asc())
+            .all()
+        )
+        if not positions:
+            return 0
+        symbols = [str(position.ticker or '').upper().strip() for position in positions if str(position.ticker or '').strip()]
+        if not symbols:
+            return 0
+        try:
+            quotes = tradier_client.get_quotes_sync(symbols, mode=mode)
+        except Exception:
+            return 0
+
+        changed_count = 0
+        for position in positions:
+            symbol = str(position.ticker or '').upper().strip()
+            if not symbol:
+                continue
+            quote = quotes.get(symbol, {})
+            if not isinstance(quote, dict):
+                continue
+            market_timestamp = trade_validator._extract_market_timestamp(quote)
+            if market_timestamp is None:
+                continue
+            current_price = 0.0
+            for key in ('last', 'close', 'bid', 'ask'):
+                try:
+                    value = float(quote.get(key) or 0.0)
+                except (TypeError, ValueError):
+                    value = 0.0
+                if value > 0:
+                    current_price = value
+                    break
+            if current_price <= 0:
+                continue
+
+            changed = False
+            if float(position.current_price or 0.0) != current_price:
+                position.current_price = current_price
+                changed = True
+
+            peak_price = max(float(position.peak_price or 0.0), current_price)
+            if float(position.peak_price or 0.0) != peak_price:
+                position.peak_price = peak_price
+                changed = True
+
+            if position.trailing_stop is not None:
+                trailing_candidate = round(peak_price * (1.0 - float(settings.TRAILING_STOP_PCT)), 4)
+                if trailing_candidate > float(position.trailing_stop or 0.0):
+                    position.trailing_stop = trailing_candidate
+                    changed = True
+
+            avg_entry_price = float(position.avg_entry_price or 0.0)
+            shares = int(position.shares or 0)
+            if avg_entry_price > 0 and shares > 0:
+                unrealized_pnl = round((current_price - avg_entry_price) * shares, 4)
+                unrealized_pnl_pct = round(((current_price / avg_entry_price) - 1.0) * 100.0, 4)
+                if float(position.unrealized_pnl or 0.0) != unrealized_pnl:
+                    position.unrealized_pnl = unrealized_pnl
+                    changed = True
+                if float(position.unrealized_pnl_pct or 0.0) != unrealized_pnl_pct:
+                    position.unrealized_pnl_pct = unrealized_pnl_pct
+                    changed = True
+
+            if changed:
+                changed_count += 1
+
+        if changed_count > 0:
+            db.commit()
+        return changed_count
 
 
 watchlist_exit_worker = WatchlistExitWorkerService()

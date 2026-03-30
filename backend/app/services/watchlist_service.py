@@ -549,6 +549,15 @@ class WatchlistService:
                     'inactiveDecisionCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == INACTIVE_DECISION),
                     'openPositionCount': sum(1 for row in rows if row.get('positionState', {}).get('hasOpenPosition')),
                     'expiredPositionCount': sum(1 for row in rows if row.get('positionState', {}).get('positionExpired')),
+                    'protectiveExitPendingCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('protectiveExitPending')
+                    ),
+                    'stopLossBreachedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('stopLossBreached')
+                    ),
+                    'trailingStopBreachedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('trailingStopBreached')
+                    ),
                     'expiringWithin24hCount': sum(
                         1
                         for row in rows
@@ -594,6 +603,15 @@ class WatchlistService:
                     'openPositionCount': len(rows),
                     'expiredPositionCount': len(due_rows),
                     'expiringWithinWindowCount': len(expiring_rows),
+                    'protectiveExitPendingCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('protectiveExitPending')
+                    ),
+                    'stopLossBreachedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('stopLossBreached')
+                    ),
+                    'trailingStopBreachedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('trailingStopBreached')
+                    ),
                     'managedOnlyOpenCount': sum(1 for row in rows if row.get('managedOnly')),
                 },
                 'rows': rows,
@@ -888,6 +906,11 @@ class WatchlistService:
             'positionExpired': False,
             'hoursUntilExpiry': None,
             'exitDeadlineSource': None,
+            'protectiveExitPending': False,
+            'protectiveExitReasons': [],
+            'stopLossBreached': False,
+            'trailingStopBreached': False,
+            'peakPrice': None,
         }
         return symbol_payload
 
@@ -930,22 +953,45 @@ class WatchlistService:
             if expires_at is not None:
                 hours_until_expiry = round((expires_at - observed_at).total_seconds() / 3600.0, 2)
                 position_expired = expires_at <= observed_at
+            current_price = float(position.current_price or 0.0) if position.current_price is not None else None
+            stop_loss = float(position.stop_loss or 0.0) if position.stop_loss is not None else None
+            trailing_stop = float(position.trailing_stop or 0.0) if position.trailing_stop is not None else None
+            peak_price = float(position.peak_price or 0.0) if position.peak_price is not None else None
+            stop_loss_breached = bool(
+                current_price is not None and stop_loss is not None and stop_loss > 0 and current_price <= stop_loss
+            )
+            trailing_stop_breached = bool(
+                current_price is not None
+                and trailing_stop is not None
+                and trailing_stop > 0
+                and current_price <= trailing_stop
+            )
+            protective_exit_reasons: list[str] = []
+            if stop_loss_breached:
+                protective_exit_reasons.append('STOP_LOSS_BREACH')
+            if trailing_stop_breached:
+                protective_exit_reasons.append('TRAILING_STOP_BREACH')
             state_map[symbol] = {
                 'hasOpenPosition': True,
                 'accountId': position.account_id,
                 'positionId': position.id,
                 'shares': int(position.shares or 0),
                 'avgEntryPrice': float(position.avg_entry_price or 0.0) if position.avg_entry_price is not None else None,
-                'currentPrice': float(position.current_price or 0.0) if position.current_price is not None else None,
-                'stopLoss': float(position.stop_loss or 0.0) if position.stop_loss is not None else None,
+                'currentPrice': current_price,
+                'stopLoss': stop_loss,
                 'profitTarget': float(position.profit_target or 0.0) if position.profit_target is not None else None,
-                'trailingStop': float(position.trailing_stop or 0.0) if position.trailing_stop is not None else None,
+                'trailingStop': trailing_stop,
+                'peakPrice': peak_price,
                 'entryTimeUtc': entry_time.isoformat() if entry_time else None,
                 'maxHoldHours': max_hold_hours,
                 'positionExpiresAtUtc': expires_at.isoformat() if expires_at else None,
                 'positionExpired': position_expired,
                 'hoursUntilExpiry': hours_until_expiry,
                 'exitDeadlineSource': 'watchlist_max_hold' if expires_at is not None else None,
+                'protectiveExitPending': bool(protective_exit_reasons),
+                'protectiveExitReasons': protective_exit_reasons,
+                'stopLossBreached': stop_loss_breached,
+                'trailingStopBreached': trailing_stop_breached,
             }
         return state_map
 
@@ -978,6 +1024,11 @@ class WatchlistService:
                 'positionExpired': False,
                 'hoursUntilExpiry': None,
                 'exitDeadlineSource': 'unavailable_crypto_ledger',
+                'protectiveExitPending': False,
+                'protectiveExitReasons': [],
+                'stopLossBreached': False,
+                'trailingStopBreached': False,
+                'peakPrice': None,
                 'observedAtUtc': observed_at.isoformat(),
             }
             for candidate in candidates:
