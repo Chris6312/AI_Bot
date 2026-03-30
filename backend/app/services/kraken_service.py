@@ -398,8 +398,16 @@ class KrakenAPIService:
             ticker = self.get_ticker(resolved_pair)
             if ticker and 'c' in ticker:
                 current_price = float(ticker['c'][0])
-                prices[resolved_pair] = current_price
-                prices[str(pair)] = current_price
+                for alias in {
+                    resolved_pair,
+                    str(pair),
+                    metadata.pair_key if metadata is not None else None,
+                    metadata.altname if metadata is not None else None,
+                    metadata.ws_pair if metadata is not None else None,
+                    metadata.display_pair if metadata is not None else None,
+                }:
+                    if str(alias or '').strip():
+                        prices[str(alias)] = current_price
 
         return prices
 
@@ -533,6 +541,42 @@ class CryptoPaperLedger:
         analytics['realized_pnl_total'] = round(sum(analytics['realized_pnl_by_pair'].values()), 8)
         return analytics
 
+    def _get_price_for_pair(self, pair: str, prices: Dict[str, float], ohlcv_pair: str | None = None) -> float:
+        metadata = self.kraken.resolve_pair(pair)
+        aliases = [
+            pair,
+            ohlcv_pair,
+            metadata.rest_pair if metadata is not None else None,
+            metadata.pair_key if metadata is not None else None,
+            metadata.altname if metadata is not None else None,
+            metadata.ws_pair if metadata is not None else None,
+            metadata.display_pair if metadata is not None else None,
+        ]
+
+        for alias in aliases:
+            if alias in prices and prices.get(alias) is not None:
+                try:
+                    return float(prices[alias])
+                except (TypeError, ValueError):
+                    continue
+
+        normalized_aliases = {
+            self.kraken._normalize_pair_alias(alias)
+            for alias in aliases
+            if str(alias or '').strip()
+        }
+        normalized_aliases.discard('')
+
+        for price_key, price_value in prices.items():
+            if self.kraken._normalize_pair_alias(price_key) not in normalized_aliases:
+                continue
+            try:
+                return float(price_value)
+            except (TypeError, ValueError):
+                continue
+
+        return 0.0
+
     def get_positions(self) -> List[Dict]:
         """Get current positions with P&L and paper-equity context."""
         positions = []
@@ -548,7 +592,7 @@ class CryptoPaperLedger:
             ohlcv_pair = self.kraken.get_ohlcv_pair(pair)
             if not ohlcv_pair:
                 continue
-            current_price = float(prices.get(ohlcv_pair, 0) or 0)
+            current_price = self._get_price_for_pair(pair, prices, ohlcv_pair)
             if current_price <= 0:
                 continue
 

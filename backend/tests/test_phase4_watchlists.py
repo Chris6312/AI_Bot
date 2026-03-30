@@ -191,6 +191,68 @@ def build_crypto_payload() -> dict:
     }
 
 
+def test_monitoring_startup_bootstrap_refreshes_assetpairs_and_forces_crypto_eval(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        db.close()
+
+        monkeypatch.setattr('app.services.watchlist_monitoring.SessionLocal', SessionFactory)
+
+        calls: dict[str, object] = {'refresh_force': None, 'evaluate': None}
+
+        def fake_refresh_asset_pairs(*, force: bool = False):
+            calls['refresh_force'] = force
+            return {
+                'BTC/USD': 'XBTUSD',
+                'ETH/USD': 'ETHUSD',
+            }
+
+        def fake_evaluate_scope(db, *, scope, limit=25, force=False, eligible_statuses=None):
+            calls['evaluate'] = {
+                'scope': scope,
+                'limit': limit,
+                'force': force,
+                'eligible_statuses': eligible_statuses,
+            }
+            return {
+                'scope': scope,
+                'capturedAtUtc': datetime.now(UTC).isoformat(),
+                'evaluatedCount': 2,
+                'summary': {
+                    'entryCandidateCount': 0,
+                    'waitingForSetupCount': 2,
+                    'dataStaleCount': 0,
+                    'dataUnavailableCount': 0,
+                    'monitorOnlyCount': 0,
+                    'inactiveCount': 0,
+                    'biasConflictCount': 0,
+                    'evaluationBlockedCount': 0,
+                },
+                'rows': [],
+                'monitoringSnapshot': {'summary': {'activeCount': 2}},
+            }
+
+        monkeypatch.setattr('app.services.watchlist_monitoring.kraken_service.refresh_asset_pairs', fake_refresh_asset_pairs)
+        monkeypatch.setattr('app.services.watchlist_monitoring.template_evaluation_service.evaluate_scope', fake_evaluate_scope)
+
+        summary = watchlist_monitoring_orchestrator._bootstrap_startup_state_sync()
+
+        assert calls['refresh_force'] is True
+        assert calls['evaluate'] == {
+            'scope': 'crypto_only',
+            'limit': 2,
+            'force': True,
+            'eligible_statuses': ('ACTIVE', 'MANAGED_ONLY'),
+        }
+        assert summary['assetPairsRefreshed'] is True
+        assert summary['assetPairCount'] == 2
+        assert summary['cryptoMonitorRefreshApplied'] is True
+        assert summary['evaluatedCount'] == 2
+        assert summary['evaluationSummary']['waitingForSetupCount'] == 2
+
+
 def test_watchlist_service_ingests_stock_watchlist_and_persists_rows(tmp_path) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
         db = SessionFactory()

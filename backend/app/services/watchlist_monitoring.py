@@ -13,6 +13,7 @@ from app.core.database import SessionLocal
 from app.models.watchlist_monitor_state import WatchlistMonitorState
 from app.services.market_sessions import get_scope_session_status
 from app.services.template_evaluator import template_evaluation_service
+from app.services.kraken_service import kraken_service
 from app.services.watchlist_service import ACTIVE, MANAGED_ONLY, PENDING_EVALUATION, WATCHLIST_SCOPE, watchlist_service
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,61 @@ class WatchlistMonitoringOrchestrator:
             enabled=bool(settings.WATCHLIST_MONITOR_ENABLED),
             poll_seconds=max(5, int(settings.WATCHLIST_MONITOR_POLL_SECONDS)),
         )
+
+    async def bootstrap_startup_state(self, *, refresh_crypto_monitor_state: bool = True) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._bootstrap_startup_state_sync,
+            refresh_crypto_monitor_state=refresh_crypto_monitor_state,
+        )
+
+    def _bootstrap_startup_state_sync(self, *, refresh_crypto_monitor_state: bool = True) -> dict[str, Any]:
+        started_at = datetime.now(UTC)
+        summary: dict[str, Any] = {
+            'capturedAtUtc': started_at.isoformat(),
+            'assetPairsRefreshed': False,
+            'assetPairCount': 0,
+            'cryptoMonitorRefreshAttempted': bool(refresh_crypto_monitor_state),
+            'cryptoMonitorRefreshApplied': False,
+            'evaluatedCount': 0,
+            'evaluationSummary': {},
+            'monitoringSnapshot': None,
+        }
+
+        asset_pairs = kraken_service.refresh_asset_pairs(force=True)
+        summary['assetPairsRefreshed'] = True
+        summary['assetPairCount'] = len(asset_pairs)
+
+        if not refresh_crypto_monitor_state:
+            return summary
+
+        db = SessionLocal()
+        try:
+            watchlist_service.reconcile_scope_statuses(db, scope='crypto_only')
+            eligible_count = (
+                db.query(WatchlistMonitorState)
+                .filter(
+                    WatchlistMonitorState.scope == 'crypto_only',
+                    WatchlistMonitorState.monitoring_status.in_(ELIGIBLE_DUE_STATUSES),
+                )
+                .count()
+            )
+            evaluation = template_evaluation_service.evaluate_scope(
+                db,
+                scope='crypto_only',
+                limit=max(1, eligible_count),
+                force=True,
+                eligible_statuses=ELIGIBLE_DUE_STATUSES,
+            )
+            summary['cryptoMonitorRefreshApplied'] = True
+            summary['evaluatedCount'] = evaluation['evaluatedCount']
+            summary['evaluationSummary'] = evaluation['summary']
+            summary['monitoringSnapshot'] = evaluation['monitoringSnapshot']
+            return summary
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def get_runtime_status(self, db: Session | None = None, *, scope: WATCHLIST_SCOPE | None = None) -> dict[str, Any]:
         due_snapshot = None

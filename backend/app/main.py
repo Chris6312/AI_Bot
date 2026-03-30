@@ -45,6 +45,22 @@ async def lifespan(app: FastAPI):
     watchlist_exit_task = None
     from app.core.config import settings
 
+    logger.info('🔄 Priming Kraken AssetPairs cache for startup...')
+    try:
+        startup_refresh = await watchlist_monitoring_orchestrator.bootstrap_startup_state(
+            refresh_crypto_monitor_state=bool(settings.WATCHLIST_MONITOR_ENABLED),
+        )
+        logger.info(
+            'Startup crypto refresh complete: asset_pairs=%s evaluated=%s data_unavailable=%s waiting=%s entry_candidates=%s',
+            startup_refresh['assetPairCount'],
+            startup_refresh['evaluatedCount'],
+            startup_refresh.get('evaluationSummary', {}).get('dataUnavailableCount', 0),
+            startup_refresh.get('evaluationSummary', {}).get('waitingForSetupCount', 0),
+            startup_refresh.get('evaluationSummary', {}).get('entryCandidateCount', 0),
+        )
+    except Exception as exc:
+        logger.warning('Startup Kraken/crypto bootstrap failed: %s', exc)
+
     if settings.WATCHLIST_MONITOR_ENABLED:
         logger.info('🛰️ Starting watchlist monitoring orchestrator...')
         watchlist_monitor_task = asyncio.create_task(watchlist_monitoring_orchestrator.run_loop())
