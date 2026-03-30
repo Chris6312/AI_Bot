@@ -1240,6 +1240,147 @@ def test_watchlist_exit_readiness_endpoint_returns_position_deadline_summary(tmp
 
 
 
+def test_exit_readiness_snapshot_extends_structure_aware_time_stop(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        symbol_payload = deepcopy(payload['bot_payload']['symbols'][0])
+        symbol_payload['exit_template'] = 'time_stop_with_structure_check'
+        symbol_payload['max_hold_hours'] = 24
+        payload['bot_payload']['symbols'] = [symbol_payload]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=25)
+        db.add(
+            Position(
+                account_id='paper',
+                ticker='AAPL',
+                shares=5,
+                avg_entry_price=100.0,
+                current_price=103.0,
+                strategy='AI_SCREENING',
+                entry_time=entry_time,
+                entry_reasoning={'intentId': 'intent-structure-1'},
+                stop_loss=98.0,
+                profit_target=108.0,
+                peak_price=104.0,
+                trailing_stop=101.0,
+                is_open=True,
+                execution_id='intent-structure-1',
+            )
+        )
+        db.commit()
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='stocks_only', expiring_within_hours=24)
+
+        assert readiness['summary']['openPositionCount'] == 1
+        assert readiness['summary']['expiredPositionCount'] == 0
+        assert readiness['summary']['timeStopExtendedCount'] == 1
+        row = readiness['rows'][0]
+        assert row['positionState']['positionExpired'] is False
+        assert row['positionState']['timeStopStructureCheckPassed'] is True
+        assert row['positionState']['timeStopExtended'] is True
+        assert row['positionState']['timeStopExtensionHours'] == 4.0
+        assert row['positionState']['basePositionExpiresAtUtc'] is not None
+        assert row['positionState']['timeStopExtendedUntilUtc'] is not None
+        assert row['positionState']['exitDeadlineSource'] == 'watchlist_max_hold_structure_extension'
+        assert row['positionState']['hoursUntilExpiry'] is not None
+        assert float(row['positionState']['hoursUntilExpiry']) > 0
+
+
+def test_watchlist_exit_worker_dry_run_skips_structure_extended_time_stop(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        symbol_payload = deepcopy(payload['bot_payload']['symbols'][0])
+        symbol_payload['exit_template'] = 'time_stop_with_structure_check'
+        symbol_payload['max_hold_hours'] = 24
+        payload['bot_payload']['symbols'] = [symbol_payload]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=25)
+        db.add(
+            Position(
+                account_id='paper',
+                ticker='AAPL',
+                shares=5,
+                avg_entry_price=100.0,
+                current_price=103.0,
+                strategy='AI_SCREENING',
+                entry_time=entry_time,
+                entry_reasoning={'intentId': 'intent-structure-2'},
+                stop_loss=98.0,
+                profit_target=108.0,
+                peak_price=104.0,
+                trailing_stop=101.0,
+                is_open=True,
+                execution_id='intent-structure-2',
+            )
+        )
+        db.commit()
+
+        status = watchlist_exit_worker.get_status(db)
+        result = watchlist_exit_worker.run_exit_sweep(db, execute=False, limit=10)
+
+        assert status['summary']['candidateExitCount'] == 0
+        assert status['summary']['expiredPositionCount'] == 0
+        assert result['summary']['candidateCount'] == 0
+        assert result['summary']['expiredPositionCount'] == 0
+        assert result['rows'] == []
+
+
+def test_exit_readiness_snapshot_marks_structure_time_stop_expired_after_extension_window(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        symbol_payload = deepcopy(payload['bot_payload']['symbols'][0])
+        symbol_payload['exit_template'] = 'time_stop_with_structure_check'
+        symbol_payload['max_hold_hours'] = 24
+        payload['bot_payload']['symbols'] = [symbol_payload]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=29)
+        db.add(
+            Position(
+                account_id='paper',
+                ticker='AAPL',
+                shares=5,
+                avg_entry_price=100.0,
+                current_price=103.0,
+                strategy='AI_SCREENING',
+                entry_time=entry_time,
+                entry_reasoning={'intentId': 'intent-structure-3'},
+                stop_loss=98.0,
+                profit_target=108.0,
+                peak_price=104.0,
+                trailing_stop=101.0,
+                is_open=True,
+                execution_id='intent-structure-3',
+            )
+        )
+        db.commit()
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='stocks_only', expiring_within_hours=24)
+
+        assert readiness['summary']['openPositionCount'] == 1
+        assert readiness['summary']['expiredPositionCount'] == 1
+        assert readiness['summary']['timeStopExtendedCount'] == 0
+        row = readiness['rows'][0]
+        assert row['positionState']['timeStopStructureCheckPassed'] is True
+        assert row['positionState']['timeStopExtended'] is False
+        assert row['positionState']['timeStopExtensionHours'] == 4.0
+        assert row['positionState']['positionExpired'] is True
+        assert row['positionState']['timeStopExtendedUntilUtc'] is not None
+        assert row['positionState']['exitDeadlineSource'] == 'watchlist_max_hold'
+        assert float(row['positionState']['hoursUntilExpiry']) <= 0
+
+
 def test_exit_readiness_snapshot_marks_protective_stock_exit_signals(tmp_path) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
         db = SessionFactory()

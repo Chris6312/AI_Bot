@@ -575,6 +575,9 @@ class WatchlistService:
                     'impulseTrailArmedCount': sum(
                         1 for row in rows if row.get('positionState', {}).get('impulseTrailArmed')
                     ),
+                    'timeStopExtendedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('timeStopExtended')
+                    ),
                     'expiringWithin24hCount': sum(
                         1
                         for row in rows
@@ -640,6 +643,9 @@ class WatchlistService:
                     ),
                     'impulseTrailArmedCount': sum(
                         1 for row in rows if row.get('positionState', {}).get('impulseTrailArmed')
+                    ),
+                    'timeStopExtendedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('timeStopExtended')
                     ),
                     'managedOnlyOpenCount': sum(1 for row in rows if row.get('managedOnly')),
                 },
@@ -931,12 +937,17 @@ class WatchlistService:
         symbol_payload['managedOnly'] = row.monitoring_status == MANAGED_ONLY
         symbol_payload['positionState'] = position_state or {
             'hasOpenPosition': False,
+            'basePositionExpiresAtUtc': None,
             'positionExpiresAtUtc': None,
             'positionExpired': False,
             'hoursUntilExpiry': None,
             'hoursSinceEntry': None,
             'followThroughWindowHours': None,
             'followThroughFailed': False,
+            'timeStopStructureCheckPassed': False,
+            'timeStopExtended': False,
+            'timeStopExtensionHours': None,
+            'timeStopExtendedUntilUtc': None,
             'exitDeadlineSource': None,
             'protectiveExitPending': False,
             'protectiveExitReasons': [],
@@ -987,12 +998,7 @@ class WatchlistService:
             exit_template = str(watchlist_row.exit_template or '').strip().lower() if watchlist_row is not None and watchlist_row.exit_template is not None else ''
             trade = self._resolve_trade_for_position(db, position)
             profit_scale_out_taken = self._trade_has_partial_trigger(trade, 'PROFIT_TARGET_REACHED')
-            expires_at = entry_time + timedelta(hours=max_hold_hours) if entry_time is not None and max_hold_hours is not None else None
-            hours_until_expiry = None
-            position_expired = False
-            if expires_at is not None:
-                hours_until_expiry = round((expires_at - observed_at).total_seconds() / 3600.0, 2)
-                position_expired = expires_at <= observed_at
+            base_expires_at = entry_time + timedelta(hours=max_hold_hours) if entry_time is not None and max_hold_hours is not None else None
             hours_since_entry = None
             if entry_time is not None:
                 hours_since_entry = round((observed_at - entry_time).total_seconds() / 3600.0, 2)
@@ -1046,6 +1052,25 @@ class WatchlistService:
             )
             impulse_reference_price = max(float(peak_price or 0.0), float(current_price or 0.0))
             impulse_trailing_stop = self._calculate_impulse_trailing_stop(impulse_reference_price) if impulse_trail_armed else None
+            (
+                effective_expires_at,
+                position_expired,
+                hours_until_expiry,
+                time_stop_structure_check_passed,
+                time_stop_extended,
+                time_stop_extension_hours,
+                time_stop_extended_until,
+                exit_deadline_source,
+            ) = self._apply_structure_time_stop(
+                exit_template=exit_template,
+                base_expires_at=base_expires_at,
+                observed_at=observed_at,
+                max_hold_hours=max_hold_hours,
+                avg_entry_price=avg_entry_price,
+                current_price=current_price,
+                stop_loss_breached=stop_loss_breached,
+                trailing_stop_breached=trailing_stop_breached,
+            )
             state_map[symbol] = {
                 'hasOpenPosition': True,
                 'accountId': position.account_id,
@@ -1064,13 +1089,18 @@ class WatchlistService:
                 'impulseTrailingStop': impulse_trailing_stop,
                 'entryTimeUtc': entry_time.isoformat() if entry_time else None,
                 'maxHoldHours': max_hold_hours,
-                'positionExpiresAtUtc': expires_at.isoformat() if expires_at else None,
+                'basePositionExpiresAtUtc': base_expires_at.isoformat() if base_expires_at else None,
+                'positionExpiresAtUtc': effective_expires_at.isoformat() if effective_expires_at else None,
                 'positionExpired': position_expired,
                 'hoursUntilExpiry': hours_until_expiry,
                 'hoursSinceEntry': hours_since_entry,
                 'followThroughWindowHours': follow_through_window_hours,
                 'followThroughFailed': follow_through_failed,
-                'exitDeadlineSource': 'watchlist_max_hold' if expires_at is not None else None,
+                'timeStopStructureCheckPassed': time_stop_structure_check_passed,
+                'timeStopExtended': time_stop_extended,
+                'timeStopExtensionHours': time_stop_extension_hours,
+                'timeStopExtendedUntilUtc': time_stop_extended_until.isoformat() if time_stop_extended_until else None,
+                'exitDeadlineSource': exit_deadline_source,
                 'protectiveExitPending': bool(protective_exit_reasons),
                 'protectiveExitReasons': protective_exit_reasons,
                 'stopLossBreached': stop_loss_breached,
@@ -1110,6 +1140,68 @@ class WatchlistService:
         return round(max(2.0, min(24.0, float(max_hold_hours) / 2.0)), 2)
 
     @staticmethod
+    def _resolve_structure_extension_hours(max_hold_hours: int | None) -> float | None:
+        if max_hold_hours is None:
+            return 4.0
+        return round(max(1.0, min(8.0, float(max_hold_hours) / 6.0)), 2)
+
+    @classmethod
+    def _apply_structure_time_stop(
+        cls,
+        *,
+        exit_template: str,
+        base_expires_at: datetime | None,
+        observed_at: datetime,
+        max_hold_hours: int | None,
+        avg_entry_price: float | None,
+        current_price: float | None,
+        stop_loss_breached: bool,
+        trailing_stop_breached: bool,
+    ) -> tuple[datetime | None, bool, float | None, bool, bool, float | None, datetime | None, str | None]:
+        effective_expires_at = base_expires_at
+        position_expired = False
+        hours_until_expiry = None
+        time_stop_structure_check_passed = False
+        time_stop_extended = False
+        time_stop_extension_hours = None
+        time_stop_extended_until = None
+        exit_deadline_source = 'watchlist_max_hold' if base_expires_at is not None else None
+
+        if base_expires_at is not None and exit_template == 'time_stop_with_structure_check':
+            time_stop_extension_hours = cls._resolve_structure_extension_hours(max_hold_hours)
+            structure_intact = bool(
+                observed_at >= base_expires_at
+                and avg_entry_price is not None
+                and avg_entry_price > 0
+                and current_price is not None
+                and current_price >= avg_entry_price
+                and not stop_loss_breached
+                and not trailing_stop_breached
+            )
+            time_stop_structure_check_passed = structure_intact
+            if structure_intact and time_stop_extension_hours is not None:
+                time_stop_extended_until = base_expires_at + timedelta(hours=time_stop_extension_hours)
+                if observed_at < time_stop_extended_until:
+                    effective_expires_at = time_stop_extended_until
+                    time_stop_extended = True
+                    exit_deadline_source = 'watchlist_max_hold_structure_extension'
+
+        if effective_expires_at is not None:
+            hours_until_expiry = round((effective_expires_at - observed_at).total_seconds() / 3600.0, 2)
+            position_expired = effective_expires_at <= observed_at
+
+        return (
+            effective_expires_at,
+            position_expired,
+            hours_until_expiry,
+            time_stop_structure_check_passed,
+            time_stop_extended,
+            time_stop_extension_hours,
+            time_stop_extended_until,
+            exit_deadline_source,
+        )
+
+    @staticmethod
     def _calculate_impulse_trailing_stop(reference_price: float | None) -> float | None:
         if reference_price is None or reference_price <= 0:
             return None
@@ -1140,9 +1232,14 @@ class WatchlistService:
                 'pnlPercent': float(position.get('pnlPercent') or 0.0) if position.get('pnlPercent') is not None else None,
                 'entryTimeUtc': None,
                 'maxHoldHours': None,
+                'basePositionExpiresAtUtc': None,
                 'positionExpiresAtUtc': None,
                 'positionExpired': False,
                 'hoursUntilExpiry': None,
+                'timeStopStructureCheckPassed': False,
+                'timeStopExtended': False,
+                'timeStopExtensionHours': None,
+                'timeStopExtendedUntilUtc': None,
                 'exitDeadlineSource': 'unavailable_crypto_ledger',
                 'protectiveExitPending': False,
                 'protectiveExitReasons': [],
