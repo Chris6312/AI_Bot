@@ -1465,3 +1465,228 @@ def test_watchlist_exit_sweep_endpoint_runs_dry_run_summary(tmp_path, monkeypatc
         body = response.json()
         assert body['summary']['candidateCount'] == 1
         assert body['rows'][0]['action'] == 'DRY_RUN_CANDIDATE'
+
+
+def test_watchlist_exit_worker_status_reports_runtime_metadata(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        db.add(
+            Position(
+                account_id='paper',
+                ticker='AAPL',
+                shares=2,
+                avg_entry_price=100.0,
+                current_price=103.0,
+                strategy='AI_SCREENING',
+                entry_time=datetime.now(UTC) - timedelta(hours=73),
+                entry_reasoning={'intentId': 'intent-entry'},
+                stop_loss=98.0,
+                profit_target=108.0,
+                peak_price=103.0,
+                trailing_stop=100.0,
+                is_open=True,
+                execution_id='intent-entry',
+            )
+        )
+        db.commit()
+
+        watchlist_exit_worker._runtime.enabled = True
+        watchlist_exit_worker._runtime.poll_seconds = 17
+        watchlist_exit_worker._runtime.last_run_summary = {'summary': {'submittedCount': 0}}
+        monkeypatch.setattr(runtime_state, 'get', lambda: SimpleNamespace(running=True, stock_mode='PAPER'))
+        monkeypatch.setattr(
+            'app.services.watchlist_exit_worker.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(
+                session_open=False,
+                to_dict=lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': False,
+                    'reason': 'market closed for test',
+                    'nextSessionStartUtc': None,
+                    'nextSessionStartEt': None,
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            ),
+        )
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+
+        status = watchlist_exit_worker.get_status(db)
+
+        assert status['enabled'] is True
+        assert status['pollSeconds'] == 17
+        assert status['summary']['expiredPositionCount'] == 1
+        assert status['summary']['eligibleExpiredCount'] == 0
+        assert status['summary']['blockedExpiredCount'] == 1
+        assert status['rows'][0]['symbol'] == 'AAPL'
+
+
+def test_watchlist_exit_worker_run_once_updates_runtime_summary(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=73)
+        position = Position(
+            account_id='paper',
+            ticker='AAPL',
+            shares=4,
+            avg_entry_price=100.0,
+            current_price=103.0,
+            strategy='AI_SCREENING',
+            entry_time=entry_time,
+            entry_reasoning={'intentId': 'intent-entry'},
+            stop_loss=98.0,
+            profit_target=108.0,
+            peak_price=103.0,
+            trailing_stop=100.0,
+            is_open=True,
+            execution_id='intent-entry',
+        )
+        db.add(position)
+        db.flush()
+        db.add(
+            Trade(
+                trade_id='trade-entry-run-once',
+                account_id='paper',
+                ticker='AAPL',
+                direction='LONG',
+                strategy='AI_SCREENING',
+                entry_time=entry_time,
+                entry_price=100.0,
+                shares=4,
+                entry_cost=400.0,
+                entry_reasoning={'intentId': 'intent-entry'},
+                execution_id='intent-entry',
+                entry_order_id='entry-order',
+            )
+        )
+        db.commit()
+
+        watchlist_exit_worker._runtime.last_started_at_utc = None
+        watchlist_exit_worker._runtime.last_finished_at_utc = None
+        watchlist_exit_worker._runtime.last_error = 'old-error'
+        watchlist_exit_worker._runtime.consecutive_failures = 2
+        watchlist_exit_worker._runtime.last_run_summary = {}
+
+        monkeypatch.setattr(runtime_state, 'get', lambda: SimpleNamespace(running=True, stock_mode='PAPER'))
+        monkeypatch.setattr(
+            'app.services.watchlist_exit_worker.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(
+                session_open=True,
+                to_dict=lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': True,
+                    'reason': 'session open for run_once test',
+                    'nextSessionStartUtc': None,
+                    'nextSessionStartEt': None,
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            ),
+        )
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+        monkeypatch.setattr(tradier_client, 'get_position_quantity_sync', lambda symbol, mode=None: 4)
+        monkeypatch.setattr(
+            tradier_client,
+            'place_order_sync',
+            lambda ticker, qty, side, mode=None, order_type='market', duration='day': {
+                'order': {
+                    'id': 'exit-run-once',
+                    'status': 'submitted',
+                    'quantity': qty,
+                    'exec_quantity': 0,
+                }
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_order_sync',
+            lambda order_id, mode=None: {
+                'order': {
+                    'id': order_id,
+                    'status': 'filled',
+                    'quantity': 4,
+                    'exec_quantity': 4,
+                    'avg_fill_price': 103.25,
+                }
+            },
+        )
+
+        watchlist_exit_worker._runtime.last_started_at_utc = datetime.now(UTC).isoformat()
+        result = watchlist_exit_worker.run_once(db, limit=5)
+
+        db.refresh(position)
+        assert result['summary']['submittedCount'] == 1
+        assert result['summary']['closedCount'] == 1
+        assert watchlist_exit_worker._runtime.last_run_summary['summary']['closedCount'] == 1
+        assert watchlist_exit_worker._runtime.last_error is None
+        assert watchlist_exit_worker._runtime.consecutive_failures == 0
+        assert watchlist_exit_worker._runtime.last_finished_at_utc is not None
+        assert position.is_open is False
+
+
+def test_watchlist_exit_worker_endpoint_includes_runtime_status(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        db.add(
+            Position(
+                account_id='paper',
+                ticker='AAPL',
+                shares=1,
+                avg_entry_price=100.0,
+                current_price=103.0,
+                strategy='AI_SCREENING',
+                entry_time=datetime.now(UTC) - timedelta(hours=73),
+                entry_reasoning={'intentId': 'intent-entry'},
+                stop_loss=98.0,
+                profit_target=108.0,
+                peak_price=103.0,
+                trailing_stop=100.0,
+                is_open=True,
+                execution_id='intent-entry',
+            )
+        )
+        db.commit()
+        monkeypatch.setattr(settings, 'ADMIN_API_TOKEN', 'phase53-token', raising=False)
+        watchlist_exit_worker._runtime.enabled = True
+        watchlist_exit_worker._runtime.poll_seconds = 19
+        monkeypatch.setattr(runtime_state, 'get', lambda: SimpleNamespace(running=True, stock_mode='PAPER'))
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+
+        def override_db():
+            try:
+                yield db
+            finally:
+                pass
+
+        app.dependency_overrides[get_db] = override_db
+        try:
+            client = TestClient(app)
+            response = client.get('/api/watchlists/exit-worker')
+        finally:
+            app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body['enabled'] is True
+        assert body['pollSeconds'] == 19
+        assert body['summary']['expiredPositionCount'] == 1
