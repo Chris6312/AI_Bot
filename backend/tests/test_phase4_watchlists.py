@@ -2173,3 +2173,300 @@ def test_watchlist_exit_worker_execute_scales_out_profit_target_stock_position(t
         assert position.trailing_stop == round(111.0 * (1.0 - settings.TRAILING_STOP_PCT), 4)
         assert isinstance(trade.exit_reasoning, dict)
         assert trade.exit_reasoning['partialExits'][0]['trigger'] == 'PROFIT_TARGET_REACHED'
+
+
+def test_exit_readiness_snapshot_surfaces_failed_follow_through_signal(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        symbol_payload = deepcopy(payload['bot_payload']['symbols'][0])
+        symbol_payload['exit_template'] = 'first_failed_follow_through'
+        symbol_payload['max_hold_hours'] = 24
+        payload['bot_payload']['symbols'] = [symbol_payload]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=3)
+        position = Position(
+            account_id='paper',
+            ticker='AAPL',
+            shares=5,
+            avg_entry_price=100.0,
+            current_price=99.0,
+            strategy='AI_SCREENING',
+            entry_time=entry_time,
+            entry_reasoning={'intentId': 'intent-entry'},
+            stop_loss=95.0,
+            profit_target=108.0,
+            peak_price=101.0,
+            trailing_stop=94.0,
+            is_open=True,
+            execution_id='intent-entry',
+        )
+        db.add(position)
+        db.add(
+            Trade(
+                trade_id='trade-follow-through',
+                account_id='paper',
+                ticker='AAPL',
+                direction='LONG',
+                strategy='AI_SCREENING',
+                entry_time=entry_time,
+                entry_price=100.0,
+                shares=5,
+                entry_cost=500.0,
+                entry_reasoning={'intentId': 'intent-entry'},
+                execution_id='intent-entry',
+                entry_order_id='entry-order',
+            )
+        )
+        db.commit()
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='stocks_only', expiring_within_hours=24)
+
+        assert readiness['summary']['openPositionCount'] == 1
+        assert readiness['summary']['followThroughFailedCount'] == 1
+        assert readiness['rows'][0]['positionState']['followThroughFailed'] is True
+        assert readiness['rows'][0]['positionState']['hoursSinceEntry'] is not None
+        assert readiness['rows'][0]['positionState']['followThroughWindowHours'] == 12.0
+
+
+def test_watchlist_exit_worker_dry_run_surfaces_failed_follow_through(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        symbol_payload = deepcopy(payload['bot_payload']['symbols'][0])
+        symbol_payload['exit_template'] = 'first_failed_follow_through'
+        symbol_payload['max_hold_hours'] = 24
+        payload['bot_payload']['symbols'] = [symbol_payload]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=3)
+        position = Position(
+            account_id='paper',
+            ticker='AAPL',
+            shares=5,
+            avg_entry_price=100.0,
+            current_price=99.0,
+            strategy='AI_SCREENING',
+            entry_time=entry_time,
+            entry_reasoning={'intentId': 'intent-entry'},
+            stop_loss=95.0,
+            profit_target=108.0,
+            peak_price=101.0,
+            trailing_stop=94.0,
+            is_open=True,
+            execution_id='intent-entry',
+        )
+        db.add(position)
+        db.add(
+            Trade(
+                trade_id='trade-follow-through',
+                account_id='paper',
+                ticker='AAPL',
+                direction='LONG',
+                strategy='AI_SCREENING',
+                entry_time=entry_time,
+                entry_price=100.0,
+                shares=5,
+                entry_cost=500.0,
+                entry_reasoning={'intentId': 'intent-entry'},
+                execution_id='intent-entry',
+                entry_order_id='entry-order',
+            )
+        )
+        db.commit()
+
+        result = watchlist_exit_worker.run_exit_sweep(db, execute=False, limit=10)
+
+        assert result['summary']['candidateCount'] == 1
+        assert result['summary']['followThroughExitCount'] == 1
+        assert result['rows'][0]['action'] == 'DRY_RUN_CANDIDATE'
+        assert result['rows'][0]['exitTrigger'] == 'FAILED_FOLLOW_THROUGH'
+        assert result['rows'][0]['exitReasons'] == ['FAILED_FOLLOW_THROUGH']
+
+
+def test_watchlist_exit_worker_execute_closes_failed_follow_through_position(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        symbol_payload = deepcopy(payload['bot_payload']['symbols'][0])
+        symbol_payload['exit_template'] = 'first_failed_follow_through'
+        symbol_payload['max_hold_hours'] = 24
+        payload['bot_payload']['symbols'] = [symbol_payload]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=3)
+        position = Position(
+            account_id='paper',
+            ticker='AAPL',
+            shares=5,
+            avg_entry_price=100.0,
+            current_price=99.0,
+            strategy='AI_SCREENING',
+            entry_time=entry_time,
+            entry_reasoning={'intentId': 'intent-entry'},
+            stop_loss=95.0,
+            profit_target=108.0,
+            peak_price=101.0,
+            trailing_stop=94.0,
+            is_open=True,
+            execution_id='intent-entry',
+        )
+        db.add(position)
+        trade = Trade(
+            trade_id='trade-follow-through',
+            account_id='paper',
+            ticker='AAPL',
+            direction='LONG',
+            strategy='AI_SCREENING',
+            entry_time=entry_time,
+            entry_price=100.0,
+            shares=5,
+            entry_cost=500.0,
+            entry_reasoning={'intentId': 'intent-entry'},
+            execution_id='intent-entry',
+            entry_order_id='entry-order',
+        )
+        db.add(trade)
+        db.commit()
+
+        monkeypatch.setattr(runtime_state, 'get', lambda: SimpleNamespace(running=True, stock_mode='PAPER'))
+        monkeypatch.setattr(
+            'app.services.watchlist_exit_worker.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(
+                session_open=True,
+                to_dict=lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': True,
+                    'reason': 'session open for follow through test',
+                    'nextSessionStartUtc': None,
+                    'nextSessionStartEt': None,
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            ),
+        )
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+        monkeypatch.setattr(tradier_client, 'get_quotes_sync', lambda symbols, mode=None: {})
+        monkeypatch.setattr(tradier_client, 'get_position_quantity_sync', lambda symbol, mode=None: 5)
+        monkeypatch.setattr(
+            tradier_client,
+            'place_order_sync',
+            lambda ticker, qty, side, mode=None, order_type='market', duration='day': {
+                'order': {
+                    'id': 'exit-follow-through-1',
+                    'status': 'submitted',
+                    'quantity': qty,
+                    'exec_quantity': 0,
+                }
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_order_sync',
+            lambda order_id, mode=None: {
+                'order': {
+                    'id': order_id,
+                    'status': 'filled',
+                    'quantity': 5,
+                    'exec_quantity': 5,
+                    'avg_fill_price': 99.0,
+                }
+            },
+        )
+
+        result = watchlist_exit_worker.run_exit_sweep(db, execute=True, limit=10)
+
+        db.refresh(position)
+        db.refresh(trade)
+        intent = db.query(OrderIntent).filter(OrderIntent.execution_source == 'WATCHLIST_EXIT_WORKER').one()
+
+        assert result['summary']['submittedCount'] == 1
+        assert result['summary']['closedCount'] == 1
+        assert result['summary']['followThroughExitCount'] == 1
+        assert result['rows'][0]['action'] == 'EXIT_CLOSED'
+        assert result['rows'][0]['exitTrigger'] == 'FAILED_FOLLOW_THROUGH'
+        assert intent.requested_quantity == 5
+        assert position.is_open is False
+        assert position.shares == 0
+        assert trade.exit_trigger == 'FAILED_FOLLOW_THROUGH'
+
+
+def test_watchlist_exit_worker_refresh_tightens_trailing_stop_for_impulse_template(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [deepcopy(payload['bot_payload']['symbols'][1])]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        payload['ui_payload']['symbol_context'] = {'MSFT': payload['ui_payload']['symbol_context']['MSFT']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=2)
+        position = Position(
+            account_id='paper',
+            ticker='MSFT',
+            shares=4,
+            avg_entry_price=100.0,
+            current_price=109.0,
+            strategy='AI_SCREENING',
+            entry_time=entry_time,
+            entry_reasoning={'intentId': 'intent-entry'},
+            stop_loss=96.0,
+            profit_target=108.0,
+            peak_price=109.0,
+            trailing_stop=104.0,
+            is_open=True,
+            execution_id='intent-entry',
+        )
+        db.add(position)
+        db.add(
+            Trade(
+                trade_id='trade-impulse-trail',
+                account_id='paper',
+                ticker='MSFT',
+                direction='LONG',
+                strategy='AI_SCREENING',
+                entry_time=entry_time,
+                entry_price=100.0,
+                shares=4,
+                entry_cost=400.0,
+                entry_reasoning={'intentId': 'intent-entry'},
+                execution_id='intent-entry',
+                entry_order_id='entry-order',
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quotes_sync',
+            lambda symbols, mode=None: {
+                'MSFT': {
+                    'last': 112.0,
+                    'timestamp': datetime.now(UTC).isoformat(),
+                }
+            },
+        )
+
+        result = watchlist_exit_worker.run_exit_sweep(db, execute=False, limit=10)
+
+        db.refresh(position)
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='stocks_only', expiring_within_hours=24)
+
+        assert result['summary']['refreshedPriceCount'] == 1
+        assert result['summary']['candidateCount'] == 0
+        assert result['rows'] == []
+        assert position.current_price == 112.0
+        assert position.peak_price == 112.0
+        assert position.trailing_stop == round(112.0 * (1.0 - (settings.TRAILING_STOP_PCT * 0.5)), 4)
+        assert readiness['summary']['impulseTrailArmedCount'] == 1
+        assert readiness['rows'][0]['positionState']['impulseTrailArmed'] is True
+        assert readiness['rows'][0]['positionState']['impulseTrailingStop'] == round(112.0 * (1.0 - (settings.TRAILING_STOP_PCT * 0.5)), 4)

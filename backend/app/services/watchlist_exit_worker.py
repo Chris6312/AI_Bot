@@ -14,6 +14,7 @@ from app.core.database import SessionLocal
 from app.models.order_intent import OrderIntent
 from app.models.position import Position
 from app.models.trade import Trade
+from app.models.watchlist_symbol import WatchlistSymbol
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.market_sessions import get_scope_session_status
 from app.services.runtime_state import runtime_state
@@ -29,8 +30,10 @@ EXIT_TRIGGER = 'TIME_STOP_EXPIRED'
 STOP_LOSS_TRIGGER = 'STOP_LOSS_BREACH'
 TRAILING_STOP_TRIGGER = 'TRAILING_STOP_BREACH'
 PROFIT_TARGET_TRIGGER = 'PROFIT_TARGET_REACHED'
+FOLLOW_THROUGH_TRIGGER = 'FAILED_FOLLOW_THROUGH'
 EXECUTION_SOURCE = 'WATCHLIST_EXIT_WORKER'
 SUPPORTED_SCOPE = 'stocks_only'
+IMPULSE_TRAIL_STOP_FACTOR = 0.5
 
 
 @dataclass
@@ -57,6 +60,7 @@ class WatchlistExitWorkerService:
         expired_rows = [row for row in due_rows if row.get('positionState', {}).get('positionExpired')]
         protective_rows = [row for row in due_rows if row.get('positionState', {}).get('protectiveExitPending')]
         profit_target_rows = [row for row in due_rows if row.get('positionState', {}).get('scaleOutReady')]
+        follow_through_rows = [row for row in due_rows if row.get('positionState', {}).get('followThroughFailed')]
         session = get_scope_session_status(SUPPORTED_SCOPE, observed_at)
         session_open = bool(getattr(session, 'session_open', False))
         eligible_due = len(due_rows) if session_open else 0
@@ -80,6 +84,7 @@ class WatchlistExitWorkerService:
                 'expiredPositionCount': len(expired_rows),
                 'protectiveExitCount': len(protective_rows),
                 'profitTargetCount': len(profit_target_rows),
+                'followThroughExitCount': len(follow_through_rows),
                 'eligibleExpiredCount': len(expired_rows) if session_open else 0,
                 'blockedExpiredCount': 0 if session_open else len(expired_rows),
                 'eligibleProtectiveCount': len(protective_rows) if session_open else 0,
@@ -141,6 +146,7 @@ class WatchlistExitWorkerService:
                 'expiredPositionCount': sum(1 for row in due_rows if row.get('positionState', {}).get('positionExpired')),
                 'protectiveExitCount': sum(1 for row in due_rows if row.get('positionState', {}).get('protectiveExitPending')),
                 'profitTargetCount': sum(1 for row in due_rows if row.get('positionState', {}).get('scaleOutReady')),
+                'followThroughExitCount': sum(1 for row in due_rows if row.get('positionState', {}).get('followThroughFailed')),
                 'refreshedPriceCount': refreshed_price_count,
                 'candidateCount': 0,
                 'submittedCount': 0,
@@ -380,6 +386,7 @@ class WatchlistExitWorkerService:
             if row.get('positionState', {}).get('positionExpired')
             or row.get('positionState', {}).get('protectiveExitPending')
             or row.get('positionState', {}).get('scaleOutReady')
+            or row.get('positionState', {}).get('followThroughFailed')
         ]
 
     def _build_candidate_row(self, db: Session, row: dict[str, Any]) -> dict[str, Any]:
@@ -440,6 +447,8 @@ class WatchlistExitWorkerService:
     def _build_exit_reasons(row: dict[str, Any]) -> list[str]:
         position_state = row.get('positionState', {}) if isinstance(row, dict) else {}
         reasons = list(position_state.get('protectiveExitReasons') or [])
+        if position_state.get('followThroughFailed'):
+            reasons.append(FOLLOW_THROUGH_TRIGGER)
         if position_state.get('scaleOutReady'):
             reasons.append(PROFIT_TARGET_TRIGGER)
         if position_state.get('positionExpired'):
@@ -453,7 +462,7 @@ class WatchlistExitWorkerService:
     @classmethod
     def _primary_exit_trigger(cls, row: dict[str, Any]) -> str:
         reasons = cls._build_exit_reasons(row)
-        for preferred in (STOP_LOSS_TRIGGER, TRAILING_STOP_TRIGGER, PROFIT_TARGET_TRIGGER, EXIT_TRIGGER):
+        for preferred in (STOP_LOSS_TRIGGER, TRAILING_STOP_TRIGGER, FOLLOW_THROUGH_TRIGGER, PROFIT_TARGET_TRIGGER, EXIT_TRIGGER):
             if preferred in reasons:
                 return preferred
         return reasons[0] if reasons else EXIT_TRIGGER
@@ -489,6 +498,16 @@ class WatchlistExitWorkerService:
             changed = True
         if changed:
             db.commit()
+
+
+    @staticmethod
+    def _resolve_watchlist_row(db: Session, *, symbol: str) -> WatchlistSymbol | None:
+        return (
+            db.query(WatchlistSymbol)
+            .filter(WatchlistSymbol.scope == SUPPORTED_SCOPE, WatchlistSymbol.symbol == symbol)
+            .order_by(WatchlistSymbol.id.desc())
+            .first()
+        )
 
     @staticmethod
     def _refresh_open_position_prices(db: Session, *, mode: str) -> int:
@@ -559,6 +578,17 @@ class WatchlistExitWorkerService:
                     changed = True
                 if float(position.unrealized_pnl_pct or 0.0) != unrealized_pnl_pct:
                     position.unrealized_pnl_pct = unrealized_pnl_pct
+                    changed = True
+
+            watchlist_row = WatchlistExitWorkerService._resolve_watchlist_row(db, symbol=symbol)
+            exit_template = str(watchlist_row.exit_template or '').strip().lower() if watchlist_row is not None else ''
+            profit_target = float(position.profit_target or 0.0)
+            if exit_template == 'trail_after_impulse' and profit_target > 0 and current_price >= profit_target:
+                impulse_reference = max(float(position.peak_price or 0.0), current_price)
+                tightened_pct = float(settings.TRAILING_STOP_PCT) * IMPULSE_TRAIL_STOP_FACTOR
+                impulse_candidate = round(impulse_reference * (1.0 - tightened_pct), 4)
+                if position.trailing_stop is None or impulse_candidate > float(position.trailing_stop or 0.0):
+                    position.trailing_stop = impulse_candidate
                     changed = True
 
             if changed:

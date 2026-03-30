@@ -76,6 +76,9 @@ MONITOR_ONLY = 'MONITOR_ONLY'
 INACTIVE_DECISION = 'INACTIVE'
 MONITORING_OFFSET_SECONDS = 20
 PROFIT_TARGET_SCALE_OUT_TEMPLATES = {'scale_out_then_trail', 'sell_into_strength'}
+FOLLOW_THROUGH_EXIT_TEMPLATES = {'first_failed_follow_through'}
+IMPULSE_TRAIL_TEMPLATES = {'trail_after_impulse'}
+IMPULSE_TRAIL_STOP_FACTOR = 0.5
 
 
 class WatchlistValidationError(ValueError):
@@ -566,6 +569,12 @@ class WatchlistService:
                     'scaleOutReadyCount': sum(
                         1 for row in rows if row.get('positionState', {}).get('scaleOutReady')
                     ),
+                    'followThroughFailedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('followThroughFailed')
+                    ),
+                    'impulseTrailArmedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('impulseTrailArmed')
+                    ),
                     'expiringWithin24hCount': sum(
                         1
                         for row in rows
@@ -625,6 +634,12 @@ class WatchlistService:
                     ),
                     'scaleOutReadyCount': sum(
                         1 for row in rows if row.get('positionState', {}).get('scaleOutReady')
+                    ),
+                    'followThroughFailedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('followThroughFailed')
+                    ),
+                    'impulseTrailArmedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('impulseTrailArmed')
                     ),
                     'managedOnlyOpenCount': sum(1 for row in rows if row.get('managedOnly')),
                 },
@@ -919,6 +934,9 @@ class WatchlistService:
             'positionExpiresAtUtc': None,
             'positionExpired': False,
             'hoursUntilExpiry': None,
+            'hoursSinceEntry': None,
+            'followThroughWindowHours': None,
+            'followThroughFailed': False,
             'exitDeadlineSource': None,
             'protectiveExitPending': False,
             'protectiveExitReasons': [],
@@ -927,6 +945,8 @@ class WatchlistService:
             'profitTargetReached': False,
             'scaleOutReady': False,
             'scaleOutAlreadyTaken': False,
+            'impulseTrailArmed': False,
+            'impulseTrailingStop': None,
             'peakPrice': None,
         }
         return symbol_payload
@@ -973,6 +993,10 @@ class WatchlistService:
             if expires_at is not None:
                 hours_until_expiry = round((expires_at - observed_at).total_seconds() / 3600.0, 2)
                 position_expired = expires_at <= observed_at
+            hours_since_entry = None
+            if entry_time is not None:
+                hours_since_entry = round((observed_at - entry_time).total_seconds() / 3600.0, 2)
+            avg_entry_price = float(position.avg_entry_price or 0.0) if position.avg_entry_price is not None else None
             current_price = float(position.current_price or 0.0) if position.current_price is not None else None
             stop_loss = float(position.stop_loss or 0.0) if position.stop_loss is not None else None
             trailing_stop = float(position.trailing_stop or 0.0) if position.trailing_stop is not None else None
@@ -1003,12 +1027,31 @@ class WatchlistService:
                 and exit_template in PROFIT_TARGET_SCALE_OUT_TEMPLATES
                 and not profit_scale_out_taken
             )
+            follow_through_window_hours = self._resolve_follow_through_window_hours(max_hold_hours)
+            follow_through_failed = bool(
+                exit_template in FOLLOW_THROUGH_EXIT_TEMPLATES
+                and avg_entry_price is not None
+                and avg_entry_price > 0
+                and current_price is not None
+                and current_price < avg_entry_price
+                and hours_since_entry is not None
+                and follow_through_window_hours is not None
+                and 1.0 <= hours_since_entry <= follow_through_window_hours
+                and not stop_loss_breached
+                and not trailing_stop_breached
+            )
+            impulse_trail_armed = bool(
+                exit_template in IMPULSE_TRAIL_TEMPLATES
+                and profit_target_reached
+            )
+            impulse_reference_price = max(float(peak_price or 0.0), float(current_price or 0.0))
+            impulse_trailing_stop = self._calculate_impulse_trailing_stop(impulse_reference_price) if impulse_trail_armed else None
             state_map[symbol] = {
                 'hasOpenPosition': True,
                 'accountId': position.account_id,
                 'positionId': position.id,
                 'shares': int(position.shares or 0),
-                'avgEntryPrice': float(position.avg_entry_price or 0.0) if position.avg_entry_price is not None else None,
+                'avgEntryPrice': avg_entry_price,
                 'currentPrice': current_price,
                 'stopLoss': stop_loss,
                 'profitTarget': profit_target,
@@ -1017,11 +1060,16 @@ class WatchlistService:
                 'profitTargetReached': profit_target_reached,
                 'scaleOutReady': scale_out_ready,
                 'scaleOutAlreadyTaken': profit_scale_out_taken,
+                'impulseTrailArmed': impulse_trail_armed,
+                'impulseTrailingStop': impulse_trailing_stop,
                 'entryTimeUtc': entry_time.isoformat() if entry_time else None,
                 'maxHoldHours': max_hold_hours,
                 'positionExpiresAtUtc': expires_at.isoformat() if expires_at else None,
                 'positionExpired': position_expired,
                 'hoursUntilExpiry': hours_until_expiry,
+                'hoursSinceEntry': hours_since_entry,
+                'followThroughWindowHours': follow_through_window_hours,
+                'followThroughFailed': follow_through_failed,
                 'exitDeadlineSource': 'watchlist_max_hold' if expires_at is not None else None,
                 'protectiveExitPending': bool(protective_exit_reasons),
                 'protectiveExitReasons': protective_exit_reasons,
@@ -1053,6 +1101,19 @@ class WatchlistService:
             if isinstance(event, dict) and str(event.get('trigger') or '').upper() == str(trigger).upper():
                 return True
         return False
+
+
+    @staticmethod
+    def _resolve_follow_through_window_hours(max_hold_hours: int | None) -> float | None:
+        if max_hold_hours is None:
+            return 24.0
+        return round(max(2.0, min(24.0, float(max_hold_hours) / 2.0)), 2)
+
+    @staticmethod
+    def _calculate_impulse_trailing_stop(reference_price: float | None) -> float | None:
+        if reference_price is None or reference_price <= 0:
+            return None
+        return round(reference_price * (1.0 - (float(settings.TRAILING_STOP_PCT) * IMPULSE_TRAIL_STOP_FACTOR)), 4)
 
     def _build_crypto_position_state_map(self, *, observed_at: datetime) -> dict[str, dict[str, Any]]:
         state_map: dict[str, dict[str, Any]] = {}
