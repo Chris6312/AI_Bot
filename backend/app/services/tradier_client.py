@@ -224,6 +224,8 @@ class TradierClient:
                 "connected": False,
                 "accountId": "",
                 "buyingPower": 0.0,
+                "brokerBuyingPower": 0.0,
+                "availableToTrade": 0.0,
                 "portfolioValue": 0.0,
                 "cash": 0.0,
                 "unrealizedPnL": 0.0,
@@ -242,17 +244,19 @@ class TradierClient:
         )
         cash = _coalesce_numeric(balances, ["total_cash", "cash_available", "cash"])
 
-        buying_power = _coalesce_numeric(
+        broker_buying_power = _coalesce_numeric(
             balances,
             ["buying_power", "margin_buying_power", "stock_buying_power", "option_buying_power"],
         )
-        if buying_power <= 0:
-            buying_power = _coalesce_numeric(
+        if broker_buying_power <= 0:
+            broker_buying_power = _coalesce_numeric(
                 margin,
                 ["stock_buying_power", "option_buying_power", "buying_power"],
             )
-        if buying_power <= 0:
-            buying_power = cash or portfolio_value
+        if broker_buying_power <= 0:
+            broker_buying_power = cash or portfolio_value
+
+        available_to_trade = cash if cash > 0 else broker_buying_power or portfolio_value
 
         unrealized_pnl = _coalesce_numeric(
             balances,
@@ -264,7 +268,9 @@ class TradierClient:
             "mode": selected_mode,
             "connected": True,
             "accountId": str(account_id),
-            "buyingPower": buying_power,
+            "buyingPower": broker_buying_power,
+            "brokerBuyingPower": broker_buying_power,
+            "availableToTrade": available_to_trade,
             "portfolioValue": portfolio_value,
             "cash": cash,
             "unrealizedPnL": unrealized_pnl,

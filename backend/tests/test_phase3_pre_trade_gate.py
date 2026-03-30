@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.database import Base, get_db
 from app.main import app
+from app.services.kraken_service import KrakenPairMetadata
 from app.services.pre_trade_gate import PreTradeGateDecision, pre_trade_gate
 
 UTC = timezone.utc
@@ -134,6 +135,7 @@ async def test_crypto_gate_rejects_candle_gap(monkeypatch, tmp_path) -> None:
             candles.append({'timestamp': base, 'open': 1, 'high': 1, 'low': 1, 'close': 1})
 
         monkeypatch.setattr('app.services.pre_trade_gate.get_execution_gate_status', lambda: type('Gate', (), {'allowed': True, 'state': 'ARMED', 'reason': '', 'status_code': 200})())
+        monkeypatch.setattr('app.services.pre_trade_gate.kraken_service.resolve_pair', lambda pair: KrakenPairMetadata(display_pair='BTC/USD', rest_pair='XBTUSD', pair_key='XXBTZUSD', ws_pair='XBT/USD', altname='XBTUSD'))
         monkeypatch.setattr('app.services.pre_trade_gate.kraken_service.get_ticker', lambda pair: {'c': ['100'], 'v': ['0', '5000'], '_fetched_at_utc': now.isoformat()})
         monkeypatch.setattr('app.services.pre_trade_gate.kraken_service.get_ohlc', lambda pair, interval=5, limit=20: candles)
         monkeypatch.setattr(
@@ -186,6 +188,7 @@ def test_crypto_route_returns_gate_rejection(monkeypatch, tmp_path) -> None:
 
         monkeypatch.setattr('app.routers.crypto.ensure_execution_armed', lambda: None)
         monkeypatch.setattr('app.routers.crypto.crypto_ledger.get_ledger', lambda: {'balance': 10000.0, 'equity': 10000.0})
+        monkeypatch.setattr('app.routers.crypto.kraken_service.resolve_pair', lambda pair: KrakenPairMetadata(display_pair='BTC/USD', rest_pair='XBTUSD', pair_key='XXBTZUSD', ws_pair='XBT/USD', altname='XBTUSD'))
 
         async def fake_gate(**kwargs):
             return PreTradeGateDecision(

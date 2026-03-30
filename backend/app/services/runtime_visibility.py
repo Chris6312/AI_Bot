@@ -8,7 +8,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.services.control_plane import get_control_plane_status, get_execution_gate_status
-from app.services.kraken_service import TOP_30_PAIRS, kraken_service
+from app.services.kraken_service import kraken_service
 from app.services.tradier_client import tradier_client
 
 UTC = timezone.utc
@@ -172,7 +172,8 @@ class RuntimeVisibilityService:
         }
 
     def _probe_kraken(self, observed_at: datetime) -> dict[str, Any]:
-        probe_pair = TOP_30_PAIRS.get('BTC/USD') or next(iter(TOP_30_PAIRS.values()))
+        supported_pairs = kraken_service.get_supported_pairs()
+        probe_pair = kraken_service.get_ohlcv_pair('BTC/USD') or next(iter(supported_pairs.values()), 'XBTUSD')
         try:
             ticker = kraken_service.get_ticker(probe_pair)
         except Exception as exc:  # pragma: no cover - exercised by tests with monkeypatch

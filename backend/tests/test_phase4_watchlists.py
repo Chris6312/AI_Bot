@@ -22,7 +22,7 @@ from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
 from app.services.control_plane import discord_decision_guard
-from app.services.kraken_service import CryptoPaperLedger, crypto_ledger, kraken_service
+from app.services.kraken_service import CryptoPaperLedger, KrakenPairMetadata, crypto_ledger, kraken_service
 from app.services.market_sessions import calculate_next_scope_evaluation_at, get_scope_session_status
 from app.services.tradier_client import tradier_client
 from app.services.runtime_state import runtime_state
@@ -712,6 +712,11 @@ def test_template_evaluator_promotes_crypto_symbol_to_entry_candidate(tmp_path, 
         watchlist_service.ingest_watchlist(db, payload, source='api')
 
         now = datetime.now(UTC)
+        monkeypatch.setattr(
+            kraken_service,
+            'resolve_pair',
+            lambda pair: KrakenPairMetadata(display_pair='BTC/USD', rest_pair='XBTUSD', pair_key='XXBTZUSD', ws_pair='XBT/USD', altname='XBTUSD'),
+        )
         monkeypatch.setattr(
             kraken_service,
             'get_ticker',

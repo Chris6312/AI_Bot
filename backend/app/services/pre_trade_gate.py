@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.services.control_plane import get_execution_gate_status
-from app.services.kraken_service import TOP_30_PAIRS, kraken_service
+from app.services.kraken_service import kraken_service
 from app.services.runtime_visibility import runtime_visibility_service
 from app.services.safety_validator import SafetyValidator
 from app.services.trade_validator import trade_validator
@@ -286,16 +286,21 @@ class PreTradeGateService:
                 context=context,
             )
 
-        supported_pair = symbol in TOP_30_PAIRS
+        resolved_pair = kraken_service.resolve_pair(symbol)
+        supported_pair = resolved_pair is not None
         checks.append(
             PreTradeGateCheck(
                 name='symbol_resolution',
                 passed=supported_pair,
-                reason='' if supported_pair else f'{symbol} is not in the supported Kraken pair map.',
-                details={'pair': symbol, 'ohlcvPair': TOP_30_PAIRS.get(symbol)},
+                reason='' if supported_pair else f'{symbol} is not in the current Kraken AssetPairs universe.',
+                details={
+                    'pair': symbol,
+                    'resolvedDisplayPair': resolved_pair.display_pair if resolved_pair else None,
+                    'ohlcvPair': resolved_pair.rest_pair if resolved_pair else None,
+                },
             )
         )
-        if not supported_pair:
+        if not supported_pair or resolved_pair is None:
             return self._reject(
                 'crypto',
                 symbol,
@@ -306,7 +311,7 @@ class PreTradeGateService:
                 context=context,
             )
 
-        ohlcv_pair = TOP_30_PAIRS[symbol]
+        ohlcv_pair = resolved_pair.rest_pair
         ticker = kraken_service.get_ticker(ohlcv_pair)
         candles = kraken_service.get_ohlc(ohlcv_pair, interval=5, limit=trade_validator.crypto_min_candles_required)
         validation = trade_validator.validate_crypto_trade_with_market_data(symbol, amount, ticker=ticker, candles=candles)

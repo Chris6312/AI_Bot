@@ -24,6 +24,11 @@ const scopeLabels: Record<WatchlistScope, string> = {
   crypto_only: 'Crypto',
 }
 
+function isHealthyValidationStatus(status?: string | null) {
+  const normalized = (status ?? '').trim().toLowerCase()
+  return normalized === 'accepted' || normalized === 'valid'
+}
+
 export default function Watchlists() {
   const [selectedSymbol, setSelectedSymbol] = useState<{ scope: WatchlistScope; symbol: string } | null>(null)
 
@@ -123,7 +128,7 @@ function ScopePanel({
           <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-500">{scopeLabels[scope]}</div>
           <h2 className="mt-1 text-2xl font-semibold text-white">{activeWatchlist ? 'Active watchlist loaded' : 'No active watchlist yet'}</h2>
           <div className="mt-3 flex flex-wrap gap-2">
-            <StatusBadge tone={activeWatchlist?.validationStatus === 'accepted' ? 'good' : 'muted'}>
+            <StatusBadge tone={isHealthyValidationStatus(activeWatchlist?.validationStatus) ? 'good' : 'muted'}>
               {activeWatchlist?.validationStatus ?? 'No active payload'}
             </StatusBadge>
             <StatusBadge tone="muted">{activeWatchlist?.provider ?? 'Unknown provider'}</StatusBadge>

@@ -9,7 +9,7 @@ from datetime import datetime, time, timezone
 from typing import Any, Dict, List, Tuple
 from zoneinfo import ZoneInfo
 
-from app.services.kraken_service import TOP_30_PAIRS, kraken_service
+from app.services.kraken_service import kraken_service
 from app.services.tradier_client import tradier_client
 
 logger = logging.getLogger(__name__)
@@ -47,13 +47,14 @@ class TradeValidator:
         ticker: dict[str, Any] | None = None,
         candles: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        if pair not in TOP_30_PAIRS:
-            return self._result(False, f"❌ {pair} not in supported pairs list")
+        resolved_pair = self.kraken.resolve_pair(pair)
+        if resolved_pair is None:
+            return self._result(False, f"❌ {pair} not in Kraken AssetPairs")
 
         if amount is None or amount <= 0:
             return self._result(False, f"❌ Invalid amount for {pair}")
 
-        ohlcv_pair = TOP_30_PAIRS[pair]
+        ohlcv_pair = resolved_pair.rest_pair
 
         ticker_payload = ticker or self.kraken.get_ticker(ohlcv_pair)
         if not ticker_payload or "c" not in ticker_payload:

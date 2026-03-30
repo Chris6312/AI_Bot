@@ -124,6 +124,38 @@ export interface AIDecision {
   vix?: number
 }
 
+
+
+export interface OrderEventRecord {
+  eventType: string
+  status: string
+  message: string
+  eventTime: string | null
+  payload: Record<string, unknown>
+}
+
+export interface OrderIntentRecord {
+  intentId: string
+  accountId: string
+  assetClass: string
+  symbol: string
+  side: string
+  requestedQuantity: number
+  requestedPrice: number | null
+  filledQuantity: number
+  avgFillPrice: number | null
+  status: string
+  executionSource: string
+  submittedOrderId?: string | null
+  positionId?: number | null
+  tradeId?: number | null
+  rejectionReason?: string | null
+  submittedAt?: string | null
+  firstFillAt?: string | null
+  lastFillAt?: string | null
+  context: Record<string, unknown>
+  events: OrderEventRecord[]
+}
 export interface TradeHistoryEntry {
   id: string
   timestamp: string
@@ -145,6 +177,8 @@ export interface StockAccount {
   connected: boolean
   accountId: string
   buyingPower: number
+  brokerBuyingPower?: number
+  availableToTrade?: number
   portfolioValue: number
   cash: number
   unrealizedPnL: number

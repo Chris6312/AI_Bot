@@ -13,7 +13,7 @@ from ta.trend import MACD
 from ta.volatility import BollingerBands
 from ta.volume import VolumeWeightedAveragePrice
 
-from app.services.kraken_service import kraken_service, TOP_30_PAIRS
+from app.services.kraken_service import kraken_service
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class CryptoAnalyzer:
         Returns:
             DataFrame with OHLC data or None if error
         """
-        ohlcv_pair = TOP_30_PAIRS.get(pair)
+        ohlcv_pair = self.kraken.get_ohlcv_pair(pair)
         if not ohlcv_pair:
             logger.error(f"Unknown pair: {pair}")
             return None
@@ -299,7 +299,7 @@ class CryptoAnalyzer:
         Returns:
             24h change percentage or None
         """
-        ohlcv_pair = TOP_30_PAIRS.get(pair)
+        ohlcv_pair = self.kraken.get_ohlcv_pair(pair)
         if not ohlcv_pair:
             return None
         
@@ -336,7 +336,7 @@ class CryptoAnalyzer:
         Returns:
             Dict with all indicators and signals
         """
-        ohlcv_pair = TOP_30_PAIRS.get(pair)
+        ohlcv_pair = self.kraken.get_ohlcv_pair(pair)
         
         # Get current price
         ticker = self.kraken.get_ticker(ohlcv_pair)
@@ -473,7 +473,7 @@ class CryptoAnalyzer:
         """
         results = []
         
-        for pair in TOP_30_PAIRS.keys():
+        for pair in self.kraken.get_supported_pairs().keys():
             logger.info(f"Analyzing {pair}...")
             
             try:

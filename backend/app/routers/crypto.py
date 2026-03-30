@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.services.control_plane import ensure_execution_armed, require_admin_token
-from app.services.kraken_service import TOP_30_PAIRS, crypto_ledger, kraken_service
+from app.services.kraken_service import crypto_ledger, kraken_service
 from app.services.pre_trade_gate import pre_trade_gate
 
 router = APIRouter(prefix="/crypto", tags=["crypto"])
@@ -79,10 +79,10 @@ async def get_crypto_candles(
 
 @router.get("/pairs")
 async def get_top_pairs():
-    """Get top 15 liquid crypto pairs"""
+    """Get tradable crypto pairs from Kraken AssetPairs."""
     return [
         {"display": display, "ohlcv": ohlcv}
-        for display, ohlcv in TOP_30_PAIRS.items()
+        for display, ohlcv in kraken_service.get_supported_pairs().items()
     ]
 
 
@@ -100,7 +100,8 @@ async def execute_crypto_trade(
         if trade_side not in {'BUY', 'SELL'}:
             raise HTTPException(status_code=400, detail=f'Invalid side: {trade.side}')
 
-        if trade.pair not in TOP_30_PAIRS:
+        resolved_pair = kraken_service.resolve_pair(trade.pair)
+        if resolved_pair is None:
             raise HTTPException(status_code=400, detail=f"Invalid pair: {trade.pair}")
 
         ledger = crypto_ledger.get_ledger()
@@ -119,7 +120,7 @@ async def execute_crypto_trade(
         if not gate.allowed:
             raise HTTPException(status_code=400, detail=gate.rejection_reason)
 
-        ohlcv_pair = TOP_30_PAIRS[trade.pair]
+        ohlcv_pair = resolved_pair.rest_pair
         execution_price = trade.price or float(gate.market_data.get('currentPrice') or 0.0)
         if execution_price <= 0:
             raise HTTPException(status_code=400, detail='Current market price unavailable after pre-trade gate approval.')

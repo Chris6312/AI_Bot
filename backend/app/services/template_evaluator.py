@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.watchlist_monitor_state import WatchlistMonitorState
 from app.models.watchlist_symbol import WatchlistSymbol
-from app.services.kraken_service import TOP_30_PAIRS, kraken_service
+from app.services.kraken_service import kraken_service
 from app.services.market_sessions import calculate_next_scope_evaluation_at
 from app.services.runtime_state import runtime_state
 from app.services.trade_validator import trade_validator
@@ -236,11 +236,12 @@ class TemplateEvaluationService:
 
     def _evaluate_crypto_row(self, row: WatchlistSymbol) -> TemplateEvaluationResult:
         pair = f"{str(row.symbol).upper()}/{str(row.quote_currency).upper()}"
-        ohlcv_pair = TOP_30_PAIRS.get(pair)
+        resolved_pair = kraken_service.resolve_pair(pair)
+        ohlcv_pair = resolved_pair.rest_pair if resolved_pair is not None else None
         if not ohlcv_pair:
             return TemplateEvaluationResult(
                 state=DATA_UNAVAILABLE,
-                reason=f'Crypto pair {pair} is not in the supported Kraken map.',
+                reason=f'Crypto pair {pair} is not in the current Kraken AssetPairs universe.',
                 market_data_at_utc=None,
                 details={'pair': pair},
             )

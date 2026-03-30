@@ -1,65 +1,80 @@
-import { useMemo, type ReactNode } from 'react'
+import { useMemo } from 'react'
+import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
-import { Activity, AlertTriangle, Bitcoin, DollarSign, Shield, TrendingUp, Wallet } from 'lucide-react'
+import {
+  Activity,
+  ArrowRight,
+  ClipboardList,
+  FileSearch,
+  Radar,
+  Shield,
+  TrendingUp,
+  Wallet,
+} from 'lucide-react'
 
 import { api } from '@/lib/api'
 import type {
   BotStatus,
   CryptoLedger,
-  CryptoPosition,
-  DependencyCheck,
-  GateDecisionRecord,
   MarketStatus,
   RuntimeVisibility,
   StockAccount,
-  StockPosition,
+  WatchlistExitReadinessSnapshot,
+  WatchlistMonitoringSnapshot,
+  WatchlistOrchestrationStatus,
+  WatchlistScope,
+  WatchlistUploadRecord,
 } from '@/types'
+
+const scopeLabels: Record<WatchlistScope, string> = {
+  stocks_only: 'Stocks',
+  crypto_only: 'Crypto',
+}
 
 function formatMoney(value: number) {
   return `$${value.toFixed(2)}`
 }
 
-function formatObserved(value?: string | null) {
+function formatRelative(value?: string | null) {
   if (!value) return '—'
-  return `${formatDistanceToNow(new Date(value), { addSuffix: true })}`
+  return formatDistanceToNow(new Date(value), { addSuffix: true })
 }
 
-function stateTone(state: string) {
+function isHealthyValidationStatus(status?: string | null) {
+  const normalized = (status ?? '').trim().toLowerCase()
+  return normalized === 'accepted' || normalized === 'valid'
+}
+
+function stateTone(state?: string | null) {
   switch (state) {
     case 'ARMED':
     case 'READY':
-      return 'bg-green-900/60 text-green-300 border-green-700'
+      return 'good' as const
     case 'PAUSED':
     case 'DEGRADED':
-      return 'bg-yellow-900/50 text-yellow-300 border-yellow-700'
+      return 'warn' as const
     case 'LOCKED':
     case 'READ_ONLY':
     case 'REJECTED':
     case 'MISSING':
-      return 'bg-red-900/50 text-red-300 border-red-700'
+      return 'danger' as const
     default:
-      return 'bg-gray-800 text-gray-300 border-gray-700'
+      return 'muted' as const
   }
 }
 
 export default function Dashboard() {
-  const { data: stockPositions = [] } = useQuery<StockPosition[]>({
-    queryKey: ['stockPositions'],
-    queryFn: api.getStockPositions,
-    refetchInterval: 5000,
-  })
-
-  const { data: cryptoPositions = [] } = useQuery<CryptoPosition[]>({
-    queryKey: ['cryptoPositions'],
-    queryFn: api.getCryptoPositions,
-    refetchInterval: 5000,
-  })
-
   const { data: botStatus } = useQuery<BotStatus>({
     queryKey: ['botStatus'],
     queryFn: api.getBotStatus,
     refetchInterval: 3000,
+  })
+
+  const { data: runtimeVisibility } = useQuery<RuntimeVisibility>({
+    queryKey: ['runtimeVisibility'],
+    queryFn: () => api.getRuntimeVisibility(8),
+    refetchInterval: 10000,
   })
 
   const { data: marketStatus } = useQuery<MarketStatus>({
@@ -80,296 +95,374 @@ export default function Dashboard() {
     refetchInterval: 5000,
   })
 
-  const { data: runtimeVisibility } = useQuery<RuntimeVisibility>({
-    queryKey: ['runtimeVisibility'],
-    queryFn: () => api.getRuntimeVisibility(8),
+  const { data: stockPositions = [] } = useQuery({
+    queryKey: ['stockPositions'],
+    queryFn: api.getStockPositions,
+    refetchInterval: 5000,
+  })
+
+  const { data: cryptoPositions = [] } = useQuery({
+    queryKey: ['cryptoPositions'],
+    queryFn: api.getCryptoPositions,
+    refetchInterval: 5000,
+  })
+
+  const { data: stockWatchlist } = useQuery<WatchlistUploadRecord | null>({
+    queryKey: ['activeWatchlist', 'stocks_only'],
+    queryFn: () => api.getActiveWatchlist('stocks_only'),
+    refetchInterval: 10000,
+  })
+
+  const { data: cryptoWatchlist } = useQuery<WatchlistUploadRecord | null>({
+    queryKey: ['activeWatchlist', 'crypto_only'],
+    queryFn: () => api.getActiveWatchlist('crypto_only'),
+    refetchInterval: 10000,
+  })
+
+  const { data: stockMonitoring } = useQuery<WatchlistMonitoringSnapshot>({
+    queryKey: ['watchlistMonitoring', 'stocks_only'],
+    queryFn: () => api.getWatchlistMonitoring('stocks_only'),
+    refetchInterval: 10000,
+  })
+
+  const { data: cryptoMonitoring } = useQuery<WatchlistMonitoringSnapshot>({
+    queryKey: ['watchlistMonitoring', 'crypto_only'],
+    queryFn: () => api.getWatchlistMonitoring('crypto_only'),
+    refetchInterval: 10000,
+  })
+
+  const { data: stockOrchestration } = useQuery<WatchlistOrchestrationStatus>({
+    queryKey: ['watchlistOrchestration', 'stocks_only'],
+    queryFn: () => api.getWatchlistOrchestration('stocks_only'),
+    refetchInterval: 10000,
+  })
+
+  const { data: cryptoOrchestration } = useQuery<WatchlistOrchestrationStatus>({
+    queryKey: ['watchlistOrchestration', 'crypto_only'],
+    queryFn: () => api.getWatchlistOrchestration('crypto_only'),
+    refetchInterval: 10000,
+  })
+
+  const { data: stockExitReadiness } = useQuery<WatchlistExitReadinessSnapshot>({
+    queryKey: ['watchlistExitReadiness', 'stocks_only'],
+    queryFn: () => api.getWatchlistExitReadiness('stocks_only', 24),
+    refetchInterval: 10000,
+  })
+
+  const { data: cryptoExitReadiness } = useQuery<WatchlistExitReadinessSnapshot>({
+    queryKey: ['watchlistExitReadiness', 'crypto_only'],
+    queryFn: () => api.getWatchlistExitReadiness('crypto_only', 24),
     refetchInterval: 10000,
   })
 
   const summary = useMemo(() => {
     const stockEquity = stockAccount?.portfolioValue ?? 0
     const cryptoEquity = cryptoLedger?.equity ?? 0
-    const stockPnL = stockAccount?.unrealizedPnL ?? stockPositions.reduce((sum, p) => sum + p.pnl, 0)
-    const cryptoPnL = cryptoLedger?.totalPnL ?? cryptoPositions.reduce((sum, p) => sum + p.pnl, 0)
-    return {
-      stockEquity,
-      cryptoEquity,
-      totalEquity: stockEquity + cryptoEquity,
-      openPnL: stockPnL + cryptoPnL,
-      activePositions: stockPositions.length + cryptoPositions.length,
-    }
-  }, [cryptoLedger, cryptoPositions, stockAccount, stockPositions])
+    const stockPnl = stockAccount?.unrealizedPnL ?? 0
+    const cryptoPnl = cryptoLedger?.totalPnL ?? 0
+    const activeWatchSymbols = (stockWatchlist?.selectedCount ?? 0) + (cryptoWatchlist?.selectedCount ?? 0)
 
-  const gateSummary = runtimeVisibility?.gate.summary
-  const lastDecision = gateSummary?.lastDecision
-  const lastRejected = gateSummary?.lastRejected
-  const dependencies = runtimeVisibility?.dependencies.checks
+    return {
+      totalEquity: stockEquity + cryptoEquity,
+      openPnl: stockPnl + cryptoPnl,
+      activePositions: stockPositions.length + cryptoPositions.length,
+      activeWatchSymbols,
+    }
+  }, [cryptoLedger, cryptoPositions.length, cryptoWatchlist?.selectedCount, stockAccount, stockPositions.length, stockWatchlist?.selectedCount])
+
+  const recentGateDecisions = runtimeVisibility?.gate.recent ?? []
+  const dependencySummary = runtimeVisibility?.dependencies.summary
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h1 className="text-3xl font-bold text-white">Operator Dashboard</h1>
-          <p className="mt-1 text-gray-400">Runtime truth board for control state, market readiness, and recent gate decisions.</p>
-        </div>
-        <div className="flex flex-wrap gap-3">
-          <StatusPill
-            active={marketStatus?.stock.isOpen ?? false}
-            icon={<TrendingUp className="h-4 w-4" />}
-            label={`Stock Market: ${marketStatus?.stock.isOpen ? 'Open' : 'Closed'}`}
-          />
-          <StatusPill
-            active={botStatus?.running ?? false}
-            icon={<Activity className="h-4 w-4" />}
-            label={`Bot: ${botStatus?.running ? 'Active' : 'Inactive'}`}
-          />
-          <StatusPill
-            active={(botStatus?.stockMode ?? 'PAPER') === 'LIVE'}
-            icon={<Wallet className="h-4 w-4" />}
-            label={`Stock Mode: ${botStatus?.stockMode ?? 'PAPER'}`}
-          />
-        </div>
-      </div>
-
-      <ControlPlaneBanner
-        state={botStatus?.controlPlane.state ?? 'UNKNOWN'}
-        reason={botStatus?.controlPlane.reason ?? 'Waiting for control-plane status.'}
-        executionGateState={botStatus?.executionGate.state ?? 'UNKNOWN'}
-        lastDecision={lastDecision ?? null}
-      />
-
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-5">
-        <StatCard title="Total Equity" value={formatMoney(summary.totalEquity)} icon={<DollarSign className="h-6 w-6" />} trend={summary.totalEquity >= 0 ? 'up' : 'down'} />
-        <StatCard title="Stock Equity" value={formatMoney(summary.stockEquity)} icon={<TrendingUp className="h-6 w-6" />} trend={summary.stockEquity >= 0 ? 'up' : 'down'} />
-        <StatCard title="Crypto Equity" value={formatMoney(summary.cryptoEquity)} icon={<Bitcoin className="h-6 w-6" />} trend={summary.cryptoEquity >= 0 ? 'up' : 'down'} />
-        <StatCard title="Open P&L" value={formatMoney(summary.openPnL)} icon={<Activity className="h-6 w-6" />} trend={summary.openPnL >= 0 ? 'up' : 'down'} />
-        <StatCard title="Gate Rejections" value={String(gateSummary?.rejectedCount ?? 0)} icon={<Shield className="h-6 w-6" />} trend={(gateSummary?.rejectedCount ?? 0) > 0 ? 'down' : 'up'} />
-      </div>
-
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-        <div className="xl:col-span-2 space-y-6">
-          <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-            <MarketPanel title={`Stock Positions (${botStatus?.stockMode ?? 'PAPER'})`} positions={stockPositions} type="stock" emptyMessage="No active stock positions" />
-            <MarketPanel title="Crypto Positions (PAPER)" positions={cryptoPositions} type="crypto" emptyMessage="No active crypto positions" />
+      <header className="rounded-3xl border border-slate-800 bg-slate-900/70 p-6 shadow-2xl shadow-slate-950/30">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+          <div>
+            <div className="mb-2 flex items-center gap-2 text-sm font-medium uppercase tracking-[0.22em] text-cyan-300">
+              <Radar className="h-4 w-4" />
+              Operator console
+            </div>
+            <h1 className="text-3xl font-semibold text-white">Daily watchlist mission board</h1>
+            <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-400">
+              The dashboard now behaves like a flight deck: runtime truth, active watchlists, execution pressure, and the fastest lanes into positions,
+              monitoring, and audit.
+            </p>
           </div>
-          <GateDecisionPanel recent={runtimeVisibility?.gate.recent ?? []} />
-        </div>
 
-        <div className="space-y-6">
-          <DependencyPanel dependencies={dependencies} />
-          <LastRejectionCard decision={lastRejected ?? null} />
+          <div className="flex flex-wrap gap-3">
+            <StatusPill tone={marketStatus?.stock.isOpen ? 'good' : 'warn'} label={`Stocks ${marketStatus?.stock.isOpen ? 'open' : 'closed'}`} />
+            <StatusPill tone={botStatus?.running ? 'good' : 'warn'} label={botStatus?.running ? 'Runtime active' : 'Runtime paused'} />
+            <StatusPill tone={stateTone(botStatus?.controlPlane.state)} label={`Control ${botStatus?.controlPlane.state ?? 'UNKNOWN'}`} />
+            <StatusPill tone={stateTone(botStatus?.executionGate.state)} label={`Gate ${botStatus?.executionGate.state ?? 'UNKNOWN'}`} />
+          </div>
         </div>
+      </header>
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <MetricCard label="Total equity" value={formatMoney(summary.totalEquity)} detail={`${formatMoney(summary.openPnl)} open P&L`} icon={<Wallet className="h-5 w-5" />} />
+        <MetricCard label="Active positions" value={String(summary.activePositions)} detail={`${stockPositions.length} stock · ${cryptoPositions.length} crypto`} icon={<TrendingUp className="h-5 w-5" />} />
+        <MetricCard label="Active watch symbols" value={String(summary.activeWatchSymbols)} detail={`${stockWatchlist?.selectedCount ?? 0} stock · ${cryptoWatchlist?.selectedCount ?? 0} crypto`} icon={<ClipboardList className="h-5 w-5" />} />
+        <MetricCard label="Dependency readiness" value={`${dependencySummary?.readyCount ?? 0}/${(dependencySummary?.readyCount ?? 0) + (dependencySummary?.degradedCount ?? 0) + (dependencySummary?.missingCount ?? 0)}`} detail={dependencySummary?.criticalReady ? 'Critical rails ready' : 'Critical rails degraded'} icon={<Shield className="h-5 w-5" />} />
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.55fr)_minmax(320px,0.95fr)]">
+        <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
+          <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">
+            <Activity className="h-4 w-4 text-cyan-300" />
+            Command deck
+          </div>
+          <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+            <CommandCard to="/watchlists" title="Watchlists" description="Review the accepted uploads, context notes, and provider limitations before the bot leans forward." />
+            <CommandCard to="/monitoring" title="Monitoring" description="See who is due, who is blocked, and which symbols are standing on a trigger." />
+            <CommandCard to="/positions" title="Positions" description="Track live inventory, exit pressure, and the trade tape without bouncing between separate pages." />
+            <CommandCard to="/audit" title="Audit trail" description="Inspect watchlist receipts, gate decisions, order lifecycle events, and the paper-ledger breadcrumb trail." />
+          </div>
+        </section>
+
+        <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
+          <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">
+            <Shield className="h-4 w-4 text-emerald-300" />
+            Control plane truth
+          </div>
+          <div className="mt-4 space-y-3 text-sm text-slate-300">
+            <SummaryRow label="Control state" value={botStatus?.controlPlane.state ?? 'UNKNOWN'} tone={stateTone(botStatus?.controlPlane.state)} />
+            <SummaryRow label="Control reason" value={botStatus?.controlPlane.reason ?? '—'} />
+            <SummaryRow label="Gate state" value={botStatus?.executionGate.state ?? 'UNKNOWN'} tone={stateTone(botStatus?.executionGate.state)} />
+            <SummaryRow label="Last heartbeat" value={formatRelative(botStatus?.lastHeartbeat)} />
+            <SummaryRow label="Stock session" value={marketStatus?.stock.isOpen ? 'Open' : 'Closed'} tone={marketStatus?.stock.isOpen ? 'good' : 'warn'} />
+            <SummaryRow label="Stock mode" value={botStatus?.stockMode ?? 'PAPER'} />
+          </div>
+        </section>
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 2xl:grid-cols-2">
+        <ScopeCard
+          scope="stocks_only"
+          watchlist={stockWatchlist}
+          monitoring={stockMonitoring}
+          orchestration={stockOrchestration}
+          exitReadiness={stockExitReadiness}
+        />
+        <ScopeCard
+          scope="crypto_only"
+          watchlist={cryptoWatchlist}
+          monitoring={cryptoMonitoring}
+          orchestration={cryptoOrchestration}
+          exitReadiness={cryptoExitReadiness}
+        />
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.95fr)]">
+        <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
+          <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">
+            <FileSearch className="h-4 w-4 text-cyan-300" />
+            Recent gate decisions
+          </div>
+          <div className="mt-4 space-y-3">
+            {recentGateDecisions.length === 0 ? (
+              <EmptyState message="No gate decisions have been recorded yet." />
+            ) : (
+              recentGateDecisions.slice(0, 6).map((decision) => (
+                <div key={`${decision.recordedAtUtc}-${decision.symbol}-${decision.state}`} className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-base font-semibold text-white">{decision.symbol}</span>
+                        <ToneBadge tone={decision.allowed ? 'good' : 'danger'}>{decision.allowed ? 'Allowed' : 'Rejected'}</ToneBadge>
+                        <ToneBadge tone={stateTone(decision.state)}>{decision.state}</ToneBadge>
+                      </div>
+                      <div className="mt-2 text-sm text-slate-400">
+                        {decision.executionSource} · {decision.assetClass}
+                      </div>
+                    </div>
+                    <div className="text-sm text-slate-500">{formatRelative(decision.recordedAtUtc)}</div>
+                  </div>
+                  <div className="mt-3 text-sm text-slate-300">{decision.rejectionReason || 'Gate opened cleanly. No rejection reason recorded.'}</div>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+
+        <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
+          <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">
+            <Shield className="h-4 w-4 text-emerald-300" />
+            Dependency board
+          </div>
+          <div className="mt-4 space-y-3">
+            {runtimeVisibility?.dependencies.checks ? (
+              Object.values(runtimeVisibility.dependencies.checks).map((dependency) => (
+                <div key={dependency.name} className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="font-medium text-white">{dependency.name}</div>
+                      <div className="mt-1 text-sm text-slate-400">{dependency.reason || 'No detail provided.'}</div>
+                    </div>
+                    <ToneBadge tone={stateTone(dependency.state)}>{dependency.state}</ToneBadge>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <EmptyState message="Dependency visibility has not arrived yet." />
+            )}
+          </div>
+        </section>
       </div>
     </div>
   )
 }
 
-function ControlPlaneBanner({
-  state,
-  reason,
-  executionGateState,
-  lastDecision,
+function ScopeCard({
+  scope,
+  watchlist,
+  monitoring,
+  orchestration,
+  exitReadiness,
 }: {
-  state: string
-  reason: string
-  executionGateState: string
-  lastDecision: GateDecisionRecord | null
+  scope: WatchlistScope
+  watchlist: WatchlistUploadRecord | null | undefined
+  monitoring: WatchlistMonitoringSnapshot | undefined
+  orchestration: WatchlistOrchestrationStatus | undefined
+  exitReadiness: WatchlistExitReadinessSnapshot | undefined
 }) {
+  const dueSnapshot = orchestration?.dueSnapshot
+  const dueCount = dueSnapshot && 'dueCount' in dueSnapshot ? dueSnapshot.dueCount : 0
+  const eligibleDueCount = dueSnapshot && 'eligibleDueCount' in dueSnapshot ? dueSnapshot.eligibleDueCount : 0
+  const blockedDueCount = dueSnapshot && 'blockedDueCount' in dueSnapshot ? dueSnapshot.blockedDueCount : 0
+  const sessionLabel = dueSnapshot && 'session' in dueSnapshot ? dueSnapshot.session.sessionLabel : 'Unknown session'
+  const sessionOpen = dueSnapshot && 'session' in dueSnapshot ? dueSnapshot.session.sessionOpen : false
+
   return (
-    <div className={`rounded-2xl border p-5 ${stateTone(state)}`}>
+    <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
-          <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide">
-            <Shield className="h-4 w-4" />
-            Control Plane {state}
+          <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-500">{scopeLabels[scope]}</div>
+          <h2 className="mt-1 text-2xl font-semibold text-white">{watchlist?.provider ?? 'No active watchlist'}</h2>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <ToneBadge tone={isHealthyValidationStatus(watchlist?.validationStatus) ? 'good' : 'warn'}>{watchlist?.validationStatus ?? 'MISSING'}</ToneBadge>
+            <ToneBadge tone={sessionOpen ? 'good' : 'warn'}>{sessionLabel}</ToneBadge>
+            <ToneBadge tone="info">{watchlist?.marketRegime ?? 'No regime'}</ToneBadge>
           </div>
-          <p className="mt-2 text-sm leading-6">{reason}</p>
         </div>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <MiniMetric label="Execution Gate" value={executionGateState} />
-          <MiniMetric label="Last Gate Decision" value={lastDecision ? `${lastDecision.symbol} · ${lastDecision.allowed ? 'Allowed' : 'Rejected'}` : 'No decisions yet'} />
+
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <SmallMetric label="Symbols" value={String(watchlist?.selectedCount ?? 0)} />
+          <SmallMetric label="Entry ready" value={String(monitoring?.summary.entryCandidateCount ?? 0)} />
+          <SmallMetric label="Open" value={String(exitReadiness?.summary.openPositionCount ?? 0)} />
+          <SmallMetric label="Protective" value={String(exitReadiness?.summary.protectiveExitPendingCount ?? 0)} />
         </div>
       </div>
-    </div>
-  )
-}
 
-function StatusPill({ active, icon, label }: { active: boolean; icon: ReactNode; label: string }) {
-  return (
-    <div className={`rounded-full px-4 py-2 ${active ? 'bg-green-900 text-green-300' : 'bg-gray-800 text-gray-400'}`}>
-      <div className="flex items-center gap-2">
-        {icon}
-        <span>{label}</span>
-      </div>
-    </div>
-  )
-}
-
-function StatCard({ title, value, icon, trend }: { title: string; value: string; icon: ReactNode; trend?: 'up' | 'down' }) {
-  const iconClass = trend === 'down' ? 'text-red-500' : 'text-green-500'
-  const valueClass = trend === 'down' ? 'text-red-500' : trend === 'up' ? 'text-green-500' : 'text-white'
-
-  return (
-    <div className="rounded-lg border border-gray-800 bg-gray-900 p-6">
-      <div className="mb-2 flex items-center justify-between">
-        <span className="text-sm text-gray-400">{title}</span>
-        <div className={iconClass}>{icon}</div>
-      </div>
-      <div className={`text-2xl font-bold ${valueClass}`}>{value}</div>
-    </div>
-  )
-}
-
-function MarketPanel({
-  title,
-  positions,
-  type,
-  emptyMessage,
-}: {
-  title: string
-  positions: Array<StockPosition | CryptoPosition>
-  type: 'stock' | 'crypto'
-  emptyMessage: string
-}) {
-  return (
-    <div className="rounded-lg border border-gray-800 bg-gray-900 p-6">
-      <h2 className="mb-4 text-xl font-bold text-white">{title}</h2>
-      {positions.length === 0 ? (
-        <p className="py-8 text-center text-gray-500">{emptyMessage}</p>
-      ) : (
-        <div className="space-y-3">
-          {positions.map((position) => {
-            const key = type === 'stock' ? (position as StockPosition).symbol : (position as CryptoPosition).pair
-            const qtyLabel =
-              type === 'stock'
-                ? `${(position as StockPosition).shares.toFixed(0)} shares`
-                : `${(position as CryptoPosition).amount.toFixed(6)}`
-            return (
-              <div key={key} className="flex items-center justify-between rounded-lg bg-gray-800 p-3">
-                <div>
-                  <div className="font-semibold text-white">{key}</div>
-                  <div className="text-sm text-gray-400">
-                    {qtyLabel} @ ${position.avgPrice.toFixed(2)}
-                  </div>
-                </div>
-                <div className="text-right">
-                  <div className={`font-semibold ${position.pnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                    {formatMoney(position.pnl)}
-                  </div>
-                  <div className={`text-sm ${position.pnlPercent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                    {position.pnlPercent >= 0 ? '+' : ''}
-                    {position.pnlPercent.toFixed(2)}%
-                  </div>
-                </div>
-              </div>
-            )
-          })}
+      <div className="mt-5 grid grid-cols-1 gap-4 xl:grid-cols-2">
+        <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+          <div className="mb-4 text-sm font-semibold text-slate-200">Watchlist state</div>
+          <div className="space-y-3 text-sm text-slate-400">
+            <SummaryRow label="Generated" value={formatRelative(watchlist?.generatedAtUtc)} />
+            <SummaryRow label="Received" value={formatRelative(watchlist?.receivedAtUtc)} />
+            <SummaryRow label="Expires" value={formatRelative(watchlist?.watchlistExpiresAtUtc)} />
+            <SummaryRow label="Waiting for setup" value={String(monitoring?.summary.waitingForSetupCount ?? 0)} />
+            <SummaryRow label="Managed-only" value={String(monitoring?.summary.managedOnlyCount ?? 0)} />
+          </div>
         </div>
-      )}
-    </div>
-  )
-}
 
-function DependencyPanel({ dependencies }: { dependencies?: RuntimeVisibility['dependencies']['checks'] }) {
-  const entries = dependencies ? Object.values(dependencies) : []
-  return (
-    <div className="rounded-lg border border-gray-800 bg-gray-900 p-6">
-      <h2 className="mb-4 text-xl font-bold text-white">Dependency Readiness</h2>
-      <div className="space-y-3">
-        {entries.length === 0 ? (
-          <p className="text-sm text-gray-500">Waiting for dependency probes…</p>
-        ) : (
-          entries.map((entry) => <DependencyRow key={entry.name} entry={entry} />)
-        )}
+        <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+          <div className="mb-4 text-sm font-semibold text-slate-200">Evaluation pressure</div>
+          <div className="space-y-3 text-sm text-slate-400">
+            <SummaryRow label="Due" value={String(dueCount)} />
+            <SummaryRow label="Eligible" value={String(eligibleDueCount)} />
+            <SummaryRow label="Blocked" value={String(blockedDueCount)} tone={blockedDueCount > 0 ? 'warn' : 'muted'} />
+            <SummaryRow label="Expired positions" value={String(exitReadiness?.summary.expiredPositionCount ?? 0)} tone={(exitReadiness?.summary.expiredPositionCount ?? 0) > 0 ? 'warn' : 'muted'} />
+            <SummaryRow label="Scale-out ready" value={String(exitReadiness?.summary.scaleOutReadyCount ?? 0)} />
+          </div>
+        </div>
       </div>
-    </div>
+    </section>
   )
 }
 
-function DependencyRow({ entry }: { entry: DependencyCheck }) {
+function CommandCard({ to, title, description }: { to: string; title: string; description: string }) {
   return (
-    <div className="rounded-lg bg-gray-800 p-4">
-      <div className="flex items-center justify-between gap-4">
+    <Link to={to} className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4 transition hover:border-cyan-700 hover:bg-slate-950">
+      <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="font-semibold text-white">{entry.name}</div>
-          <div className="mt-1 text-xs text-gray-400">Checked {formatObserved(entry.checkedAtUtc)}</div>
+          <div className="text-base font-semibold text-white">{title}</div>
+          <div className="mt-2 text-sm leading-6 text-slate-400">{description}</div>
         </div>
-        <span className={`rounded border px-2 py-1 text-xs font-semibold ${stateTone(entry.state)}`}>{entry.state}</span>
+        <ArrowRight className="mt-1 h-4 w-4 text-cyan-300" />
       </div>
-      <div className="mt-2 text-sm text-gray-300">{entry.reason || 'Probe succeeded.'}</div>
+    </Link>
+  )
+}
+
+function MetricCard({ label, value, detail, icon }: { label: string; value: string; detail: string; icon: JSX.Element }) {
+  return (
+    <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-sm text-slate-400">{label}</div>
+        <div className="text-cyan-300">{icon}</div>
+      </div>
+      <div className="mt-3 text-3xl font-semibold text-white">{value}</div>
+      <div className="mt-2 text-sm text-slate-500">{detail}</div>
     </div>
   )
 }
 
-function GateDecisionPanel({ recent }: { recent: GateDecisionRecord[] }) {
+function SmallMetric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-gray-800 bg-gray-900 p-6">
-      <h2 className="mb-4 text-xl font-bold text-white">Recent Pre-Trade Gate Decisions</h2>
-      {recent.length === 0 ? (
-        <p className="text-sm text-gray-500">No gate decisions recorded yet.</p>
-      ) : (
-        <div className="space-y-3">
-          {recent.map((decision) => (
-            <div key={`${decision.recordedAtUtc}-${decision.symbol}-${decision.executionSource}`} className="rounded-lg bg-gray-800 p-4">
-              <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="font-semibold text-white">{decision.symbol}</span>
-                    <span className={`rounded border px-2 py-1 text-xs font-semibold ${decision.allowed ? 'border-green-700 bg-green-900/50 text-green-300' : 'border-red-700 bg-red-900/50 text-red-300'}`}>
-                      {decision.allowed ? 'ALLOWED' : 'REJECTED'}
-                    </span>
-                    <span className="text-xs uppercase tracking-wide text-gray-400">{decision.assetClass}</span>
-                  </div>
-                  <div className="mt-1 text-sm text-gray-400">
-                    {decision.executionSource} · {formatObserved(decision.recordedAtUtc)}
-                  </div>
-                </div>
-                <div className="text-sm text-gray-300">State: {decision.state}</div>
-              </div>
-              <div className="mt-3 text-sm text-gray-300">
-                {decision.rejectionReason || 'All gate checks passed.'}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+    <div className="rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
+      <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
+      <div className="mt-1 text-2xl font-semibold text-white">{value}</div>
     </div>
   )
 }
 
-function LastRejectionCard({ decision }: { decision: GateDecisionRecord | null }) {
+function SummaryRow({ label, value, tone = 'muted' }: { label: string; value: string; tone?: 'good' | 'warn' | 'danger' | 'info' | 'muted' }) {
   return (
-    <div className="rounded-lg border border-gray-800 bg-gray-900 p-6">
-      <h2 className="mb-4 flex items-center gap-2 text-xl font-bold text-white">
-        <AlertTriangle className="h-5 w-5 text-yellow-400" />
-        Last Rejection
-      </h2>
-      {!decision ? (
-        <p className="text-sm text-gray-500">No rejected gate decisions recorded yet.</p>
-      ) : (
-        <div className="space-y-3 text-sm">
-          <div>
-            <div className="text-xs uppercase tracking-wide text-gray-500">Symbol</div>
-            <div className="font-semibold text-white">{decision.symbol}</div>
-          </div>
-          <div>
-            <div className="text-xs uppercase tracking-wide text-gray-500">Reason</div>
-            <div className="text-gray-300">{decision.rejectionReason}</div>
-          </div>
-          <div className="rounded-lg bg-gray-800 p-3 text-gray-400">
-            {decision.executionSource} · {formatObserved(decision.recordedAtUtc)}
-          </div>
-        </div>
-      )}
+    <div className="flex items-start justify-between gap-4">
+      <div className="text-slate-500">{label}</div>
+      <div className={toneTextClass(tone)}>{value}</div>
     </div>
   )
 }
 
-function MiniMetric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-xl bg-black/20 px-4 py-3">
-      <div className="text-xs uppercase tracking-wide opacity-70">{label}</div>
-      <div className="mt-1 text-sm font-semibold">{value}</div>
-    </div>
-  )
+function StatusPill({ label, tone }: { label: string; tone: 'good' | 'warn' | 'danger' | 'info' | 'muted' }) {
+  return <span className={`rounded-full px-3 py-2 text-sm ${toneBadgeClass(tone)}`}>{label}</span>
+}
+
+function ToneBadge({ children, tone }: { children: string; tone: 'good' | 'warn' | 'danger' | 'info' | 'muted' }) {
+  return <span className={`rounded-full px-2.5 py-1 text-xs font-semibold uppercase tracking-wide ${toneBadgeClass(tone)}`}>{children}</span>
+}
+
+function EmptyState({ message }: { message: string }) {
+  return <div className="rounded-2xl border border-dashed border-slate-700 px-4 py-8 text-center text-sm text-slate-500">{message}</div>
+}
+
+function toneBadgeClass(tone: 'good' | 'warn' | 'danger' | 'info' | 'muted') {
+  switch (tone) {
+    case 'good':
+      return 'border border-emerald-700/60 bg-emerald-500/10 text-emerald-200'
+    case 'warn':
+      return 'border border-amber-700/60 bg-amber-500/10 text-amber-200'
+    case 'danger':
+      return 'border border-rose-700/60 bg-rose-500/10 text-rose-200'
+    case 'info':
+      return 'border border-cyan-700/60 bg-cyan-500/10 text-cyan-200'
+    default:
+      return 'border border-slate-700 bg-slate-800/80 text-slate-300'
+  }
+}
+
+function toneTextClass(tone: 'good' | 'warn' | 'danger' | 'info' | 'muted') {
+  switch (tone) {
+    case 'good':
+      return 'text-right text-emerald-300'
+    case 'warn':
+      return 'text-right text-amber-300'
+    case 'danger':
+      return 'text-right text-rose-300'
+    case 'info':
+      return 'text-right text-cyan-300'
+    default:
+      return 'text-right text-slate-300'
+  }
 }

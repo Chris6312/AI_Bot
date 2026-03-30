@@ -718,7 +718,7 @@ class TradingBot(commands.Bot):
         return snapshot
 
     async def _execute_crypto_positions(self, positions: List[Dict], *, db, decision_data: Dict | None = None) -> List[Dict]:
-        from app.services.kraken_service import TOP_30_PAIRS, crypto_ledger
+        from app.services.kraken_service import crypto_ledger, kraken_service
 
         results = []
         ledger = crypto_ledger.get_ledger()
@@ -754,7 +754,7 @@ class TradingBot(commands.Bot):
                 )
                 continue
 
-            ohlcv_pair = TOP_30_PAIRS.get(pair)
+            ohlcv_pair = kraken_service.get_ohlcv_pair(pair)
             current_price = float(gate.market_data.get('currentPrice') or 0.0)
             if not ohlcv_pair or current_price <= 0:
                 results.append(
@@ -1061,14 +1061,14 @@ class TradingBot(commands.Bot):
         return '\n'.join(cancel_results)
 
     async def _cancel_crypto_execution(self, result: List[Dict]) -> str:
-        from app.services.kraken_service import TOP_30_PAIRS, crypto_ledger
+        from app.services.kraken_service import crypto_ledger, kraken_service
 
         cancel_results = []
 
         for trade in result:
             pair = trade['pair']
             amount = trade['amount']
-            ohlcv_pair = TOP_30_PAIRS.get(pair)
+            ohlcv_pair = kraken_service.get_ohlcv_pair(pair)
 
             exit_trade = crypto_ledger.execute_trade(
                 pair=pair,

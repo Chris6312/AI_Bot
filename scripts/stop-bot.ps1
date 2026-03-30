@@ -103,16 +103,16 @@ function Stop-ListeningProcessOnPort {
         Select-Object -ExpandProperty OwningProcess -Unique |
         Sort-Object
 
-    foreach ($pid in $processIds) {
-        if ($pid -le 0) {
+    foreach ($processId in $processIds) {
+        if ($processId -le 0) {
             continue
         }
 
-        $commandLine = Get-CommandLine -ProcessId $pid
-        $safeToStop = Test-IsProjectProcess -ProcessId $pid -ProjectRoot $ProjectRoot -Patterns $Patterns
+        $commandLine = Get-CommandLine -ProcessId $processId
+        $safeToStop = Test-IsProjectProcess -ProcessId $processId -ProjectRoot $ProjectRoot -Patterns $Patterns
 
         if (-not $safeToStop) {
-            Write-Warning "Skipping PID $pid on port $Port because it does not look like this project's $Label process."
+            Write-Warning "Skipping PID $processId on port $Port because it does not look like this project's $Label process."
             if (-not [string]::IsNullOrWhiteSpace($commandLine)) {
                 Write-Host "Command: $commandLine" -ForegroundColor DarkGray
             }
@@ -120,12 +120,12 @@ function Stop-ListeningProcessOnPort {
         }
 
         try {
-            Write-Host "Stopping $Label on port $Port (PID $pid)..." -ForegroundColor Yellow
-            Stop-Process -Id $pid -Force -ErrorAction Stop
-            Write-Host "✓ Stopped PID $pid" -ForegroundColor Green
+            Write-Host "Stopping $Label on port $Port (PID $processId)..." -ForegroundColor Yellow
+            Stop-Process -Id $processId -Force -ErrorAction Stop
+            Write-Host "✓ Stopped PID $processId" -ForegroundColor Green
         }
         catch {
-            Write-Warning "Failed to stop PID $pid on port $Port. $($_.Exception.Message)"
+            Write-Warning "Failed to stop PID $processId on port $Port. $($_.Exception.Message)"
         }
     }
 }
