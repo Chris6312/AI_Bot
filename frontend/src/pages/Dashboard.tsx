@@ -4,16 +4,29 @@ import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import {
   Activity,
+  AlertTriangle,
   ArrowRight,
   ClipboardList,
   FileSearch,
   Radar,
   Shield,
+  TimerReset,
   TrendingUp,
   Wallet,
 } from 'lucide-react'
 
 import { api } from '@/lib/api'
+import {
+  DetailRow,
+  EmptyState,
+  MetricCard,
+  MiniMetric,
+  PageHero,
+  SectionCard,
+  StatusPill,
+  ToneBadge,
+  type Tone,
+} from '@/components/operator-ui'
 import type {
   BotStatus,
   CryptoLedger,
@@ -46,22 +59,42 @@ function isHealthyValidationStatus(status?: string | null) {
   return normalized === 'accepted' || normalized === 'valid'
 }
 
-function stateTone(state?: string | null) {
-  switch (state) {
+function stateTone(state?: string | null): Tone {
+  switch ((state ?? '').toUpperCase()) {
     case 'ARMED':
     case 'READY':
-      return 'good' as const
+    case 'RUNNING':
+    case 'OPEN':
+      return 'good'
     case 'PAUSED':
     case 'DEGRADED':
-      return 'warn' as const
+    case 'CLOSED':
+      return 'warn'
     case 'LOCKED':
     case 'READ_ONLY':
     case 'REJECTED':
     case 'MISSING':
-      return 'danger' as const
+    case 'DATA_UNAVAILABLE':
+      return 'danger'
     default:
-      return 'muted' as const
+      return 'muted'
   }
+}
+
+function getAvailableToTrade(account?: StockAccount) {
+  if (!account) return 0
+  return account.availableToTrade ?? account.cash ?? account.buyingPower ?? 0
+}
+
+function getSessionBadgeLabel(scope: WatchlistScope, sessionLabel?: string | null, sessionOpen?: boolean) {
+  const trimmed = (sessionLabel ?? '').trim()
+  if (trimmed) {
+    return trimmed
+  }
+  if (scope === 'crypto_only') {
+    return '24/7 session'
+  }
+  return sessionOpen ? 'Session open' : 'Session closed'
 }
 
 export default function Dashboard() {
@@ -119,39 +152,39 @@ export default function Dashboard() {
     refetchInterval: 10000,
   })
 
-  const { data: stockMonitoring } = useQuery<WatchlistMonitoringSnapshot>({
+  const { data: stockMonitoring } = useQuery<WatchlistMonitoringSnapshot | null>({
     queryKey: ['watchlistMonitoring', 'stocks_only'],
-    queryFn: () => api.getWatchlistMonitoring('stocks_only'),
+    queryFn: () => api.getWatchlistMonitoringOptional('stocks_only'),
     refetchInterval: 10000,
   })
 
-  const { data: cryptoMonitoring } = useQuery<WatchlistMonitoringSnapshot>({
+  const { data: cryptoMonitoring } = useQuery<WatchlistMonitoringSnapshot | null>({
     queryKey: ['watchlistMonitoring', 'crypto_only'],
-    queryFn: () => api.getWatchlistMonitoring('crypto_only'),
+    queryFn: () => api.getWatchlistMonitoringOptional('crypto_only'),
     refetchInterval: 10000,
   })
 
-  const { data: stockOrchestration } = useQuery<WatchlistOrchestrationStatus>({
+  const { data: stockOrchestration } = useQuery<WatchlistOrchestrationStatus | null>({
     queryKey: ['watchlistOrchestration', 'stocks_only'],
-    queryFn: () => api.getWatchlistOrchestration('stocks_only'),
+    queryFn: () => api.getWatchlistOrchestrationOptional('stocks_only'),
     refetchInterval: 10000,
   })
 
-  const { data: cryptoOrchestration } = useQuery<WatchlistOrchestrationStatus>({
+  const { data: cryptoOrchestration } = useQuery<WatchlistOrchestrationStatus | null>({
     queryKey: ['watchlistOrchestration', 'crypto_only'],
-    queryFn: () => api.getWatchlistOrchestration('crypto_only'),
+    queryFn: () => api.getWatchlistOrchestrationOptional('crypto_only'),
     refetchInterval: 10000,
   })
 
-  const { data: stockExitReadiness } = useQuery<WatchlistExitReadinessSnapshot>({
+  const { data: stockExitReadiness } = useQuery<WatchlistExitReadinessSnapshot | null>({
     queryKey: ['watchlistExitReadiness', 'stocks_only'],
-    queryFn: () => api.getWatchlistExitReadiness('stocks_only', 24),
+    queryFn: () => api.getWatchlistExitReadinessOptional('stocks_only', 24),
     refetchInterval: 10000,
   })
 
-  const { data: cryptoExitReadiness } = useQuery<WatchlistExitReadinessSnapshot>({
+  const { data: cryptoExitReadiness } = useQuery<WatchlistExitReadinessSnapshot | null>({
     queryKey: ['watchlistExitReadiness', 'crypto_only'],
-    queryFn: () => api.getWatchlistExitReadiness('crypto_only', 24),
+    queryFn: () => api.getWatchlistExitReadinessOptional('crypto_only', 24),
     refetchInterval: 10000,
   })
 
@@ -159,91 +192,157 @@ export default function Dashboard() {
     const stockEquity = stockAccount?.portfolioValue ?? 0
     const cryptoEquity = cryptoLedger?.equity ?? 0
     const stockPnl = stockAccount?.unrealizedPnL ?? 0
-    const cryptoPnl = cryptoLedger?.totalPnL ?? 0
-    const activeWatchSymbols = (stockWatchlist?.selectedCount ?? 0) + (cryptoWatchlist?.selectedCount ?? 0)
+    const cryptoPnl = cryptoLedger?.netPnL ?? cryptoLedger?.totalPnL ?? 0
 
     return {
       totalEquity: stockEquity + cryptoEquity,
       openPnl: stockPnl + cryptoPnl,
       activePositions: stockPositions.length + cryptoPositions.length,
-      activeWatchSymbols,
+      watchSymbols: (stockWatchlist?.selectedCount ?? 0) + (cryptoWatchlist?.selectedCount ?? 0),
+      availableCapital: getAvailableToTrade(stockAccount) + (cryptoLedger?.balance ?? 0),
     }
-  }, [cryptoLedger, cryptoPositions.length, cryptoWatchlist?.selectedCount, stockAccount, stockPositions.length, stockWatchlist?.selectedCount])
+  }, [cryptoLedger, cryptoPositions.length, stockAccount, stockPositions.length, stockWatchlist?.selectedCount, cryptoWatchlist?.selectedCount])
 
-  const recentGateDecisions = runtimeVisibility?.gate.recent ?? []
   const dependencySummary = runtimeVisibility?.dependencies.summary
+  const recentGateDecisions = runtimeVisibility?.gate.recent ?? []
+
+  const attentionItems = useMemo(() => {
+    const items: Array<{ label: string; detail: string; tone: Tone; to: string }> = []
+
+    const stockProtective = stockExitReadiness?.summary.protectiveExitPendingCount ?? 0
+    const cryptoProtective = cryptoExitReadiness?.summary.protectiveExitPendingCount ?? 0
+    if (stockProtective + cryptoProtective > 0) {
+      items.push({
+        label: 'Protective exits pending',
+        detail: `${stockProtective} stock · ${cryptoProtective} crypto`,
+        tone: 'warn',
+        to: '/positions',
+      })
+    }
+
+    const unavailable = (stockMonitoring?.summary.dataUnavailableCount ?? 0) + (cryptoMonitoring?.summary.dataUnavailableCount ?? 0)
+    if (unavailable > 0) {
+      items.push({
+        label: 'Symbols missing market data',
+        detail: `${unavailable} rows still marked DATA_UNAVAILABLE`,
+        tone: 'danger',
+        to: '/monitoring',
+      })
+    }
+
+    const blockedDue = [stockOrchestration, cryptoOrchestration].reduce((sum, item) => {
+      const snapshot = item?.dueSnapshot
+      if (snapshot && 'summary' in snapshot) {
+        return sum + (snapshot.summary.blockedDueCount ?? 0)
+      }
+      if (snapshot && 'blockedDueCount' in snapshot) {
+        return sum + (snapshot.blockedDueCount ?? 0)
+      }
+      return sum
+    }, 0)
+    if (blockedDue > 0) {
+      items.push({
+        label: 'Due evaluations are blocked',
+        detail: `${blockedDue} evaluations are waiting on session, data, or control state`,
+        tone: 'warn',
+        to: '/monitoring',
+      })
+    }
+
+    const gateRejections = runtimeVisibility?.gate.summary.rejectedCount ?? 0
+    if (gateRejections > 0) {
+      items.push({
+        label: 'Recent gate rejections',
+        detail: `${gateRejections} recent decisions were denied`,
+        tone: 'warn',
+        to: '/audit',
+      })
+    }
+
+    if (items.length === 0) {
+      items.push({
+        label: 'Immediate pressure looks calm',
+        detail: 'No protective exits, blocked due runs, or fresh gate bruises are visible right now.',
+        tone: 'good',
+        to: '/monitoring',
+      })
+    }
+
+    return items.slice(0, 4)
+  }, [cryptoExitReadiness?.summary.protectiveExitPendingCount, cryptoMonitoring?.summary.dataUnavailableCount, cryptoOrchestration, runtimeVisibility?.gate.summary.rejectedCount, stockExitReadiness?.summary.protectiveExitPendingCount, stockMonitoring?.summary.dataUnavailableCount, stockOrchestration])
 
   return (
     <div className="space-y-6">
-      <header className="rounded-3xl border border-slate-800 bg-slate-900/70 p-6 shadow-2xl shadow-slate-950/30">
-        <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
-          <div>
-            <div className="mb-2 flex items-center gap-2 text-sm font-medium uppercase tracking-[0.22em] text-cyan-300">
-              <Radar className="h-4 w-4" />
-              Operator console
-            </div>
-            <h1 className="text-3xl font-semibold text-white">Daily watchlist mission board</h1>
-            <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-400">
-              The dashboard now behaves like a flight deck: runtime truth, active watchlists, execution pressure, and the fastest lanes into positions,
-              monitoring, and audit.
-            </p>
-          </div>
-
-          <div className="flex flex-wrap gap-3">
+      <PageHero
+        eyebrow={
+          <>
+            <Radar className="h-4 w-4" />
+            Operator console
+          </>
+        }
+        title="Daily watchlist mission board"
+        description="This dashboard is the flight deck. It surfaces watchlist pressure, runtime truth, inventory, and the shortest routes into monitoring, positions, audit, and control."
+        aside={
+          <>
             <StatusPill tone={marketStatus?.stock.isOpen ? 'good' : 'warn'} label={`Stocks ${marketStatus?.stock.isOpen ? 'open' : 'closed'}`} />
+            <StatusPill tone="info" label="Crypto 24/7" />
             <StatusPill tone={botStatus?.running ? 'good' : 'warn'} label={botStatus?.running ? 'Runtime active' : 'Runtime paused'} />
-            <StatusPill tone={stateTone(botStatus?.controlPlane.state)} label={`Control ${botStatus?.controlPlane.state ?? 'UNKNOWN'}`} />
             <StatusPill tone={stateTone(botStatus?.executionGate.state)} label={`Gate ${botStatus?.executionGate.state ?? 'UNKNOWN'}`} />
-          </div>
-        </div>
-      </header>
+          </>
+        }
+      />
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <MetricCard label="Total equity" value={formatMoney(summary.totalEquity)} detail={`${formatMoney(summary.openPnl)} open P&L`} icon={<Wallet className="h-5 w-5" />} />
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-5">
+        <MetricCard label="Combined paper equity" value={formatMoney(summary.totalEquity)} detail={`${formatMoney(summary.openPnl)} open P&L across stock + crypto`} icon={<Wallet className="h-5 w-5" />} />
+        <MetricCard label="Combined deployable cash" value={formatMoney(summary.availableCapital)} detail="Tradier available-to-trade plus crypto ledger cash" icon={<Shield className="h-5 w-5" />} />
         <MetricCard label="Active positions" value={String(summary.activePositions)} detail={`${stockPositions.length} stock · ${cryptoPositions.length} crypto`} icon={<TrendingUp className="h-5 w-5" />} />
-        <MetricCard label="Active watch symbols" value={String(summary.activeWatchSymbols)} detail={`${stockWatchlist?.selectedCount ?? 0} stock · ${cryptoWatchlist?.selectedCount ?? 0} crypto`} icon={<ClipboardList className="h-5 w-5" />} />
-        <MetricCard label="Dependency readiness" value={`${dependencySummary?.readyCount ?? 0}/${(dependencySummary?.readyCount ?? 0) + (dependencySummary?.degradedCount ?? 0) + (dependencySummary?.missingCount ?? 0)}`} detail={dependencySummary?.criticalReady ? 'Critical rails ready' : 'Critical rails degraded'} icon={<Shield className="h-5 w-5" />} />
+        <MetricCard label="Watch symbols" value={String(summary.watchSymbols)} detail={`${stockWatchlist?.selectedCount ?? 0} stock · ${cryptoWatchlist?.selectedCount ?? 0} crypto`} icon={<ClipboardList className="h-5 w-5" />} />
+        <MetricCard label="Dependency readiness" value={`${dependencySummary?.readyCount ?? 0}/${(dependencySummary?.readyCount ?? 0) + (dependencySummary?.degradedCount ?? 0) + (dependencySummary?.missingCount ?? 0)}`} detail={dependencySummary?.criticalReady ? 'Critical rails ready' : 'Critical rails degraded'} icon={<Activity className="h-5 w-5" />} />
       </div>
 
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.55fr)_minmax(320px,0.95fr)]">
-        <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
-          <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">
-            <Activity className="h-4 w-4 text-cyan-300" />
-            Command deck
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.95fr)]">
+        <SectionCard
+          title="Immediate attention"
+          eyebrow="Mission pressure"
+          icon={<AlertTriangle className="h-4 w-4 text-amber-300" />}
+        >
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {attentionItems.map((item) => (
+              <Link key={item.label} to={item.to} className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4 transition hover:border-cyan-700 hover:bg-slate-950">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-base font-semibold text-white">{item.label}</span>
+                      <ToneBadge tone={item.tone}>{item.tone}</ToneBadge>
+                    </div>
+                    <div className="mt-2 text-sm leading-6 text-slate-400">{item.detail}</div>
+                  </div>
+                  <ArrowRight className="mt-1 h-4 w-4 text-cyan-300" />
+                </div>
+              </Link>
+            ))}
           </div>
-          <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
-            <CommandCard to="/watchlists" title="Watchlists" description="Review the accepted uploads, context notes, and provider limitations before the bot leans forward." />
-            <CommandCard to="/monitoring" title="Monitoring" description="See who is due, who is blocked, and which symbols are standing on a trigger." />
-            <CommandCard to="/positions" title="Positions" description="Track live inventory, exit pressure, and the trade tape without bouncing between separate pages." />
-            <CommandCard to="/audit" title="Audit trail" description="Inspect watchlist receipts, gate decisions, order lifecycle events, and the paper-ledger breadcrumb trail." />
-          </div>
-        </section>
+        </SectionCard>
 
-        <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
-          <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">
-            <Shield className="h-4 w-4 text-emerald-300" />
-            Control plane truth
+        <SectionCard title="Command deck" eyebrow="Fast lanes" icon={<Radar className="h-4 w-4 text-cyan-300" />}>
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <CommandCard to="/watchlists" title="Watchlists" description="Review accepted uploads, context notes, and provider limitations." />
+            <CommandCard to="/monitoring" title="Monitoring" description="See who is due, who is blocked, and which rows are starved for data." />
+            <CommandCard to="/positions" title="Positions" description="Track inventory, exit deadlines, and the most urgent symbols." />
+            <CommandCard to="/audit" title="Audit trail" description="Inspect receipts, gate decisions, and execution breadcrumbs." />
           </div>
-          <div className="mt-4 space-y-3 text-sm text-slate-300">
-            <SummaryRow label="Control state" value={botStatus?.controlPlane.state ?? 'UNKNOWN'} tone={stateTone(botStatus?.controlPlane.state)} />
-            <SummaryRow label="Control reason" value={botStatus?.controlPlane.reason ?? '—'} />
-            <SummaryRow label="Gate state" value={botStatus?.executionGate.state ?? 'UNKNOWN'} tone={stateTone(botStatus?.executionGate.state)} />
-            <SummaryRow label="Last heartbeat" value={formatRelative(botStatus?.lastHeartbeat)} />
-            <SummaryRow label="Stock session" value={marketStatus?.stock.isOpen ? 'Open' : 'Closed'} tone={marketStatus?.stock.isOpen ? 'good' : 'warn'} />
-            <SummaryRow label="Stock mode" value={botStatus?.stockMode ?? 'PAPER'} />
-          </div>
-        </section>
+        </SectionCard>
       </div>
 
-      <div className="grid grid-cols-1 gap-6 2xl:grid-cols-2">
-        <ScopeCard
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
+        <ScopePulseCard
           scope="stocks_only"
           watchlist={stockWatchlist}
           monitoring={stockMonitoring}
           orchestration={stockOrchestration}
           exitReadiness={stockExitReadiness}
         />
-        <ScopeCard
+        <ScopePulseCard
           scope="crypto_only"
           watchlist={cryptoWatchlist}
           monitoring={cryptoMonitoring}
@@ -252,13 +351,9 @@ export default function Dashboard() {
         />
       </div>
 
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.95fr)]">
-        <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
-          <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">
-            <FileSearch className="h-4 w-4 text-cyan-300" />
-            Recent gate decisions
-          </div>
-          <div className="mt-4 space-y-3">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(340px,0.9fr)]">
+        <SectionCard title="Recent gate decisions" eyebrow="Audit pulse" icon={<FileSearch className="h-4 w-4 text-cyan-300" />}>
+          <div className="space-y-3">
             {recentGateDecisions.length === 0 ? (
               <EmptyState message="No gate decisions have been recorded yet." />
             ) : (
@@ -271,9 +366,7 @@ export default function Dashboard() {
                         <ToneBadge tone={decision.allowed ? 'good' : 'danger'}>{decision.allowed ? 'Allowed' : 'Rejected'}</ToneBadge>
                         <ToneBadge tone={stateTone(decision.state)}>{decision.state}</ToneBadge>
                       </div>
-                      <div className="mt-2 text-sm text-slate-400">
-                        {decision.executionSource} · {decision.assetClass}
-                      </div>
+                      <div className="mt-2 text-sm text-slate-400">{decision.executionSource} · {decision.assetClass}</div>
                     </div>
                     <div className="text-sm text-slate-500">{formatRelative(decision.recordedAtUtc)}</div>
                   </div>
@@ -282,14 +375,10 @@ export default function Dashboard() {
               ))
             )}
           </div>
-        </section>
+        </SectionCard>
 
-        <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
-          <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-slate-400">
-            <Shield className="h-4 w-4 text-emerald-300" />
-            Dependency board
-          </div>
-          <div className="mt-4 space-y-3">
+        <SectionCard title="Dependency board" eyebrow="Runtime truth" icon={<Shield className="h-4 w-4 text-emerald-300" />}>
+          <div className="space-y-3">
             {runtimeVisibility?.dependencies.checks ? (
               Object.values(runtimeVisibility.dependencies.checks).map((dependency) => (
                 <div key={dependency.name} className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
@@ -306,13 +395,13 @@ export default function Dashboard() {
               <EmptyState message="Dependency visibility has not arrived yet." />
             )}
           </div>
-        </section>
+        </SectionCard>
       </div>
     </div>
   )
 }
 
-function ScopeCard({
+function ScopePulseCard({
   scope,
   watchlist,
   monitoring,
@@ -321,35 +410,35 @@ function ScopeCard({
 }: {
   scope: WatchlistScope
   watchlist: WatchlistUploadRecord | null | undefined
-  monitoring: WatchlistMonitoringSnapshot | undefined
-  orchestration: WatchlistOrchestrationStatus | undefined
-  exitReadiness: WatchlistExitReadinessSnapshot | undefined
+  monitoring: WatchlistMonitoringSnapshot | null | undefined
+  orchestration: WatchlistOrchestrationStatus | null | undefined
+  exitReadiness: WatchlistExitReadinessSnapshot | null | undefined
 }) {
   const dueSnapshot = orchestration?.dueSnapshot
-  const dueCount = dueSnapshot && 'dueCount' in dueSnapshot ? dueSnapshot.dueCount : 0
-  const eligibleDueCount = dueSnapshot && 'eligibleDueCount' in dueSnapshot ? dueSnapshot.eligibleDueCount : 0
-  const blockedDueCount = dueSnapshot && 'blockedDueCount' in dueSnapshot ? dueSnapshot.blockedDueCount : 0
-  const sessionLabel = dueSnapshot && 'session' in dueSnapshot ? dueSnapshot.session.sessionLabel : 'Unknown session'
-  const sessionOpen = dueSnapshot && 'session' in dueSnapshot ? dueSnapshot.session.sessionOpen : false
+  const dueCount = dueSnapshot && 'summary' in dueSnapshot ? dueSnapshot.summary.totalDueCount : dueSnapshot && 'dueCount' in dueSnapshot ? dueSnapshot.dueCount : 0
+  const eligibleDueCount = dueSnapshot && 'summary' in dueSnapshot ? dueSnapshot.summary.eligibleDueCount : dueSnapshot && 'eligibleDueCount' in dueSnapshot ? dueSnapshot.eligibleDueCount : 0
+  const blockedDueCount = dueSnapshot && 'summary' in dueSnapshot ? dueSnapshot.summary.blockedDueCount : dueSnapshot && 'blockedDueCount' in dueSnapshot ? dueSnapshot.blockedDueCount : 0
+  const nextRun = dueSnapshot && 'scopes' in dueSnapshot ? dueSnapshot.scopes?.[scope]?.nextEvaluationAtUtc : dueSnapshot && 'nextEvaluationAtUtc' in dueSnapshot ? dueSnapshot.nextEvaluationAtUtc : null
+  const sessionLabel = dueSnapshot && 'scopes' in dueSnapshot ? dueSnapshot.scopes?.[scope]?.session.sessionLabel : dueSnapshot && 'session' in dueSnapshot ? dueSnapshot.session.sessionLabel : 'Unknown session'
+  const sessionOpen = dueSnapshot && 'scopes' in dueSnapshot ? dueSnapshot.scopes?.[scope]?.session.sessionOpen : dueSnapshot && 'session' in dueSnapshot ? dueSnapshot.session.sessionOpen : false
 
   return (
-    <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
+    <SectionCard title={`${scopeLabels[scope]} pulse`} eyebrow="Scope snapshot" icon={<TimerReset className="h-4 w-4 text-cyan-300" />}>
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
-          <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-500">{scopeLabels[scope]}</div>
-          <h2 className="mt-1 text-2xl font-semibold text-white">{watchlist?.provider ?? 'No active watchlist'}</h2>
+          <div className="text-2xl font-semibold text-white">{watchlist?.provider ?? 'No active watchlist'}</div>
           <div className="mt-3 flex flex-wrap gap-2">
-            <ToneBadge tone={isHealthyValidationStatus(watchlist?.validationStatus) ? 'good' : 'warn'}>{watchlist?.validationStatus ?? 'MISSING'}</ToneBadge>
-            <ToneBadge tone={sessionOpen ? 'good' : 'warn'}>{sessionLabel}</ToneBadge>
-            <ToneBadge tone="info">{watchlist?.marketRegime ?? 'No regime'}</ToneBadge>
+            <ToneBadge tone={isHealthyValidationStatus(watchlist?.validationStatus) ? 'good' : 'warn'}>{watchlist?.validationStatus ?? 'missing'}</ToneBadge>
+            <ToneBadge tone={sessionOpen ? 'good' : 'warn'}>{getSessionBadgeLabel(scope, sessionLabel, sessionOpen)}</ToneBadge>
+            <ToneBadge tone="info">{watchlist?.marketRegime ?? 'regime unavailable'}</ToneBadge>
           </div>
         </div>
 
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <SmallMetric label="Symbols" value={String(watchlist?.selectedCount ?? 0)} />
-          <SmallMetric label="Entry ready" value={String(monitoring?.summary.entryCandidateCount ?? 0)} />
-          <SmallMetric label="Open" value={String(exitReadiness?.summary.openPositionCount ?? 0)} />
-          <SmallMetric label="Protective" value={String(exitReadiness?.summary.protectiveExitPendingCount ?? 0)} />
+          <MiniMetric label="Symbols" value={String(watchlist?.selectedCount ?? 0)} />
+          <MiniMetric label="Ready" value={String(monitoring?.summary.entryCandidateCount ?? 0)} />
+          <MiniMetric label="Open" value={String(exitReadiness?.summary.openPositionCount ?? 0)} />
+          <MiniMetric label="Protective" value={String(exitReadiness?.summary.protectiveExitPendingCount ?? 0)} />
         </div>
       </div>
 
@@ -357,26 +446,26 @@ function ScopeCard({
         <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
           <div className="mb-4 text-sm font-semibold text-slate-200">Watchlist state</div>
           <div className="space-y-3 text-sm text-slate-400">
-            <SummaryRow label="Generated" value={formatRelative(watchlist?.generatedAtUtc)} />
-            <SummaryRow label="Received" value={formatRelative(watchlist?.receivedAtUtc)} />
-            <SummaryRow label="Expires" value={formatRelative(watchlist?.watchlistExpiresAtUtc)} />
-            <SummaryRow label="Waiting for setup" value={String(monitoring?.summary.waitingForSetupCount ?? 0)} />
-            <SummaryRow label="Managed-only" value={String(monitoring?.summary.managedOnlyCount ?? 0)} />
+            <DetailRow label="Generated" value={formatRelative(watchlist?.generatedAtUtc)} />
+            <DetailRow label="Received" value={formatRelative(watchlist?.receivedAtUtc)} />
+            <DetailRow label="Expires" value={formatRelative(watchlist?.watchlistExpiresAtUtc)} />
+            <DetailRow label="Waiting for setup" value={String(monitoring?.summary.waitingForSetupCount ?? 0)} />
+            <DetailRow label="Data unavailable" value={String(monitoring?.summary.dataUnavailableCount ?? 0)} tone={(monitoring?.summary.dataUnavailableCount ?? 0) > 0 ? 'danger' : 'muted'} />
           </div>
         </div>
 
         <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
           <div className="mb-4 text-sm font-semibold text-slate-200">Evaluation pressure</div>
           <div className="space-y-3 text-sm text-slate-400">
-            <SummaryRow label="Due" value={String(dueCount)} />
-            <SummaryRow label="Eligible" value={String(eligibleDueCount)} />
-            <SummaryRow label="Blocked" value={String(blockedDueCount)} tone={blockedDueCount > 0 ? 'warn' : 'muted'} />
-            <SummaryRow label="Expired positions" value={String(exitReadiness?.summary.expiredPositionCount ?? 0)} tone={(exitReadiness?.summary.expiredPositionCount ?? 0) > 0 ? 'warn' : 'muted'} />
-            <SummaryRow label="Scale-out ready" value={String(exitReadiness?.summary.scaleOutReadyCount ?? 0)} />
+            <DetailRow label="Due" value={String(dueCount)} />
+            <DetailRow label="Eligible due" value={String(eligibleDueCount)} />
+            <DetailRow label="Blocked due" value={String(blockedDueCount)} tone={blockedDueCount > 0 ? 'warn' : 'muted'} />
+            <DetailRow label="Expiring within 24h" value={String(exitReadiness?.summary.expiringWithinWindowCount ?? 0)} tone={(exitReadiness?.summary.expiringWithinWindowCount ?? 0) > 0 ? 'warn' : 'muted'} />
+            <DetailRow label="Next run" value={formatRelative(nextRun)} />
           </div>
         </div>
       </div>
-    </section>
+    </SectionCard>
   )
 }
 
@@ -392,77 +481,4 @@ function CommandCard({ to, title, description }: { to: string; title: string; de
       </div>
     </Link>
   )
-}
-
-function MetricCard({ label, value, detail, icon }: { label: string; value: string; detail: string; icon: JSX.Element }) {
-  return (
-    <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
-      <div className="flex items-center justify-between gap-3">
-        <div className="text-sm text-slate-400">{label}</div>
-        <div className="text-cyan-300">{icon}</div>
-      </div>
-      <div className="mt-3 text-3xl font-semibold text-white">{value}</div>
-      <div className="mt-2 text-sm text-slate-500">{detail}</div>
-    </div>
-  )
-}
-
-function SmallMetric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
-      <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
-      <div className="mt-1 text-2xl font-semibold text-white">{value}</div>
-    </div>
-  )
-}
-
-function SummaryRow({ label, value, tone = 'muted' }: { label: string; value: string; tone?: 'good' | 'warn' | 'danger' | 'info' | 'muted' }) {
-  return (
-    <div className="flex items-start justify-between gap-4">
-      <div className="text-slate-500">{label}</div>
-      <div className={toneTextClass(tone)}>{value}</div>
-    </div>
-  )
-}
-
-function StatusPill({ label, tone }: { label: string; tone: 'good' | 'warn' | 'danger' | 'info' | 'muted' }) {
-  return <span className={`rounded-full px-3 py-2 text-sm ${toneBadgeClass(tone)}`}>{label}</span>
-}
-
-function ToneBadge({ children, tone }: { children: string; tone: 'good' | 'warn' | 'danger' | 'info' | 'muted' }) {
-  return <span className={`rounded-full px-2.5 py-1 text-xs font-semibold uppercase tracking-wide ${toneBadgeClass(tone)}`}>{children}</span>
-}
-
-function EmptyState({ message }: { message: string }) {
-  return <div className="rounded-2xl border border-dashed border-slate-700 px-4 py-8 text-center text-sm text-slate-500">{message}</div>
-}
-
-function toneBadgeClass(tone: 'good' | 'warn' | 'danger' | 'info' | 'muted') {
-  switch (tone) {
-    case 'good':
-      return 'border border-emerald-700/60 bg-emerald-500/10 text-emerald-200'
-    case 'warn':
-      return 'border border-amber-700/60 bg-amber-500/10 text-amber-200'
-    case 'danger':
-      return 'border border-rose-700/60 bg-rose-500/10 text-rose-200'
-    case 'info':
-      return 'border border-cyan-700/60 bg-cyan-500/10 text-cyan-200'
-    default:
-      return 'border border-slate-700 bg-slate-800/80 text-slate-300'
-  }
-}
-
-function toneTextClass(tone: 'good' | 'warn' | 'danger' | 'info' | 'muted') {
-  switch (tone) {
-    case 'good':
-      return 'text-right text-emerald-300'
-    case 'warn':
-      return 'text-right text-amber-300'
-    case 'danger':
-      return 'text-right text-rose-300'
-    case 'info':
-      return 'text-right text-cyan-300'
-    default:
-      return 'text-right text-slate-300'
-  }
 }

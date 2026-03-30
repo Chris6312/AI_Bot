@@ -216,8 +216,8 @@ export default function Settings() {
                 }
               >
                 <div className="flex flex-wrap gap-2">
-                  <StatusBadge tone={stockReady.paper ? 'good' : 'danger'}>Paper {stockReady.paper ? 'Ready' : 'Missing'}</StatusBadge>
-                  <StatusBadge tone={stockReady.live ? 'good' : 'warn'}>Live {stockReady.live ? 'Ready' : 'Missing'}</StatusBadge>
+                  <StatusBadge tone={stockReady.paper ? 'good' : 'danger'}>{`Paper ${stockReady.paper ? 'Ready' : 'Missing'}`}</StatusBadge>
+                  <StatusBadge tone={stockReady.live ? 'good' : 'warn'}>{`Live ${stockReady.live ? 'Ready' : 'Missing'}`}</StatusBadge>
                 </div>
               </ActionCard>
 
@@ -276,8 +276,8 @@ export default function Settings() {
                 Recent gate decisions
               </div>
               <div className="flex flex-wrap gap-2">
-                <StatusBadge tone="good">Allowed {gateSummary?.allowedCount ?? 0}</StatusBadge>
-                <StatusBadge tone="danger">Rejected {gateSummary?.rejectedCount ?? 0}</StatusBadge>
+                <StatusBadge tone="good">{`Allowed ${gateSummary?.allowedCount ?? 0}`}</StatusBadge>
+                <StatusBadge tone="danger">{`Rejected ${gateSummary?.rejectedCount ?? 0}`}</StatusBadge>
               </div>
             </div>
 

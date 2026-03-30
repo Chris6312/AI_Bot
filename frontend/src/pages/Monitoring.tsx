@@ -166,9 +166,9 @@ function ScopeMonitoringPanel({
             <StatusBadge tone={orchestration?.session.sessionOpen ? 'good' : 'warn'}>
               {orchestration?.session.sessionLabel ?? 'Unknown session'}
             </StatusBadge>
-            <StatusBadge tone="muted">Due {orchestration?.dueCount ?? 0}</StatusBadge>
-            <StatusBadge tone="info">Eligible {orchestration?.eligibleDueCount ?? 0}</StatusBadge>
-            {orchestration?.blockedDueCount ? <StatusBadge tone="warn">Blocked {orchestration.blockedDueCount}</StatusBadge> : null}
+            <StatusBadge tone="muted">{`Due ${orchestration?.dueCount ?? 0}`}</StatusBadge>
+            <StatusBadge tone="info">{`Eligible ${orchestration?.eligibleDueCount ?? 0}`}</StatusBadge>
+            {orchestration?.blockedDueCount ? <StatusBadge tone="warn">{`Blocked ${orchestration.blockedDueCount}`}</StatusBadge> : null}
           </div>
         </div>
 
