@@ -1,4 +1,5 @@
 export type TradingMode = 'LIVE' | 'PAPER'
+export type WatchlistScope = 'stocks_only' | 'crypto_only'
 
 export interface ControlPlaneStatus {
   state: 'LOCKED' | 'READ_ONLY' | 'PAUSED' | 'ARMED' | string
@@ -105,6 +106,8 @@ export interface CryptoPosition {
   costBasis: number
   pnl: number
   pnlPercent: number
+  entryTimeUtc?: string | null
+  realizedPnl?: number
 }
 
 export interface AIDecision {
@@ -154,6 +157,9 @@ export interface CryptoLedger {
   equity: number
   marketValue: number
   totalPnL: number
+  realizedPnL?: number
+  netPnL?: number
+  returnPct?: number
   trades: TradeHistoryEntry[]
   positions: CryptoPosition[]
 }
@@ -203,6 +209,271 @@ export interface CryptoCandle {
   volume: number
 }
 
+export interface WatchlistSymbolContext {
+  thesis?: string
+  why_now?: string
+  notes?: string
+  [key: string]: unknown
+}
+
+export interface WatchlistSymbolMonitoring {
+  latestDecisionState: string
+  latestDecisionReason: string
+  decisionContext: Record<string, unknown>
+  requiredTimeframes: string[]
+  evaluationIntervalSeconds: number | null
+  lastDecisionAtUtc: string | null
+  lastEvaluatedAtUtc: string | null
+  nextEvaluationAtUtc: string | null
+  lastMarketDataAtUtc: string | null
+}
+
+export interface WatchlistPositionState {
+  hasOpenPosition: boolean
+  positionState?: string | null
+  entryTimeUtc?: string | null
+  basePositionExpiresAtUtc?: string | null
+  positionExpiresAtUtc?: string | null
+  positionExpired?: boolean
+  hoursUntilExpiry?: number | null
+  hoursSinceEntry?: number | null
+  followThroughWindowHours?: number | null
+  followThroughFailed?: boolean
+  timeStopStructureCheckPassed?: boolean
+  timeStopExtended?: boolean
+  timeStopExtensionHours?: number | null
+  timeStopExtendedUntilUtc?: string | null
+  exitDeadlineSource?: string | null
+  stopLoss?: number | null
+  profitTarget?: number | null
+  trailingStop?: number | null
+  protectiveExitPending?: boolean
+  protectiveExitReasons?: string[]
+  stopLossBreached?: boolean
+  trailingStopBreached?: boolean
+  profitTargetReached?: boolean
+  scaleOutReady?: boolean
+  scaleOutAlreadyTaken?: boolean
+  impulseTrailArmed?: boolean
+  impulseTrailingStop?: number | null
+  peakPrice?: number | null
+  currentPrice?: number | null
+  unrealizedPnl?: number | null
+  unrealizedPnlPct?: number | null
+  maxHoldHours?: number | null
+}
+
+export interface WatchlistSymbolRecord {
+  symbol: string
+  quoteCurrency: string
+  assetClass: string
+  enabled: boolean
+  tradeDirection: string
+  priorityRank: number
+  tier: string
+  bias: string
+  setupTemplate: string
+  botTimeframes: string[]
+  exitTemplate: string
+  maxHoldHours: number
+  riskFlags: string[]
+  monitoringStatus: string
+  uploadId: string
+  managedOnly?: boolean
+  monitoring?: WatchlistSymbolMonitoring | null
+  positionState?: WatchlistPositionState | null
+}
+
+export interface WatchlistUploadRecord {
+  uploadId: string
+  scanId: string
+  schemaVersion: string
+  provider: string
+  scope: WatchlistScope
+  source: string
+  sourceUserId?: string | null
+  sourceChannelId?: string | null
+  sourceMessageId?: string | null
+  payloadHash?: string | null
+  generatedAtUtc?: string | null
+  generatedAtUtcSource?: string | null
+  receivedAtUtc?: string | null
+  watchlistExpiresAtUtc?: string | null
+  validationStatus: string
+  rejectionReason?: string | null
+  marketRegime?: string | null
+  selectedCount: number
+  isActive: boolean
+  validation: Record<string, unknown>
+  symbols: WatchlistSymbolRecord[]
+  managedOnlySymbols: WatchlistSymbolRecord[]
+  statusSummary: {
+    activeCount: number
+    managedOnlyCount: number
+    inactiveCount: number
+  }
+  monitoringSummary: WatchlistMonitoringSummary
+  targetSessionEt?: string | null
+  targetSessionSource?: string | null
+  uiPayload: {
+    summary: Record<string, unknown>
+    providerLimitations: string[]
+    symbolContext: Record<string, WatchlistSymbolContext>
+  }
+}
+
+export interface WatchlistMonitoringSummary {
+  total: number
+  activeCount: number
+  managedOnlyCount: number
+  inactiveCount: number
+  pendingEvaluationCount: number
+  entryCandidateCount: number
+  waitingForSetupCount: number
+  dataStaleCount: number
+  dataUnavailableCount: number
+  biasConflictCount: number
+  evaluationBlockedCount: number
+  monitorOnlyCount: number
+  inactiveDecisionCount: number
+  openPositionCount: number
+  expiredPositionCount: number
+  protectiveExitPendingCount: number
+  stopLossBreachedCount: number
+  trailingStopBreachedCount: number
+  profitTargetReachedCount: number
+  scaleOutReadyCount: number
+  followThroughFailedCount: number
+  impulseTrailArmedCount: number
+  timeStopExtendedCount: number
+  expiringWithin24hCount: number
+  nextEvaluationAtUtc: string | null
+  lastEvaluatedAtUtc: string | null
+}
+
+export interface WatchlistMonitoringSnapshot {
+  scope: WatchlistScope
+  capturedAtUtc: string
+  activeUploadId: string | null
+  summary: WatchlistMonitoringSummary
+  rows: WatchlistSymbolRecord[]
+}
+
+export interface ScopeSessionStatus {
+  scope: WatchlistScope
+  sessionOpen: boolean
+  referenceTimeUtc: string
+  timezone: string
+  sessionLabel: string
+  sessionDateEt?: string | null
+  nextOpenUtc?: string | null
+  nextCloseUtc?: string | null
+}
+
+export interface WatchlistDueScopeSnapshot {
+  scope: WatchlistScope
+  dueCount: number
+  eligibleDueCount: number
+  blockedDueCount: number
+  activeDueCount: number
+  managedOnlyDueCount: number
+  nextEvaluationAtUtc: string | null
+  activeUploadId: string | null
+  session: ScopeSessionStatus
+}
+
+export interface WatchlistOrchestrationStatus {
+  enabled: boolean
+  pollSeconds: number
+  lastStartedAtUtc: string | null
+  lastFinishedAtUtc: string | null
+  lastError: string | null
+  consecutiveFailures: number
+  lastRunSummary: Record<string, unknown>
+  dueSnapshot:
+    | {
+        capturedAtUtc: string
+        scopes: Partial<Record<WatchlistScope, WatchlistDueScopeSnapshot>>
+        summary: {
+          totalDueCount: number
+          eligibleDueCount: number
+          blockedDueCount: number
+          activeDueCount: number
+          managedOnlyDueCount: number
+        }
+      }
+    | WatchlistDueScopeSnapshot
+    | null
+}
+
+export interface WatchlistExitReadinessSummary {
+  openPositionCount: number
+  expiredPositionCount: number
+  expiringWithinWindowCount: number
+  protectiveExitPendingCount: number
+  stopLossBreachedCount: number
+  trailingStopBreachedCount: number
+  profitTargetReachedCount: number
+  scaleOutReadyCount: number
+  followThroughFailedCount: number
+  impulseTrailArmedCount: number
+  timeStopExtendedCount: number
+  managedOnlyOpenCount: number
+}
+
+export interface WatchlistExitReadinessSnapshot {
+  scope: WatchlistScope
+  capturedAtUtc: string
+  activeUploadId: string | null
+  expiringWithinHours: number
+  summary: WatchlistExitReadinessSummary
+  rows: WatchlistSymbolRecord[]
+}
+
+export interface WatchlistExitWorkerRow {
+  symbol: string
+  managedOnly: boolean
+  monitoringStatus: string
+  positionState: WatchlistPositionState
+  exitTrigger: string | null
+  exitReasons: string[]
+  exitAlreadyInProgress: boolean
+}
+
+export interface WatchlistExitWorkerStatus {
+  scope: WatchlistScope
+  capturedAtUtc: string
+  mode: TradingMode
+  runtimeRunning: boolean
+  brokerReady: boolean
+  session: ScopeSessionStatus
+  enabled: boolean
+  pollSeconds: number
+  lastStartedAtUtc: string | null
+  lastFinishedAtUtc: string | null
+  lastError: string | null
+  consecutiveFailures: number
+  lastRunSummary: Record<string, unknown>
+  summary: {
+    candidateExitCount: number
+    expiredPositionCount: number
+    protectiveExitCount: number
+    profitTargetCount: number
+    followThroughExitCount: number
+    eligibleExpiredCount: number
+    blockedExpiredCount: number
+    eligibleProtectiveCount: number
+    blockedProtectiveCount: number
+    eligibleProfitTargetCount: number
+    blockedProfitTargetCount: number
+    eligibleExitCount: number
+    blockedExitCount: number
+    managedOnlyExpiredCount: number
+    alreadyInProgressCount: number
+  }
+  rows: WatchlistExitWorkerRow[]
+}
+
 export const TOP_15_CRYPTO_PAIRS = [
   { display: 'BTC/USD', ohlcv: 'XBTUSD' },
   { display: 'ETH/USD', ohlcv: 'ETHUSD' },
@@ -219,4 +490,4 @@ export const TOP_15_CRYPTO_PAIRS = [
   { display: 'BCH/USD', ohlcv: 'BCHUSD' },
   { display: 'ALGO/USD', ohlcv: 'ALGOUSD' },
   { display: 'XLM/USD', ohlcv: 'XLMUSD' },
-]
+] as const

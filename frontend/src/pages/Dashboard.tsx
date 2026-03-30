@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import { Activity, AlertTriangle, Bitcoin, DollarSign, Shield, TrendingUp, Wallet } from 'lucide-react'
@@ -194,7 +194,7 @@ function ControlPlaneBanner({
   )
 }
 
-function StatusPill({ active, icon, label }: { active: boolean; icon: React.ReactNode; label: string }) {
+function StatusPill({ active, icon, label }: { active: boolean; icon: ReactNode; label: string }) {
   return (
     <div className={`rounded-full px-4 py-2 ${active ? 'bg-green-900 text-green-300' : 'bg-gray-800 text-gray-400'}`}>
       <div className="flex items-center gap-2">
@@ -205,7 +205,7 @@ function StatusPill({ active, icon, label }: { active: boolean; icon: React.Reac
   )
 }
 
-function StatCard({ title, value, icon, trend }: { title: string; value: string; icon: React.ReactNode; trend?: 'up' | 'down' }) {
+function StatCard({ title, value, icon, trend }: { title: string; value: string; icon: ReactNode; trend?: 'up' | 'down' }) {
   const iconClass = trend === 'down' ? 'text-red-500' : 'text-green-500'
   const valueClass = trend === 'down' ? 'text-red-500' : trend === 'up' ? 'text-green-500' : 'text-white'
 

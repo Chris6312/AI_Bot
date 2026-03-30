@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import type { AIDecision } from '@/types'
@@ -39,7 +40,7 @@ function CounterCard({ label, value }: { label: string; value: number }) {
   )
 }
 
-function DecisionPanel({ title, decisions, icon }: { title: string; decisions: AIDecision[]; icon: React.ReactNode }) {
+function DecisionPanel({ title, decisions, icon }: { title: string; decisions: AIDecision[]; icon: ReactNode }) {
   return (
     <div className="rounded-lg border border-gray-800 bg-gray-900 p-6">
       <h2 className="mb-4 flex items-center gap-2 text-xl font-bold text-white">
