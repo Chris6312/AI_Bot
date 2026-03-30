@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.position import Position
+from app.models.trade import Trade
 from app.models.watchlist_monitor_state import WatchlistMonitorState
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
@@ -74,6 +75,7 @@ PENDING_EVALUATION = 'PENDING_EVALUATION'
 MONITOR_ONLY = 'MONITOR_ONLY'
 INACTIVE_DECISION = 'INACTIVE'
 MONITORING_OFFSET_SECONDS = 20
+PROFIT_TARGET_SCALE_OUT_TEMPLATES = {'scale_out_then_trail', 'sell_into_strength'}
 
 
 class WatchlistValidationError(ValueError):
@@ -558,6 +560,12 @@ class WatchlistService:
                     'trailingStopBreachedCount': sum(
                         1 for row in rows if row.get('positionState', {}).get('trailingStopBreached')
                     ),
+                    'profitTargetReachedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('profitTargetReached')
+                    ),
+                    'scaleOutReadyCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('scaleOutReady')
+                    ),
                     'expiringWithin24hCount': sum(
                         1
                         for row in rows
@@ -611,6 +619,12 @@ class WatchlistService:
                     ),
                     'trailingStopBreachedCount': sum(
                         1 for row in rows if row.get('positionState', {}).get('trailingStopBreached')
+                    ),
+                    'profitTargetReachedCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('profitTargetReached')
+                    ),
+                    'scaleOutReadyCount': sum(
+                        1 for row in rows if row.get('positionState', {}).get('scaleOutReady')
                     ),
                     'managedOnlyOpenCount': sum(1 for row in rows if row.get('managedOnly')),
                 },
@@ -910,6 +924,9 @@ class WatchlistService:
             'protectiveExitReasons': [],
             'stopLossBreached': False,
             'trailingStopBreached': False,
+            'profitTargetReached': False,
+            'scaleOutReady': False,
+            'scaleOutAlreadyTaken': False,
             'peakPrice': None,
         }
         return symbol_payload
@@ -947,6 +964,9 @@ class WatchlistService:
                 .first()
             )
             max_hold_hours = int(watchlist_row.max_hold_hours) if watchlist_row is not None and watchlist_row.max_hold_hours is not None else None
+            exit_template = str(watchlist_row.exit_template or '').strip().lower() if watchlist_row is not None and watchlist_row.exit_template is not None else ''
+            trade = self._resolve_trade_for_position(db, position)
+            profit_scale_out_taken = self._trade_has_partial_trigger(trade, 'PROFIT_TARGET_REACHED')
             expires_at = entry_time + timedelta(hours=max_hold_hours) if entry_time is not None and max_hold_hours is not None else None
             hours_until_expiry = None
             position_expired = False
@@ -971,6 +991,18 @@ class WatchlistService:
                 protective_exit_reasons.append('STOP_LOSS_BREACH')
             if trailing_stop_breached:
                 protective_exit_reasons.append('TRAILING_STOP_BREACH')
+            profit_target = float(position.profit_target or 0.0) if position.profit_target is not None else None
+            profit_target_reached = bool(
+                current_price is not None
+                and profit_target is not None
+                and profit_target > 0
+                and current_price >= profit_target
+            )
+            scale_out_ready = bool(
+                profit_target_reached
+                and exit_template in PROFIT_TARGET_SCALE_OUT_TEMPLATES
+                and not profit_scale_out_taken
+            )
             state_map[symbol] = {
                 'hasOpenPosition': True,
                 'accountId': position.account_id,
@@ -979,9 +1011,12 @@ class WatchlistService:
                 'avgEntryPrice': float(position.avg_entry_price or 0.0) if position.avg_entry_price is not None else None,
                 'currentPrice': current_price,
                 'stopLoss': stop_loss,
-                'profitTarget': float(position.profit_target or 0.0) if position.profit_target is not None else None,
+                'profitTarget': profit_target,
                 'trailingStop': trailing_stop,
                 'peakPrice': peak_price,
+                'profitTargetReached': profit_target_reached,
+                'scaleOutReady': scale_out_ready,
+                'scaleOutAlreadyTaken': profit_scale_out_taken,
                 'entryTimeUtc': entry_time.isoformat() if entry_time else None,
                 'maxHoldHours': max_hold_hours,
                 'positionExpiresAtUtc': expires_at.isoformat() if expires_at else None,
@@ -994,6 +1029,30 @@ class WatchlistService:
                 'trailingStopBreached': trailing_stop_breached,
             }
         return state_map
+
+    @staticmethod
+    def _resolve_trade_for_position(db: Session, position: Position) -> Trade | None:
+        return (
+            db.query(Trade)
+            .filter(
+                Trade.account_id == position.account_id,
+                Trade.ticker == position.ticker,
+            )
+            .order_by(Trade.entry_time.desc(), Trade.id.desc())
+            .first()
+        )
+
+    @staticmethod
+    def _trade_has_partial_trigger(trade: Trade | None, trigger: str) -> bool:
+        if trade is None or not isinstance(trade.exit_reasoning, dict):
+            return False
+        partial_exits = trade.exit_reasoning.get('partialExits', [])
+        if not isinstance(partial_exits, list):
+            return False
+        for event in partial_exits:
+            if isinstance(event, dict) and str(event.get('trigger') or '').upper() == str(trigger).upper():
+                return True
+        return False
 
     def _build_crypto_position_state_map(self, *, observed_at: datetime) -> dict[str, dict[str, Any]]:
         state_map: dict[str, dict[str, Any]] = {}

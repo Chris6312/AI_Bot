@@ -28,6 +28,7 @@ TERMINAL_EXIT_INTENT_STATUSES = {'REJECTED', 'CLOSED', 'CANCELED', 'CANCELLED', 
 EXIT_TRIGGER = 'TIME_STOP_EXPIRED'
 STOP_LOSS_TRIGGER = 'STOP_LOSS_BREACH'
 TRAILING_STOP_TRIGGER = 'TRAILING_STOP_BREACH'
+PROFIT_TARGET_TRIGGER = 'PROFIT_TARGET_REACHED'
 EXECUTION_SOURCE = 'WATCHLIST_EXIT_WORKER'
 SUPPORTED_SCOPE = 'stocks_only'
 
@@ -55,6 +56,7 @@ class WatchlistExitWorkerService:
         due_rows = self._get_due_rows(db)
         expired_rows = [row for row in due_rows if row.get('positionState', {}).get('positionExpired')]
         protective_rows = [row for row in due_rows if row.get('positionState', {}).get('protectiveExitPending')]
+        profit_target_rows = [row for row in due_rows if row.get('positionState', {}).get('scaleOutReady')]
         session = get_scope_session_status(SUPPORTED_SCOPE, observed_at)
         session_open = bool(getattr(session, 'session_open', False))
         eligible_due = len(due_rows) if session_open else 0
@@ -77,10 +79,13 @@ class WatchlistExitWorkerService:
                 'candidateExitCount': len(due_rows),
                 'expiredPositionCount': len(expired_rows),
                 'protectiveExitCount': len(protective_rows),
+                'profitTargetCount': len(profit_target_rows),
                 'eligibleExpiredCount': len(expired_rows) if session_open else 0,
                 'blockedExpiredCount': 0 if session_open else len(expired_rows),
                 'eligibleProtectiveCount': len(protective_rows) if session_open else 0,
                 'blockedProtectiveCount': 0 if session_open else len(protective_rows),
+                'eligibleProfitTargetCount': len(profit_target_rows) if session_open else 0,
+                'blockedProfitTargetCount': 0 if session_open else len(profit_target_rows),
                 'eligibleExitCount': eligible_due,
                 'blockedExitCount': blocked_due,
                 'managedOnlyExpiredCount': sum(1 for row in expired_rows if row.get('managedOnly')),
@@ -135,10 +140,12 @@ class WatchlistExitWorkerService:
             'summary': {
                 'expiredPositionCount': sum(1 for row in due_rows if row.get('positionState', {}).get('positionExpired')),
                 'protectiveExitCount': sum(1 for row in due_rows if row.get('positionState', {}).get('protectiveExitPending')),
+                'profitTargetCount': sum(1 for row in due_rows if row.get('positionState', {}).get('scaleOutReady')),
                 'refreshedPriceCount': refreshed_price_count,
                 'candidateCount': 0,
                 'submittedCount': 0,
                 'closedCount': 0,
+                'scaleOutSubmittedCount': 0,
                 'alreadyInProgressCount': 0,
                 'blockedCount': 0,
                 'skippedCount': 0,
@@ -183,8 +190,10 @@ class WatchlistExitWorkerService:
 
             executed = self._submit_stock_exit(db, candidate, mode=runtime.stock_mode)
             result['rows'].append(executed)
-            if executed['action'] == 'EXIT_SUBMITTED':
+            if executed['action'] in {'EXIT_SUBMITTED', 'SCALE_OUT_SUBMITTED'}:
                 result['summary']['submittedCount'] += 1
+                if executed['action'] == 'SCALE_OUT_SUBMITTED':
+                    result['summary']['scaleOutSubmittedCount'] += 1
             elif executed['action'] == 'EXIT_CLOSED':
                 result['summary']['submittedCount'] += 1
                 result['summary']['closedCount'] += 1
@@ -239,7 +248,12 @@ class WatchlistExitWorkerService:
 
         fallback_quantity = int(position.shares or 0)
         broker_quantity = self._safe_broker_quantity(position.ticker, mode)
-        requested_quantity = broker_quantity or fallback_quantity
+        trigger = str(candidate.get('exitTrigger') or EXIT_TRIGGER)
+        requested_quantity = self._determine_requested_quantity(
+            trigger=trigger,
+            fallback_quantity=fallback_quantity,
+            broker_quantity=broker_quantity,
+        )
         candidate['fallbackQuantity'] = fallback_quantity
         candidate['brokerQuantity'] = broker_quantity
         candidate['requestedQuantity'] = requested_quantity
@@ -264,6 +278,7 @@ class WatchlistExitWorkerService:
                 'exitTrigger': candidate.get('exitTrigger') or EXIT_TRIGGER,
                 'exitReasons': candidate.get('exitReasons') or [],
                 'mode': mode,
+                'scaleOut': trigger == PROFIT_TARGET_TRIGGER,
                 'fallbackQuantity': fallback_quantity,
                 'brokerQuantity': broker_quantity,
             },
@@ -287,6 +302,8 @@ class WatchlistExitWorkerService:
                 current_price=float(position.current_price or 0.0) or None,
                 exit_trigger=str(candidate.get('exitTrigger') or EXIT_TRIGGER),
             )
+            if exit_record and trigger == PROFIT_TARGET_TRIGGER and int(exit_record.get('remaining_shares') or 0) > 0:
+                self._arm_profit_target_trailing(db, position_id=position.id, exit_price=float(exit_record.get('exit_price') or 0.0))
         except Exception as exc:
             execution_lifecycle.record_event(
                 db,
@@ -318,7 +335,7 @@ class WatchlistExitWorkerService:
             )
             return candidate
 
-        candidate['action'] = 'EXIT_SUBMITTED'
+        candidate['action'] = 'SCALE_OUT_SUBMITTED' if trigger == PROFIT_TARGET_TRIGGER else 'EXIT_SUBMITTED'
         candidate['closedShares'] = (
             int(exit_record.get('closed_shares') or 0)
             if exit_record
@@ -362,6 +379,7 @@ class WatchlistExitWorkerService:
             for row in rows
             if row.get('positionState', {}).get('positionExpired')
             or row.get('positionState', {}).get('protectiveExitPending')
+            or row.get('positionState', {}).get('scaleOutReady')
         ]
 
     def _build_candidate_row(self, db: Session, row: dict[str, Any]) -> dict[str, Any]:
@@ -422,6 +440,8 @@ class WatchlistExitWorkerService:
     def _build_exit_reasons(row: dict[str, Any]) -> list[str]:
         position_state = row.get('positionState', {}) if isinstance(row, dict) else {}
         reasons = list(position_state.get('protectiveExitReasons') or [])
+        if position_state.get('scaleOutReady'):
+            reasons.append(PROFIT_TARGET_TRIGGER)
         if position_state.get('positionExpired'):
             reasons.append(EXIT_TRIGGER)
         ordered: list[str] = []
@@ -433,10 +453,42 @@ class WatchlistExitWorkerService:
     @classmethod
     def _primary_exit_trigger(cls, row: dict[str, Any]) -> str:
         reasons = cls._build_exit_reasons(row)
-        for preferred in (STOP_LOSS_TRIGGER, TRAILING_STOP_TRIGGER, EXIT_TRIGGER):
+        for preferred in (STOP_LOSS_TRIGGER, TRAILING_STOP_TRIGGER, PROFIT_TARGET_TRIGGER, EXIT_TRIGGER):
             if preferred in reasons:
                 return preferred
         return reasons[0] if reasons else EXIT_TRIGGER
+
+    @staticmethod
+    def _determine_requested_quantity(*, trigger: str, fallback_quantity: int, broker_quantity: int) -> int:
+        available_quantity = broker_quantity or fallback_quantity
+        if available_quantity <= 0:
+            return 0
+        if str(trigger).upper() != PROFIT_TARGET_TRIGGER:
+            return available_quantity
+        if available_quantity <= 1:
+            return 1
+        return max(1, available_quantity // 2)
+
+    @staticmethod
+    def _arm_profit_target_trailing(db: Session, *, position_id: int, exit_price: float) -> None:
+        position = db.query(Position).filter(Position.id == position_id).first()
+        if position is None or not position.is_open:
+            return
+        changed = False
+        avg_entry = float(position.avg_entry_price or 0.0)
+        if avg_entry > 0 and float(position.stop_loss or 0.0) < avg_entry:
+            position.stop_loss = avg_entry
+            changed = True
+        peak_price = max(float(position.peak_price or 0.0), float(exit_price or 0.0), float(position.current_price or 0.0))
+        if peak_price > float(position.peak_price or 0.0):
+            position.peak_price = peak_price
+            changed = True
+        trailing_candidate = round(peak_price * (1.0 - float(settings.TRAILING_STOP_PCT)), 4)
+        if position.trailing_stop is None or trailing_candidate > float(position.trailing_stop or 0.0):
+            position.trailing_stop = trailing_candidate
+            changed = True
+        if changed:
+            db.commit()
 
     @staticmethod
     def _refresh_open_position_prices(db: Session, *, mode: str) -> int:
