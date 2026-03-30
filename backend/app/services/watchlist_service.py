@@ -971,7 +971,7 @@ class WatchlistService:
     ) -> dict[str, dict[str, Any]]:
         if scope == 'stocks_only':
             return self._build_stock_position_state_map(db, observed_at=observed_at)
-        return self._build_crypto_position_state_map(observed_at=observed_at)
+        return self._build_crypto_position_state_map(db, observed_at=observed_at)
 
     def _build_stock_position_state_map(self, db: Session, *, observed_at: datetime) -> dict[str, dict[str, Any]]:
         state_map: dict[str, dict[str, Any]] = {}
@@ -1207,7 +1207,7 @@ class WatchlistService:
             return None
         return round(reference_price * (1.0 - (float(settings.TRAILING_STOP_PCT) * IMPULSE_TRAIL_STOP_FACTOR)), 4)
 
-    def _build_crypto_position_state_map(self, *, observed_at: datetime) -> dict[str, dict[str, Any]]:
+    def _build_crypto_position_state_map(self, db: Session, *, observed_at: datetime) -> dict[str, dict[str, Any]]:
         state_map: dict[str, dict[str, Any]] = {}
         try:
             positions = crypto_ledger.get_positions()
@@ -1217,34 +1217,110 @@ class WatchlistService:
             raw_symbol = str(position.get('pair') or position.get('symbol') or '').upper().strip()
             if not raw_symbol:
                 continue
+
             candidates = {raw_symbol}
             if '/' in raw_symbol:
                 candidates.add(raw_symbol.split('/', 1)[0])
             if raw_symbol.endswith('USD') and len(raw_symbol) > 3:
                 candidates.add(raw_symbol[:-3])
+
+            latest_row = None
+            for candidate in candidates:
+                latest_row = (
+                    db.query(WatchlistSymbol)
+                    .filter(WatchlistSymbol.scope == 'crypto_only', WatchlistSymbol.symbol == candidate)
+                    .order_by(WatchlistSymbol.id.desc())
+                    .first()
+                )
+                if latest_row is not None:
+                    break
+
+            max_hold_hours = int(latest_row.max_hold_hours) if latest_row is not None and latest_row.max_hold_hours is not None else None
+            exit_template = str(latest_row.exit_template or '').strip().lower() if latest_row is not None and latest_row.exit_template is not None else ''
+
+            entry_time_raw = position.get('entryTimeUtc')
+            entry_time = None
+            if entry_time_raw:
+                try:
+                    entry_time = datetime.fromisoformat(str(entry_time_raw).replace('Z', '+00:00'))
+                    if entry_time.tzinfo is None:
+                        entry_time = entry_time.replace(tzinfo=UTC)
+                except ValueError:
+                    entry_time = None
+
+            avg_entry_price = float(position.get('avgPrice') or 0.0) if position.get('avgPrice') is not None else None
+            current_price = float(position.get('currentPrice') or 0.0) if position.get('currentPrice') is not None else None
+            base_expires_at = entry_time + timedelta(hours=max_hold_hours) if entry_time is not None and max_hold_hours is not None else None
+            hours_since_entry = None
+            if entry_time is not None:
+                hours_since_entry = round((observed_at - entry_time).total_seconds() / 3600.0, 2)
+
+            follow_through_window_hours = self._resolve_follow_through_window_hours(max_hold_hours)
+            follow_through_failed = bool(
+                exit_template in FOLLOW_THROUGH_EXIT_TEMPLATES
+                and avg_entry_price is not None
+                and avg_entry_price > 0
+                and current_price is not None
+                and current_price < avg_entry_price
+                and hours_since_entry is not None
+                and follow_through_window_hours is not None
+                and 1.0 <= hours_since_entry <= follow_through_window_hours
+            )
+
+            (
+                effective_expires_at,
+                position_expired,
+                hours_until_expiry,
+                time_stop_structure_check_passed,
+                time_stop_extended,
+                time_stop_extension_hours,
+                time_stop_extended_until,
+                exit_deadline_source,
+            ) = self._apply_structure_time_stop(
+                exit_template=exit_template,
+                base_expires_at=base_expires_at,
+                observed_at=observed_at,
+                max_hold_hours=max_hold_hours,
+                avg_entry_price=avg_entry_price,
+                current_price=current_price,
+                stop_loss_breached=False,
+                trailing_stop_breached=False,
+            )
+
             payload = {
                 'hasOpenPosition': True,
                 'pair': position.get('pair') or position.get('symbol'),
                 'amount': float(position.get('amount') or 0.0),
-                'avgEntryPrice': float(position.get('avgPrice') or 0.0) if position.get('avgPrice') is not None else None,
-                'currentPrice': float(position.get('currentPrice') or 0.0) if position.get('currentPrice') is not None else None,
+                'avgEntryPrice': avg_entry_price,
+                'currentPrice': current_price,
+                'marketValue': float(position.get('marketValue') or 0.0) if position.get('marketValue') is not None else None,
+                'costBasis': float(position.get('costBasis') or 0.0) if position.get('costBasis') is not None else None,
                 'pnl': float(position.get('pnl') or 0.0) if position.get('pnl') is not None else None,
                 'pnlPercent': float(position.get('pnlPercent') or 0.0) if position.get('pnlPercent') is not None else None,
-                'entryTimeUtc': None,
-                'maxHoldHours': None,
-                'basePositionExpiresAtUtc': None,
-                'positionExpiresAtUtc': None,
-                'positionExpired': False,
-                'hoursUntilExpiry': None,
-                'timeStopStructureCheckPassed': False,
-                'timeStopExtended': False,
-                'timeStopExtensionHours': None,
-                'timeStopExtendedUntilUtc': None,
-                'exitDeadlineSource': 'unavailable_crypto_ledger',
+                'realizedPnl': float(position.get('realizedPnl') or 0.0) if position.get('realizedPnl') is not None else None,
+                'entryTimeUtc': entry_time.isoformat() if entry_time else None,
+                'maxHoldHours': max_hold_hours,
+                'basePositionExpiresAtUtc': base_expires_at.isoformat() if base_expires_at else None,
+                'positionExpiresAtUtc': effective_expires_at.isoformat() if effective_expires_at else None,
+                'positionExpired': position_expired,
+                'hoursUntilExpiry': hours_until_expiry,
+                'hoursSinceEntry': hours_since_entry,
+                'followThroughWindowHours': follow_through_window_hours,
+                'followThroughFailed': follow_through_failed,
+                'timeStopStructureCheckPassed': time_stop_structure_check_passed,
+                'timeStopExtended': time_stop_extended,
+                'timeStopExtensionHours': time_stop_extension_hours,
+                'timeStopExtendedUntilUtc': time_stop_extended_until.isoformat() if time_stop_extended_until else None,
+                'exitDeadlineSource': exit_deadline_source or ('unavailable_crypto_ledger' if entry_time is None else 'watchlist_max_hold'),
                 'protectiveExitPending': False,
                 'protectiveExitReasons': [],
                 'stopLossBreached': False,
                 'trailingStopBreached': False,
+                'profitTargetReached': False,
+                'scaleOutReady': False,
+                'scaleOutAlreadyTaken': False,
+                'impulseTrailArmed': False,
+                'impulseTrailingStop': None,
                 'peakPrice': None,
                 'observedAtUtc': observed_at.isoformat(),
             }

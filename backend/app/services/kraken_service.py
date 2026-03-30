@@ -5,8 +5,8 @@ Handles crypto trading operations via Kraken REST API
 import requests
 import json
 import logging
-from typing import Dict, List, Optional
-from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from datetime import UTC, datetime, timezone
 from decimal import Decimal
 
 logger = logging.getLogger(__name__)
@@ -173,12 +173,12 @@ class CryptoPaperLedger:
     Paper trading ledger for crypto
     Tracks simulated trades with real Kraken prices
     """
-    
+
     def __init__(self, starting_balance: float = 100000.0):
         self.balance = Decimal(str(starting_balance))
         self.starting_balance = Decimal(str(starting_balance))
         self.trades: List[Dict] = []
-        self.positions: Dict[str, Dict] = {}  # pair -> {amount, avg_price}
+        self.positions: Dict[str, Dict] = {}  # pair -> {amount, total_cost}
         self.kraken = KrakenAPIService()
     
     def execute_trade(
@@ -255,7 +255,7 @@ class CryptoPaperLedger:
         # Record trade
         trade = {
             'id': f"paper_{len(self.trades) + 1}",
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(UTC).isoformat(),
             'market': 'CRYPTO',
             'pair': pair,
             'ohlcvPair': ohlcv_pair,
@@ -271,53 +271,132 @@ class CryptoPaperLedger:
         logger.info(f"Paper trade executed: {side} {amount} {pair} @ ${price:.2f}")
         return trade
     
+    def _build_position_analytics(self) -> dict[str, Any]:
+        analytics: dict[str, Any] = {
+            'entry_times': {},
+            'realized_pnl_by_pair': {},
+            'realized_pnl_total': 0.0,
+        }
+        running_positions: dict[str, dict[str, Decimal | str | None]] = {}
+
+        for trade in self.trades:
+            pair = str(trade.get('pair') or '').strip()
+            if not pair:
+                continue
+            side = str(trade.get('side') or '').upper().strip()
+            amount_dec = Decimal(str(trade.get('amount') or 0.0))
+            price_dec = Decimal(str(trade.get('price') or 0.0))
+            total_dec = Decimal(str(trade.get('total') or 0.0))
+            timestamp = str(trade.get('timestamp') or '').strip() or None
+            state = running_positions.setdefault(
+                pair,
+                {'amount': Decimal('0'), 'total_cost': Decimal('0'), 'opened_at': None},
+            )
+            current_amount = Decimal(str(state['amount']))
+            current_cost = Decimal(str(state['total_cost']))
+            opened_at = state['opened_at']
+
+            if side == 'BUY':
+                if current_amount <= 0 and amount_dec > 0:
+                    opened_at = timestamp
+                current_amount += amount_dec
+                current_cost += total_dec
+            elif side == 'SELL' and amount_dec > 0 and current_amount > 0:
+                sell_amount = min(amount_dec, current_amount)
+                avg_cost = (current_cost / current_amount) if current_amount > 0 else Decimal('0')
+                closed_cost = avg_cost * sell_amount
+                realized = (price_dec * sell_amount) - closed_cost
+                analytics['realized_pnl_by_pair'][pair] = float(
+                    Decimal(str(analytics['realized_pnl_by_pair'].get(pair, 0.0))) + realized
+                )
+                current_amount -= sell_amount
+                current_cost -= closed_cost
+                if current_amount <= Decimal('0.0000000001'):
+                    current_amount = Decimal('0')
+                    current_cost = Decimal('0')
+                    opened_at = None
+
+            state['amount'] = current_amount
+            state['total_cost'] = current_cost
+            state['opened_at'] = opened_at
+
+        analytics['entry_times'] = {
+            pair: state.get('opened_at')
+            for pair, state in running_positions.items()
+            if Decimal(str(state.get('amount') or 0)) > 0
+        }
+        analytics['realized_pnl_total'] = round(sum(analytics['realized_pnl_by_pair'].values()), 8)
+        return analytics
+
     def get_positions(self) -> List[Dict]:
-        """Get current positions with P&L"""
+        """Get current positions with P&L and paper-equity context."""
         positions = []
-        
+
         if not self.positions:
             return positions
-        
+
         pairs_to_check = list(self.positions.keys())
-        ohlcv_pairs = [TOP_30_PAIRS.get(p) for p in pairs_to_check]
-        
+        ohlcv_pairs = [TOP_30_PAIRS.get(p) for p in pairs_to_check if TOP_30_PAIRS.get(p)]
         prices = self.kraken.get_prices(ohlcv_pairs)
-        
+        analytics = self._build_position_analytics()
+
         for pair, pos in self.positions.items():
-            ohlcv_pair = TOP_30_PAIRS[pair]
-            current_price = prices.get(ohlcv_pair, 0)
-            
-            if current_price == 0:
+            ohlcv_pair = TOP_30_PAIRS.get(pair)
+            if not ohlcv_pair:
                 continue
-            
-            avg_price = float(pos['total_cost'] / pos['amount'])
-            current_value = float(pos['amount']) * current_price
-            cost_basis = float(pos['total_cost'])
-            pnl = current_value - cost_basis
-            pnl_percent = (pnl / cost_basis) * 100 if cost_basis > 0 else 0
-            
+            current_price = float(prices.get(ohlcv_pair, 0) or 0)
+            if current_price <= 0:
+                continue
+
+            amount_dec = Decimal(str(pos.get('amount') or 0))
+            total_cost_dec = Decimal(str(pos.get('total_cost') or 0))
+            if amount_dec <= 0:
+                continue
+
+            avg_price = float(total_cost_dec / amount_dec) if amount_dec > 0 else 0.0
+            market_value = float(amount_dec) * current_price
+            cost_basis = float(total_cost_dec)
+            pnl = market_value - cost_basis
+            pnl_percent = (pnl / cost_basis) * 100 if cost_basis > 0 else 0.0
+
             positions.append({
                 'pair': pair,
                 'ohlcvPair': ohlcv_pair,
-                'amount': float(pos['amount']),
+                'amount': float(amount_dec),
                 'avgPrice': avg_price,
                 'currentPrice': current_price,
+                'marketValue': market_value,
+                'costBasis': cost_basis,
                 'pnl': pnl,
-                'pnlPercent': pnl_percent
+                'pnlPercent': pnl_percent,
+                'entryTimeUtc': analytics['entry_times'].get(pair),
+                'realizedPnl': float(analytics['realized_pnl_by_pair'].get(pair, 0.0)),
             })
-        
+
         return positions
-    
+
     def get_ledger(self) -> Dict:
-        """Get full ledger including balance and all trades"""
-        total_pnl = sum(p['pnl'] for p in self.get_positions())
-        
+        """Get full ledger including balance, market value, equity, and P&L."""
+        positions = self.get_positions()
+        market_value = round(sum(float(position.get('marketValue') or 0.0) for position in positions), 8)
+        total_pnl = round(sum(float(position.get('pnl') or 0.0) for position in positions), 8)
+        analytics = self._build_position_analytics()
+        realized_pnl = round(float(analytics.get('realized_pnl_total') or 0.0), 8)
+        equity = round(float(self.balance) + market_value, 8)
+        net_pnl = round(equity - float(self.starting_balance), 8)
+        return_pct = round((net_pnl / float(self.starting_balance)) * 100, 8) if float(self.starting_balance) > 0 else 0.0
+
         return {
             'balance': float(self.balance),
             'startingBalance': float(self.starting_balance),
+            'marketValue': market_value,
+            'equity': equity,
             'totalPnL': total_pnl,
+            'realizedPnL': realized_pnl,
+            'netPnL': net_pnl,
+            'returnPct': return_pct,
             'trades': self.trades,
-            'positions': self.get_positions()
+            'positions': positions,
         }
 
 

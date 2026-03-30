@@ -22,7 +22,7 @@ from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
 from app.services.control_plane import discord_decision_guard
-from app.services.kraken_service import crypto_ledger, kraken_service
+from app.services.kraken_service import CryptoPaperLedger, crypto_ledger, kraken_service
 from app.services.market_sessions import calculate_next_scope_evaluation_at, get_scope_session_status
 from app.services.tradier_client import tradier_client
 from app.services.runtime_state import runtime_state
@@ -2611,3 +2611,70 @@ def test_watchlist_exit_worker_refresh_tightens_trailing_stop_for_impulse_templa
         assert readiness['summary']['impulseTrailArmedCount'] == 1
         assert readiness['rows'][0]['positionState']['impulseTrailArmed'] is True
         assert readiness['rows'][0]['positionState']['impulseTrailingStop'] == round(112.0 * (1.0 - (settings.TRAILING_STOP_PCT * 0.5)), 4)
+
+
+def test_crypto_paper_ledger_reports_equity_market_value_and_realized_pnl(monkeypatch) -> None:
+    ledger = CryptoPaperLedger(starting_balance=1000.0)
+
+    ledger.execute_trade(pair='BTC/USD', ohlcv_pair='XBTUSD', side='BUY', amount=1.0, price=100.0)
+    ledger.execute_trade(pair='BTC/USD', ohlcv_pair='XBTUSD', side='SELL', amount=0.25, price=140.0)
+
+    monkeypatch.setattr(ledger.kraken, 'get_prices', lambda pairs: {'XXBTZUSD': 120.0})
+
+    snapshot = ledger.get_ledger()
+
+    assert snapshot['balance'] == 935.0
+    assert snapshot['marketValue'] == 90.0
+    assert snapshot['equity'] == 1025.0
+    assert snapshot['totalPnL'] == 15.0
+    assert snapshot['realizedPnL'] == 10.0
+    assert snapshot['netPnL'] == 25.0
+    assert snapshot['positions'][0]['costBasis'] == 75.0
+    assert snapshot['positions'][0]['marketValue'] == 90.0
+    assert snapshot['positions'][0]['entryTimeUtc'] is not None
+
+
+def test_crypto_exit_readiness_uses_ledger_entry_time_and_watchlist_max_hold(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['exit_template'] = 'time_stop_with_structure_check'
+        payload['bot_payload']['symbols'][0]['max_hold_hours'] = 48
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        entry_time = (datetime.now(UTC) - timedelta(hours=60)).replace(microsecond=0)
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda: [
+                {
+                    'pair': 'BTC/USD',
+                    'ohlcvPair': 'XBTUSD',
+                    'amount': 0.5,
+                    'avgPrice': 100.0,
+                    'currentPrice': 95.0,
+                    'marketValue': 47.5,
+                    'costBasis': 50.0,
+                    'pnl': -2.5,
+                    'pnlPercent': -5.0,
+                    'realizedPnl': 0.0,
+                    'entryTimeUtc': entry_time.isoformat(),
+                }
+            ],
+        )
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='crypto_only', expiring_within_hours=24)
+
+        assert readiness['summary']['openPositionCount'] == 1
+        assert readiness['summary']['expiredPositionCount'] == 1
+        assert readiness['summary']['followThroughFailedCount'] == 0
+        assert readiness['rows'][0]['positionState']['entryTimeUtc'] == entry_time.isoformat()
+        assert readiness['rows'][0]['positionState']['maxHoldHours'] == 48
+        assert readiness['rows'][0]['positionState']['positionExpired'] is True
+        assert readiness['rows'][0]['positionState']['exitDeadlineSource'] == 'watchlist_max_hold'
+        assert readiness['rows'][0]['positionState']['marketValue'] == 47.5
+        assert readiness['rows'][0]['positionState']['costBasis'] == 50.0
