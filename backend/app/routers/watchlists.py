@@ -88,6 +88,20 @@ async def run_due_watchlist_monitoring(
     return watchlist_monitoring_orchestrator.run_due_once(db, scope=scope, limit_per_scope=limit_per_scope)
 
 
+@router.get('/exit-readiness')
+async def get_watchlist_exit_readiness(
+    scope: Literal['stocks_only', 'crypto_only'] | None = Query(default=None),
+    expiring_within_hours: int = Query(default=24, ge=1, le=240),
+    db: Session = Depends(get_db),
+):
+    return watchlist_service.get_exit_readiness_snapshot(
+        db,
+        scope=scope,
+        expiring_within_hours=expiring_within_hours,
+    )
+
+
+
 @router.post('/evaluate')
 async def evaluate_watchlist_monitoring(
     scope: Literal['stocks_only', 'crypto_only'] = Query(...),

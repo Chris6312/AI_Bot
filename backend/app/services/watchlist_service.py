@@ -511,7 +511,15 @@ class WatchlistService:
                 WatchlistSymbol.priority_rank.asc(),
                 WatchlistSymbol.id.asc(),
             ).all()
-            rows = [self._serialize_monitor_row(symbol_row, monitor_row) for monitor_row, symbol_row in pairs]
+            position_state_map = self._build_position_state_map(db, scope=scope_value, observed_at=observed_at)
+            rows = [
+                self._serialize_monitor_row(
+                    symbol_row,
+                    monitor_row,
+                    position_state=position_state_map.get(str(symbol_row.symbol or '').upper()),
+                )
+                for monitor_row, symbol_row in pairs
+            ]
             next_eval = min(
                 (row['monitoring']['nextEvaluationAtUtc'] for row in rows if row.get('monitoring') and row['monitoring']['nextEvaluationAtUtc']),
                 default=None,
@@ -539,8 +547,54 @@ class WatchlistService:
                     'evaluationBlockedCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'EVALUATION_BLOCKED'),
                     'monitorOnlyCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == MONITOR_ONLY),
                     'inactiveDecisionCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == INACTIVE_DECISION),
+                    'openPositionCount': sum(1 for row in rows if row.get('positionState', {}).get('hasOpenPosition')),
+                    'expiredPositionCount': sum(1 for row in rows if row.get('positionState', {}).get('positionExpired')),
+                    'expiringWithin24hCount': sum(
+                        1
+                        for row in rows
+                        if row.get('positionState', {}).get('hasOpenPosition')
+                        and row.get('positionState', {}).get('positionExpired') is False
+                        and row.get('positionState', {}).get('hoursUntilExpiry') is not None
+                        and float(row['positionState']['hoursUntilExpiry']) <= 24.0
+                    ),
                     'nextEvaluationAtUtc': next_eval,
                     'lastEvaluatedAtUtc': last_eval,
+                },
+                'rows': rows,
+            }
+        return result[scope] if scope is not None else result
+
+
+    def get_exit_readiness_snapshot(
+        self,
+        db: Session,
+        *,
+        scope: WATCHLIST_SCOPE | None = None,
+        expiring_within_hours: int = 24,
+    ) -> Any:
+        monitoring_snapshot = self.get_monitoring_snapshot(db, scope=scope, include_inactive=False)
+        scopes: dict[str, Any] = monitoring_snapshot if scope is None else {scope: monitoring_snapshot}
+        result: dict[str, Any] = {}
+        for scope_value, snapshot in scopes.items():
+            rows = [row for row in snapshot['rows'] if row.get('positionState', {}).get('hasOpenPosition')]
+            due_rows = [row for row in rows if row.get('positionState', {}).get('positionExpired')]
+            expiring_rows = [
+                row
+                for row in rows
+                if row.get('positionState', {}).get('positionExpired') is False
+                and row.get('positionState', {}).get('hoursUntilExpiry') is not None
+                and float(row['positionState']['hoursUntilExpiry']) <= float(expiring_within_hours)
+            ]
+            result[scope_value] = {
+                'scope': scope_value,
+                'capturedAtUtc': snapshot['capturedAtUtc'],
+                'activeUploadId': snapshot['activeUploadId'],
+                'expiringWithinHours': expiring_within_hours,
+                'summary': {
+                    'openPositionCount': len(rows),
+                    'expiredPositionCount': len(due_rows),
+                    'expiringWithinWindowCount': len(expiring_rows),
+                    'managedOnlyOpenCount': sum(1 for row in rows if row.get('managedOnly')),
                 },
                 'rows': rows,
             }
@@ -819,10 +873,116 @@ class WatchlistService:
     def _calculate_next_evaluation_at(self, scope: WATCHLIST_SCOPE, reference_time: datetime, interval_seconds: int | None) -> datetime | None:
         return calculate_next_scope_evaluation_at(scope, reference_time, interval_seconds)
 
-    def _serialize_monitor_row(self, row: WatchlistSymbol, monitor_state: WatchlistMonitorState | None) -> dict[str, Any]:
+    def _serialize_monitor_row(
+        self,
+        row: WatchlistSymbol,
+        monitor_state: WatchlistMonitorState | None,
+        *,
+        position_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         symbol_payload = self._serialize_symbol_row(row, monitor_state=monitor_state)
         symbol_payload['managedOnly'] = row.monitoring_status == MANAGED_ONLY
+        symbol_payload['positionState'] = position_state or {
+            'hasOpenPosition': False,
+            'positionExpiresAtUtc': None,
+            'positionExpired': False,
+            'hoursUntilExpiry': None,
+            'exitDeadlineSource': None,
+        }
         return symbol_payload
+
+    def _build_position_state_map(
+        self,
+        db: Session,
+        *,
+        scope: WATCHLIST_SCOPE,
+        observed_at: datetime,
+    ) -> dict[str, dict[str, Any]]:
+        if scope == 'stocks_only':
+            return self._build_stock_position_state_map(db, observed_at=observed_at)
+        return self._build_crypto_position_state_map(observed_at=observed_at)
+
+    def _build_stock_position_state_map(self, db: Session, *, observed_at: datetime) -> dict[str, dict[str, Any]]:
+        state_map: dict[str, dict[str, Any]] = {}
+        positions = (
+            db.query(Position)
+            .filter(Position.is_open.is_(True))
+            .order_by(Position.entry_time.asc(), Position.id.asc())
+            .all()
+        )
+        for position in positions:
+            symbol = str(position.ticker or '').upper().strip()
+            if not symbol:
+                continue
+            entry_time = position.entry_time
+            if entry_time is not None and entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=UTC)
+            watchlist_row = (
+                db.query(WatchlistSymbol)
+                .filter(WatchlistSymbol.scope == 'stocks_only', WatchlistSymbol.symbol == symbol)
+                .order_by(WatchlistSymbol.id.desc())
+                .first()
+            )
+            max_hold_hours = int(watchlist_row.max_hold_hours) if watchlist_row is not None and watchlist_row.max_hold_hours is not None else None
+            expires_at = entry_time + timedelta(hours=max_hold_hours) if entry_time is not None and max_hold_hours is not None else None
+            hours_until_expiry = None
+            position_expired = False
+            if expires_at is not None:
+                hours_until_expiry = round((expires_at - observed_at).total_seconds() / 3600.0, 2)
+                position_expired = expires_at <= observed_at
+            state_map[symbol] = {
+                'hasOpenPosition': True,
+                'accountId': position.account_id,
+                'positionId': position.id,
+                'shares': int(position.shares or 0),
+                'avgEntryPrice': float(position.avg_entry_price or 0.0) if position.avg_entry_price is not None else None,
+                'currentPrice': float(position.current_price or 0.0) if position.current_price is not None else None,
+                'stopLoss': float(position.stop_loss or 0.0) if position.stop_loss is not None else None,
+                'profitTarget': float(position.profit_target or 0.0) if position.profit_target is not None else None,
+                'trailingStop': float(position.trailing_stop or 0.0) if position.trailing_stop is not None else None,
+                'entryTimeUtc': entry_time.isoformat() if entry_time else None,
+                'maxHoldHours': max_hold_hours,
+                'positionExpiresAtUtc': expires_at.isoformat() if expires_at else None,
+                'positionExpired': position_expired,
+                'hoursUntilExpiry': hours_until_expiry,
+                'exitDeadlineSource': 'watchlist_max_hold' if expires_at is not None else None,
+            }
+        return state_map
+
+    def _build_crypto_position_state_map(self, *, observed_at: datetime) -> dict[str, dict[str, Any]]:
+        state_map: dict[str, dict[str, Any]] = {}
+        try:
+            positions = crypto_ledger.get_positions()
+        except Exception:
+            positions = []
+        for position in positions:
+            raw_symbol = str(position.get('pair') or position.get('symbol') or '').upper().strip()
+            if not raw_symbol:
+                continue
+            candidates = {raw_symbol}
+            if '/' in raw_symbol:
+                candidates.add(raw_symbol.split('/', 1)[0])
+            if raw_symbol.endswith('USD') and len(raw_symbol) > 3:
+                candidates.add(raw_symbol[:-3])
+            payload = {
+                'hasOpenPosition': True,
+                'pair': position.get('pair') or position.get('symbol'),
+                'amount': float(position.get('amount') or 0.0),
+                'avgEntryPrice': float(position.get('avgPrice') or 0.0) if position.get('avgPrice') is not None else None,
+                'currentPrice': float(position.get('currentPrice') or 0.0) if position.get('currentPrice') is not None else None,
+                'pnl': float(position.get('pnl') or 0.0) if position.get('pnl') is not None else None,
+                'pnlPercent': float(position.get('pnlPercent') or 0.0) if position.get('pnlPercent') is not None else None,
+                'entryTimeUtc': None,
+                'maxHoldHours': None,
+                'positionExpiresAtUtc': None,
+                'positionExpired': False,
+                'hoursUntilExpiry': None,
+                'exitDeadlineSource': 'unavailable_crypto_ledger',
+                'observedAtUtc': observed_at.isoformat(),
+            }
+            for candidate in candidates:
+                state_map.setdefault(candidate, payload)
+        return state_map
 
     @staticmethod
     def _serialize_symbol_row(row: WatchlistSymbol, monitor_state: WatchlistMonitorState | None = None) -> dict[str, Any]:

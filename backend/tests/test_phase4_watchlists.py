@@ -1092,3 +1092,143 @@ def test_due_snapshot_reports_blocked_stock_rows_outside_session(tmp_path, monke
         assert snapshot['eligibleDueCount'] == 0
         assert snapshot['blockedDueCount'] == 1
         assert snapshot['session']['sessionOpen'] is False
+
+
+def test_monitoring_snapshot_includes_stock_position_expiry_state(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        position = Position(
+            account_id='acct-1',
+            ticker='AAPL',
+            shares=5,
+            avg_entry_price=100.0,
+            current_price=104.0,
+            strategy='AI_SCREENING',
+            entry_time=datetime.now(UTC) - timedelta(hours=73),
+            entry_reasoning={'intentId': 'intent-1'},
+            stop_loss=98.0,
+            profit_target=108.0,
+            peak_price=104.0,
+            trailing_stop=101.0,
+            is_open=True,
+            execution_id='intent-1',
+        )
+        db.add(position)
+        db.commit()
+
+        snapshot = watchlist_service.get_monitoring_snapshot(db, scope='stocks_only', include_inactive=False)
+
+        assert snapshot['summary']['openPositionCount'] == 1
+        assert snapshot['summary']['expiredPositionCount'] == 1
+        row = snapshot['rows'][0]
+        assert row['symbol'] == 'AAPL'
+        assert row['positionState']['hasOpenPosition'] is True
+        assert row['positionState']['shares'] == 5
+        assert row['positionState']['maxHoldHours'] == 72
+        assert row['positionState']['positionExpired'] is True
+        assert row['positionState']['positionExpiresAtUtc'] is not None
+        assert row['positionState']['exitDeadlineSource'] == 'watchlist_max_hold'
+
+
+
+def test_exit_readiness_snapshot_tracks_managed_only_open_positions(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        first_payload = build_stock_payload()
+        second_payload = deepcopy(first_payload)
+        second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][1]]
+        second_payload['bot_payload']['symbols'][0]['priority_rank'] = 1
+        second_payload['ui_payload']['summary']['selected_count'] = 1
+        second_payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        second_payload['ui_payload']['symbol_context'] = {'MSFT': second_payload['ui_payload']['symbol_context']['MSFT']}
+
+        watchlist_service.ingest_watchlist(db, first_payload, source='api')
+        db.add(
+            Position(
+                account_id='acct-1',
+                ticker='AAPL',
+                shares=3,
+                avg_entry_price=100.0,
+                current_price=102.0,
+                strategy='AI_SCREENING',
+                entry_time=datetime.now(UTC) - timedelta(hours=1),
+                entry_reasoning={'intentId': 'intent-2'},
+                stop_loss=98.0,
+                profit_target=108.0,
+                peak_price=102.0,
+                trailing_stop=100.0,
+                is_open=True,
+                execution_id='intent-2',
+            )
+        )
+        db.commit()
+        watchlist_service.ingest_watchlist(db, second_payload, source='api')
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='stocks_only', expiring_within_hours=24)
+
+        assert readiness['summary']['openPositionCount'] == 1
+        assert readiness['summary']['managedOnlyOpenCount'] == 1
+        assert readiness['rows'][0]['symbol'] == 'AAPL'
+        assert readiness['rows'][0]['managedOnly'] is True
+        assert readiness['rows'][0]['positionState']['hasOpenPosition'] is True
+        assert readiness['rows'][0]['positionState']['positionExpired'] is False
+
+
+
+def test_watchlist_exit_readiness_endpoint_returns_position_deadline_summary(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        db.add(
+            Position(
+                account_id='acct-1',
+                ticker='AAPL',
+                shares=2,
+                avg_entry_price=100.0,
+                current_price=103.0,
+                strategy='AI_SCREENING',
+                entry_time=datetime.now(UTC) - timedelta(hours=73),
+                entry_reasoning={'intentId': 'intent-3'},
+                stop_loss=98.0,
+                profit_target=108.0,
+                peak_price=103.0,
+                trailing_stop=100.0,
+                is_open=True,
+                execution_id='intent-3',
+            )
+        )
+        db.commit()
+
+        def override_db():
+            try:
+                yield db
+            finally:
+                pass
+
+        app.dependency_overrides[get_db] = override_db
+        try:
+            client = TestClient(app)
+            response = client.get('/api/watchlists/exit-readiness?scope=stocks_only&expiring_within_hours=24')
+        finally:
+            app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body['scope'] == 'stocks_only'
+        assert body['summary']['openPositionCount'] == 1
+        assert body['summary']['expiredPositionCount'] == 1
+        assert body['rows'][0]['symbol'] == 'AAPL'
+        assert body['rows'][0]['positionState']['positionExpired'] is True
