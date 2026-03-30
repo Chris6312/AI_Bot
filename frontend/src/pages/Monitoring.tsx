@@ -74,62 +74,60 @@ export default function Monitoring() {
         </div>
       </header>
 
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.65fr)_minmax(320px,0.95fr)]">
-        <div className="space-y-6">
-          {(['stocks_only', 'crypto_only'] as WatchlistScope[]).map((scope) => (
-            <ScopeMonitoringPanel
-              key={scope}
-              scope={scope}
-              monitoring={monitoring[scope]}
-              exitReadiness={exitReadiness[scope]}
-              orchestration={extractScopeSnapshot(orchestration, scope)}
-            />
-          ))}
-        </div>
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
+        <RuntimeCard
+          title="Monitoring orchestrator"
+          icon={<Activity className="h-4 w-4 text-cyan-300" />}
+          enabled={orchestration?.enabled}
+          pollSeconds={orchestration?.pollSeconds}
+          lastStartedAtUtc={orchestration?.lastStartedAtUtc ?? null}
+          lastFinishedAtUtc={orchestration?.lastFinishedAtUtc ?? null}
+          lastError={orchestration?.lastError ?? null}
+          extraRows={[
+            ['Eligible due', String(orchestration?.dueSnapshot && 'summary' in orchestration.dueSnapshot ? orchestration.dueSnapshot.summary.eligibleDueCount : 0)],
+            ['Blocked due', String(orchestration?.dueSnapshot && 'summary' in orchestration.dueSnapshot ? orchestration.dueSnapshot.summary.blockedDueCount : 0)],
+          ]}
+        />
 
-        <aside className="space-y-6">
-          <RuntimeCard
-            title="Monitoring orchestrator"
-            icon={<Activity className="h-4 w-4 text-cyan-300" />}
-            enabled={orchestration?.enabled}
-            pollSeconds={orchestration?.pollSeconds}
-            lastStartedAtUtc={orchestration?.lastStartedAtUtc ?? null}
-            lastFinishedAtUtc={orchestration?.lastFinishedAtUtc ?? null}
-            lastError={orchestration?.lastError ?? null}
-            extraRows={[
-              ['Eligible due', String(orchestration?.dueSnapshot && 'summary' in orchestration.dueSnapshot ? orchestration.dueSnapshot.summary.eligibleDueCount : 0)],
-              ['Blocked due', String(orchestration?.dueSnapshot && 'summary' in orchestration.dueSnapshot ? orchestration.dueSnapshot.summary.blockedDueCount : 0)],
-            ]}
-          />
+        <RuntimeCard
+          title="Exit worker"
+          icon={<Siren className="h-4 w-4 text-amber-300" />}
+          enabled={exitWorker?.enabled}
+          pollSeconds={exitWorker?.pollSeconds}
+          lastStartedAtUtc={exitWorker?.lastStartedAtUtc ?? null}
+          lastFinishedAtUtc={exitWorker?.lastFinishedAtUtc ?? null}
+          lastError={exitWorker?.lastError ?? null}
+          extraRows={[
+            ['Eligible exits', String(exitWorker?.summary.eligibleExitCount ?? 0)],
+            ['Blocked exits', String(exitWorker?.summary.blockedExitCount ?? 0)],
+            ['Already in progress', String(exitWorker?.summary.alreadyInProgressCount ?? 0)],
+          ]}
+        />
 
-          <RuntimeCard
-            title="Exit worker"
-            icon={<Siren className="h-4 w-4 text-amber-300" />}
-            enabled={exitWorker?.enabled}
-            pollSeconds={exitWorker?.pollSeconds}
-            lastStartedAtUtc={exitWorker?.lastStartedAtUtc ?? null}
-            lastFinishedAtUtc={exitWorker?.lastFinishedAtUtc ?? null}
-            lastError={exitWorker?.lastError ?? null}
-            extraRows={[
-              ['Eligible exits', String(exitWorker?.summary.eligibleExitCount ?? 0)],
-              ['Blocked exits', String(exitWorker?.summary.blockedExitCount ?? 0)],
-              ['Already in progress', String(exitWorker?.summary.alreadyInProgressCount ?? 0)],
-            ]}
-          />
-
-          <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5">
-            <div className="flex items-center gap-2 text-sm font-semibold text-slate-200">
-              <ShieldCheck className="h-4 w-4 text-emerald-300" />
-              Exit triggers in play
-            </div>
-            <div className="mt-4 space-y-3 text-sm text-slate-400">
-              <SummaryRow label="Expired" value={String(exitWorker?.summary.expiredPositionCount ?? 0)} />
-              <SummaryRow label="Protective" value={String(exitWorker?.summary.protectiveExitCount ?? 0)} />
-              <SummaryRow label="Profit target" value={String(exitWorker?.summary.profitTargetCount ?? 0)} />
-              <SummaryRow label="Failed follow-through" value={String(exitWorker?.summary.followThroughExitCount ?? 0)} />
-            </div>
+        <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5">
+          <div className="flex items-center gap-2 text-sm font-semibold text-slate-200">
+            <ShieldCheck className="h-4 w-4 text-emerald-300" />
+            Exit triggers in play
           </div>
-        </aside>
+          <div className="mt-4 space-y-3 text-sm text-slate-400">
+            <SummaryRow label="Expired" value={String(exitWorker?.summary.expiredPositionCount ?? 0)} />
+            <SummaryRow label="Protective" value={String(exitWorker?.summary.protectiveExitCount ?? 0)} />
+            <SummaryRow label="Profit target" value={String(exitWorker?.summary.profitTargetCount ?? 0)} />
+            <SummaryRow label="Failed follow-through" value={String(exitWorker?.summary.followThroughExitCount ?? 0)} />
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-6">
+        {(['stocks_only', 'crypto_only'] as WatchlistScope[]).map((scope) => (
+          <ScopeMonitoringPanel
+            key={scope}
+            scope={scope}
+            monitoring={monitoring[scope]}
+            exitReadiness={exitReadiness[scope]}
+            orchestration={extractScopeSnapshot(orchestration, scope)}
+          />
+        ))}
       </div>
     </div>
   )
@@ -182,7 +180,7 @@ function ScopeMonitoringPanel({
         </div>
       </div>
 
-      <div className="mt-5 grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.3fr)_minmax(260px,0.7fr)]">
+      <div className="mt-5 grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.75fr)_minmax(340px,0.95fr)] 2xl:grid-cols-[minmax(0,1.95fr)_minmax(380px,0.9fr)]">
         <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
           {rows.length === 0 ? (
             <EmptyState message="No monitoring rows are available for this scope yet." />
@@ -222,32 +220,36 @@ function ScopeMonitoringPanel({
 function MonitoringTable({ rows }: { rows: WatchlistSymbolRecord[] }) {
   return (
     <div className="overflow-x-auto">
-      <table className="min-w-full text-sm">
+      <table className="w-full min-w-[1200px] text-sm">
         <thead>
           <tr className="border-b border-slate-800 text-left text-xs uppercase tracking-wide text-slate-500">
-            <th className="pb-3 pr-4">Symbol</th>
-            <th className="pb-3 pr-4">Decision</th>
-            <th className="pb-3 pr-4">Reason</th>
-            <th className="pb-3 pr-4">Next eval</th>
-            <th className="pb-3 pr-4">Position</th>
-            <th className="pb-3 pr-4">Exit flags</th>
+            <th className="w-[150px] pb-3 pr-4">Symbol</th>
+            <th className="w-[180px] pb-3 pr-4">Decision</th>
+            <th className="w-[360px] pb-3 pr-4">Reason</th>
+            <th className="w-[220px] pb-3 pr-4">Next eval</th>
+            <th className="w-[180px] pb-3 pr-4">Position</th>
+            <th className="w-[180px] pb-3 pr-4">Exit flags</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((row) => (
             <tr key={`${row.uploadId}-${row.symbol}`} className="border-b border-slate-900/80 align-top text-slate-300">
-              <td className="py-3 pr-4">
+              <td className="py-3 pr-4 align-top">
                 <div className="font-semibold text-white">{row.symbol}</div>
                 <div className="text-xs text-slate-500">{row.monitoringStatus}</div>
               </td>
-              <td className="py-3 pr-4">
+              <td className="py-3 pr-4 align-top">
                 <StatusBadge tone={decisionTone(row.monitoring?.latestDecisionState)}>
                   {row.monitoring?.latestDecisionState ?? 'UNKNOWN'}
                 </StatusBadge>
               </td>
-              <td className="py-3 pr-4 text-slate-400">{row.monitoring?.latestDecisionReason ?? '—'}</td>
-              <td className="py-3 pr-4 text-slate-400">{formatTimestamp(row.monitoring?.nextEvaluationAtUtc)}</td>
-              <td className="py-3 pr-4 text-slate-400">
+              <td className="py-3 pr-4 align-top text-slate-400 whitespace-normal break-words [overflow-wrap:anywhere]">
+                {row.monitoring?.latestDecisionReason ?? '—'}
+              </td>
+              <td className="py-3 pr-4 align-top text-slate-400 whitespace-normal break-words">
+                {formatTimestamp(row.monitoring?.nextEvaluationAtUtc)}
+              </td>
+              <td className="py-3 pr-4 align-top text-slate-400">
                 {row.positionState?.hasOpenPosition ? (
                   <div>
                     <div className="font-medium text-slate-200">Open</div>
@@ -263,7 +265,9 @@ function MonitoringTable({ rows }: { rows: WatchlistSymbolRecord[] }) {
                   'Flat'
                 )}
               </td>
-              <td className="py-3 pr-4 text-slate-400">{buildExitFlags(row)}</td>
+              <td className="py-3 pr-4 align-top text-slate-400 whitespace-normal break-words">
+                {buildExitFlags(row)}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -349,7 +353,7 @@ function SummaryRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-start justify-between gap-4 border-b border-slate-900/90 pb-3 last:border-b-0 last:pb-0">
       <span className="text-slate-500">{label}</span>
-      <span className="max-w-[60%] text-right text-slate-200">{value}</span>
+      <span className="max-w-[60%] text-right text-slate-200 break-words">{value}</span>
     </div>
   )
 }

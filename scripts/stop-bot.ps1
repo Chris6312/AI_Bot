@@ -1,79 +1,245 @@
-# AI Bot Stop Script - Gracefully shuts down all services
+# AI Bot Supervisor - Stops local backend/frontend and optional Docker infra
 # Run from project root directory OR scripts directory
 
-$ErrorActionPreference = "Continue"
+param(
+    [switch]$KeepDocker
+)
 
-# Detect project root (go up one level if we're in scripts/)
-$ScriptDir = $PSScriptRoot
-if ($ScriptDir -like "*\scripts") {
-    $ProjectRoot = Split-Path $ScriptDir -Parent
+$ErrorActionPreference = "Stop"
+
+# Detect project root
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$ProjectRoot = if ((Split-Path $ScriptDir -Leaf) -ieq "scripts") {
+    Split-Path $ScriptDir -Parent
 } else {
-    $ProjectRoot = $ScriptDir
+    $ScriptDir
 }
 
 Write-Host "=== AI Bot Shutdown ===" -ForegroundColor Cyan
 Write-Host "Project Root: $ProjectRoot" -ForegroundColor Gray
 
-# 1. Stop FastAPI Backend
-Write-Host "`n[1/3] Stopping Backend (uvicorn)..." -ForegroundColor Yellow
-$uvicornProcesses = Get-Process -Name "python" -ErrorAction SilentlyContinue | Where-Object {
-    $_.CommandLine -like "*uvicorn*main:app*"
-}
-if ($uvicornProcesses) {
-    $uvicornProcesses | ForEach-Object {
-        Write-Host "  Stopping PID $($_.Id)..." -ForegroundColor Gray
-        Stop-Process -Id $_.Id -Force
+function Get-CommandLine {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$ProcessId
+    )
+
+    try {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        return [string]($proc.CommandLine ?? "")
     }
-    Write-Host "✓ Backend stopped" -ForegroundColor Green
-} else {
-    Write-Host "  No backend process found" -ForegroundColor Gray
+    catch {
+        return ""
+    }
 }
 
-# 2. Stop Frontend (npm/node)
-Write-Host "`n[2/3] Stopping Frontend (npm dev server)..." -ForegroundColor Yellow
-$nodeProcesses = Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object {
-    $_.CommandLine -like "*vite*" -or $_.CommandLine -like "*dev*"
-}
-if ($nodeProcesses) {
-    $nodeProcesses | ForEach-Object {
-        Write-Host "  Stopping PID $($_.Id)..." -ForegroundColor Gray
-        Stop-Process -Id $_.Id -Force
+function Get-ExecutablePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$ProcessId
+    )
+
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction Stop
+        return [string]($proc.Path ?? "")
     }
-    Write-Host "✓ Frontend stopped" -ForegroundColor Green
-} else {
-    Write-Host "  No frontend process found" -ForegroundColor Gray
+    catch {
+        return ""
+    }
 }
 
-# Stop any worker processes
-Write-Host "Stopping Workers..." -ForegroundColor Yellow
-$workerProcesses = Get-Process -Name "python" -ErrorAction SilentlyContinue | Where-Object {
-    $_.CommandLine -like "*worker.py*" -or $_.CommandLine -like "*workers.*"
-}
-if ($workerProcesses) {
-    $workerProcesses | ForEach-Object {
-        Write-Host "  Stopping PID $($_.Id)..." -ForegroundColor Gray
-        Stop-Process -Id $_.Id -Force
+function Test-IsProjectProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$ProcessId,
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectRoot,
+        [string[]]$Patterns = @()
+    )
+
+    $commandLine = Get-CommandLine -ProcessId $ProcessId
+    $exePath = Get-ExecutablePath -ProcessId $ProcessId
+    $projectRootNormalized = $ProjectRoot.ToLowerInvariant()
+
+    if (-not [string]::IsNullOrWhiteSpace($commandLine)) {
+        if ($commandLine.ToLowerInvariant().Contains($projectRootNormalized)) {
+            return $true
+        }
+
+        foreach ($pattern in $Patterns) {
+            if ($commandLine -match $pattern) {
+                return $true
+            }
+        }
     }
-    Write-Host "✓ Workers stopped" -ForegroundColor Green
-} else {
-    Write-Host "  No worker processes found" -ForegroundColor Gray
+
+    if (-not [string]::IsNullOrWhiteSpace($exePath)) {
+        if ($exePath.ToLowerInvariant().StartsWith($projectRootNormalized)) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
-# 3. Stop Docker Compose
-Write-Host "`n[3/3] Stopping Docker services..." -ForegroundColor Yellow
-if (Test-Path "$ProjectRoot/docker-compose.yml") {
+function Stop-ListeningProcessOnPort {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Port,
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectRoot,
+        [string[]]$Patterns = @()
+    )
+
+    $connections = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if (-not $connections) {
+        Write-Host "No listening process found on port $Port for $Label." -ForegroundColor Gray
+        return
+    }
+
+    $processIds = $connections |
+        Select-Object -ExpandProperty OwningProcess -Unique |
+        Sort-Object
+
+    foreach ($pid in $processIds) {
+        if ($pid -le 0) {
+            continue
+        }
+
+        $commandLine = Get-CommandLine -ProcessId $pid
+        $safeToStop = Test-IsProjectProcess -ProcessId $pid -ProjectRoot $ProjectRoot -Patterns $Patterns
+
+        if (-not $safeToStop) {
+            Write-Warning "Skipping PID $pid on port $Port because it does not look like this project's $Label process."
+            if (-not [string]::IsNullOrWhiteSpace($commandLine)) {
+                Write-Host "Command: $commandLine" -ForegroundColor DarkGray
+            }
+            continue
+        }
+
+        try {
+            Write-Host "Stopping $Label on port $Port (PID $pid)..." -ForegroundColor Yellow
+            Stop-Process -Id $pid -Force -ErrorAction Stop
+            Write-Host "✓ Stopped PID $pid" -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Failed to stop PID $pid on port $Port. $($_.Exception.Message)"
+        }
+    }
+}
+
+function Stop-DockerContainerIfRunning {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ContainerName
+    )
+
+    $status = & docker ps --filter "name=^/$ContainerName$" --format "{{.Status}}" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return
+    }
+
+    $status = ($status | Out-String).Trim()
+    if ([string]::IsNullOrWhiteSpace($status)) {
+        return
+    }
+
+    Write-Host "Stopping Docker container $ContainerName..." -ForegroundColor Yellow
+    & docker stop $ContainerName | Out-Null
+    Write-Host "✓ Stopped $ContainerName" -ForegroundColor Green
+}
+
+function Clear-RuntimeFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectRoot
+    )
+
+    $runtimeDir = Join-Path $ProjectRoot "scripts\.runtime"
+    if (-not (Test-Path $runtimeDir)) {
+        return
+    }
+
+    $patterns = @(
+        "*.pid",
+        "*.json"
+    )
+
+    foreach ($pattern in $patterns) {
+        Get-ChildItem -Path $runtimeDir -Filter $pattern -File -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                Remove-Item $_.FullName -Force -ErrorAction Stop
+                Write-Host "Removed runtime file: $($_.Name)" -ForegroundColor DarkGray
+            }
+            catch {
+                Write-Warning "Could not remove runtime file $($_.FullName)"
+            }
+        }
+    }
+}
+
+# Stop local frontend/backend first
+Write-Host "`n[1/3] Stopping local app processes..." -ForegroundColor Yellow
+
+Stop-ListeningProcessOnPort `
+    -Port 8000 `
+    -Label "backend" `
+    -ProjectRoot $ProjectRoot `
+    -Patterns @(
+        'uvicorn',
+        'app\.main:app'
+    )
+
+Stop-ListeningProcessOnPort `
+    -Port 5173 `
+    -Label "frontend" `
+    -ProjectRoot $ProjectRoot `
+    -Patterns @(
+        'vite',
+        'npm(.cmd)?\s+run\s+dev'
+    )
+
+# Stop Docker pieces
+Write-Host "`n[2/3] Stopping Docker services..." -ForegroundColor Yellow
+
+$composePath = Join-Path $ProjectRoot "docker-compose.yml"
+if (Test-Path $composePath) {
     Push-Location $ProjectRoot
-    docker-compose down
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "✓ Docker services stopped" -ForegroundColor Green
-    } else {
-        Write-Warning "Docker compose down had issues"
+    try {
+        if ($KeepDocker) {
+            Write-Host "KeepDocker specified, leaving postgres/redis running." -ForegroundColor Gray
+            Stop-DockerContainerIfRunning -ContainerName "trading_bot_backend"
+        }
+        else {
+            Write-Host "Stopping compose services..." -ForegroundColor Gray
+            & docker compose down --remove-orphans
+            if ($LASTEXITCODE -ne 0) {
+                throw "docker compose down failed."
+            }
+            Write-Host "✓ Docker services stopped" -ForegroundColor Green
+        }
     }
-    Pop-Location
-} else {
-    Write-Host "  docker-compose.yml not found at $ProjectRoot" -ForegroundColor Gray
+    finally {
+        Pop-Location
+    }
 }
+else {
+    Write-Host "docker-compose.yml not found, skipping compose shutdown." -ForegroundColor Gray
+    if (-not $KeepDocker) {
+        Stop-DockerContainerIfRunning -ContainerName "trading_bot_backend"
+        Stop-DockerContainerIfRunning -ContainerName "trading_bot_postgres"
+        Stop-DockerContainerIfRunning -ContainerName "trading_bot_redis"
+    }
+}
+
+# Cleanup runtime artifacts
+Write-Host "`n[3/3] Cleaning runtime artifacts..." -ForegroundColor Yellow
+Clear-RuntimeFiles -ProjectRoot $ProjectRoot
 
 Write-Host "`n=== AI Bot Stopped ===" -ForegroundColor Green
-Write-Host "All services have been shut down" -ForegroundColor White
-Write-Host "Note: Windows Terminal tabs may still be open - close them manually if needed" -ForegroundColor Yellow
+Write-Host "Notes:" -ForegroundColor Yellow
+Write-Host "  • This script does NOT change stock/crypto mode" -ForegroundColor White
+Write-Host "  • This script does NOT force runtime state to PAPER" -ForegroundColor White
+Write-Host "  • Use -KeepDocker if you want PostgreSQL/Redis to stay up" -ForegroundColor White
