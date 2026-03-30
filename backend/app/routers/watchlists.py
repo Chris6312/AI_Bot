@@ -9,6 +9,7 @@ from app.core.database import get_db
 from app.services.control_plane import require_admin_token
 from app.services.template_evaluator import template_evaluation_service
 from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
+from app.services.watchlist_exit_worker import watchlist_exit_worker
 from app.services.watchlist_service import WatchlistValidationError, watchlist_service
 
 router = APIRouter(prefix='/watchlists', tags=['watchlists'])
@@ -100,6 +101,24 @@ async def get_watchlist_exit_readiness(
         expiring_within_hours=expiring_within_hours,
     )
 
+
+
+
+@router.get('/exit-worker')
+async def get_watchlist_exit_worker_status(
+    db: Session = Depends(get_db),
+):
+    return watchlist_exit_worker.get_status(db)
+
+
+@router.post('/run-exit-sweep')
+async def run_watchlist_exit_sweep(
+    execute: bool = Query(default=False),
+    limit: int = Query(default=25, ge=1, le=100),
+    _: bool = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+):
+    return watchlist_exit_worker.run_exit_sweep(db, execute=execute, limit=limit)
 
 
 @router.post('/evaluate')
