@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.watchlist_monitor_state import WatchlistMonitorState
+from app.services.market_sessions import get_scope_session_status
 from app.services.template_evaluator import template_evaluation_service
 from app.services.watchlist_service import ACTIVE, MANAGED_ONLY, PENDING_EVALUATION, WATCHLIST_SCOPE, watchlist_service
 
@@ -72,15 +73,25 @@ class WatchlistMonitoringOrchestrator:
             managed_only_due = scope_due.filter(WatchlistMonitorState.monitoring_status == MANAGED_ONLY).count()
             total_due = active_due + managed_only_due
             monitoring_snapshot = watchlist_service.get_monitoring_snapshot(db, scope=scope_value, include_inactive=False)
+            session_status = get_scope_session_status(scope_value, observed_at)
+            eligible_due = total_due if session_status.session_open else (total_due if scope_value == 'crypto_only' else 0)
+            blocked_due = 0 if session_status.session_open else (0 if scope_value == 'crypto_only' else total_due)
             result['scopes'][scope_value] = {
                 'scope': scope_value,
                 'dueCount': total_due,
+                'eligibleDueCount': eligible_due,
+                'blockedDueCount': blocked_due,
                 'activeDueCount': active_due,
                 'managedOnlyDueCount': managed_only_due,
                 'nextEvaluationAtUtc': monitoring_snapshot['summary']['nextEvaluationAtUtc'],
                 'activeUploadId': monitoring_snapshot['activeUploadId'],
+                'session': session_status.to_dict(),
             }
             result['summary']['totalDueCount'] += total_due
+            result['summary'].setdefault('eligibleDueCount', 0)
+            result['summary'].setdefault('blockedDueCount', 0)
+            result['summary']['eligibleDueCount'] += eligible_due
+            result['summary']['blockedDueCount'] += blocked_due
             result['summary']['activeDueCount'] += active_due
             result['summary']['managedOnlyDueCount'] += managed_only_due
         if scope is not None:
@@ -115,14 +126,17 @@ class WatchlistMonitoringOrchestrator:
                 'totalMonitorOnly': 0,
                 'totalBiasConflict': 0,
                 'totalEvaluationBlocked': 0,
+                'totalSessionBlocked': 0,
             },
         }
 
         for scope_value in scopes:
             watchlist_service.reconcile_scope_statuses(db, scope=scope_value)
             due_before = self._count_due_rows(db, scope=scope_value, observed_at=observed_at)
+            session_status = get_scope_session_status(scope_value, observed_at)
             scope_result: dict[str, Any] = {
                 'scope': scope_value,
+                'session': session_status.to_dict(),
                 'dueCountBefore': due_before,
                 'dueCountAfter': due_before,
                 'evaluatedCount': 0,
@@ -137,16 +151,22 @@ class WatchlistMonitoringOrchestrator:
                     'evaluationBlockedCount': 0,
                 },
                 'rows': [],
+                'sessionBlockedCount': 0,
                 'monitoringSnapshot': watchlist_service.get_monitoring_snapshot(db, scope=scope_value, include_inactive=False),
             }
-            if due_before > 0:
-                scope_result = template_evaluation_service.evaluate_scope(
+            if due_before > 0 and scope_value == 'stocks_only' and not session_status.session_open:
+                scope_result['sessionBlockedCount'] = due_before
+            elif due_before > 0:
+                evaluated_scope = template_evaluation_service.evaluate_scope(
                     db,
                     scope=scope_value,
                     limit=min(per_scope_limit, due_before),
                     force=False,
                     eligible_statuses=ELIGIBLE_DUE_STATUSES,
                 )
+                scope_result.update(evaluated_scope)
+                scope_result['session'] = session_status.to_dict()
+                scope_result['sessionBlockedCount'] = 0
                 scope_result['dueCountBefore'] = due_before
                 scope_result['dueCountAfter'] = self._count_due_rows(db, scope=scope_value, observed_at=datetime.now(UTC))
                 result['summary']['scopesWithDueRows'] += 1
@@ -162,6 +182,7 @@ class WatchlistMonitoringOrchestrator:
             result['summary']['totalMonitorOnly'] += scope_result['summary']['monitorOnlyCount']
             result['summary']['totalBiasConflict'] += scope_result['summary']['biasConflictCount']
             result['summary']['totalEvaluationBlocked'] += scope_result['summary']['evaluationBlockedCount']
+            result['summary']['totalSessionBlocked'] += scope_result.get('sessionBlockedCount', 0)
 
         if scope is not None:
             return result['scopes'][scope]

@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.models.watchlist_monitor_state import WatchlistMonitorState
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.services.kraken_service import TOP_30_PAIRS, kraken_service
+from app.services.market_sessions import calculate_next_scope_evaluation_at
 from app.services.runtime_state import runtime_state
 from app.services.trade_validator import trade_validator
 from app.services.tradier_client import tradier_client
@@ -401,7 +402,8 @@ class TemplateEvaluationService:
         changed = False
         next_evaluation_at = None
         if symbol_row.monitoring_status != INACTIVE:
-            next_evaluation_at = watchlist_service._calculate_next_evaluation_at(
+            next_evaluation_at = calculate_next_scope_evaluation_at(
+                symbol_row.scope,
                 observed_at,
                 monitor_state.evaluation_interval_seconds,
             )

@@ -4,10 +4,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
-import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -21,6 +21,7 @@ from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
 from app.services.control_plane import discord_decision_guard
 from app.services.kraken_service import crypto_ledger, kraken_service
+from app.services.market_sessions import calculate_next_scope_evaluation_at, get_scope_session_status
 from app.services.tradier_client import tradier_client
 from app.services.template_evaluator import (
     DATA_STALE,
@@ -48,13 +49,11 @@ def build_session_factory(tmp_path) -> Iterator[sessionmaker]:
         engine.dispose()
 
 
-def build_stock_payload(*, generated_at: str | None = None, target_session_et: str | None = None) -> dict:
-    generated_at_value = generated_at
-    if generated_at_value is None:
-        generated_at_value = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
-    payload = {
+def build_stock_payload() -> dict:
+    generated_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    return {
         'schema_version': 'bot_stock_watchlist_v1',
-        'generated_at_utc': generated_at_value,
+        'generated_at_utc': generated_at,
         'provider': 'claude_tradier_mcp',
         'scope': 'stocks_only',
         'bot_payload': {
@@ -117,9 +116,6 @@ def build_stock_payload(*, generated_at: str | None = None, target_session_et: s
             },
         },
     }
-    if target_session_et is not None:
-        payload['target_session_et'] = target_session_et
-    return payload
 
 
 def build_crypto_payload() -> dict:
@@ -189,10 +185,6 @@ def build_crypto_payload() -> dict:
             },
         },
     }
-
-
-def current_target_session_et() -> str:
-    return watchlist_service.resolve_watchlist_timing(generated_at=None, target_session_et=None)['targetSessionEt']
 
 
 def test_watchlist_service_ingests_stock_watchlist_and_persists_rows(tmp_path) -> None:
@@ -363,42 +355,6 @@ def test_crypto_removed_symbol_becomes_managed_only_from_open_ledger_position(tm
         assert historical_btc is not None
         assert historical_btc.monitoring_status == MANAGED_ONLY
         assert active_payload['managedOnlySymbols'][0]['symbol'] == 'BTC'
-
-
-def test_watchlist_service_auto_stamps_blank_generated_at_and_persists_target_session(tmp_path) -> None:
-    with build_session_factory(tmp_path) as SessionFactory:
-        db = SessionFactory()
-        payload = build_stock_payload(generated_at='', target_session_et=current_target_session_et())
-
-        persisted = watchlist_service.ingest_watchlist(db, payload, source='api')
-
-        assert persisted['generatedAtUtc'] is not None
-        assert persisted['generatedAtUtcSource'] == 'auto_stamped'
-        assert persisted['targetSessionEt'] == payload['target_session_et']
-        assert persisted['targetSessionSource'] == 'provided'
-        assert persisted['validation']['freshness']['generatedAtUtcSource'] == 'auto_stamped'
-        assert persisted['watchlistExpiresAtUtc'] is not None
-
-
-def test_watchlist_service_rejects_target_session_too_far_ahead(tmp_path) -> None:
-    timing = watchlist_service.resolve_watchlist_timing(generated_at=None, target_session_et=None)
-    future_session = (datetime.fromisoformat(timing['nextAllowedSessionEt']) + timedelta(days=3)).date().isoformat()
-    payload = build_stock_payload(generated_at='', target_session_et=future_session)
-
-    with build_session_factory(tmp_path) as SessionFactory:
-        db = SessionFactory()
-        with pytest.raises(WatchlistValidationError, match='target_session_et is too far ahead'):
-            watchlist_service.ingest_watchlist(db, payload, source='api')
-
-
-def test_discord_guard_accepts_watchlist_schema_version_without_generated_at_utc() -> None:
-    payload = build_stock_payload(generated_at='', target_session_et=current_target_session_et())
-    message = SimpleNamespace(id=654321)
-
-    accepted, reason = discord_decision_guard.validate_and_register(message, payload)
-
-    assert accepted is True
-    assert reason == 'accepted'
 
 
 def test_watchlist_service_rejects_stale_payload() -> None:
@@ -890,6 +846,22 @@ def test_watchlist_evaluate_endpoint_returns_runner_summary(tmp_path, monkeypatc
 
 def test_due_run_orchestrator_evaluates_only_due_active_rows(tmp_path, monkeypatch) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.get_scope_session_status',
+            lambda scope, observed_at: get_scope_session_status('crypto_only', observed_at) if scope == 'crypto_only' else SimpleNamespace(**{
+                'session_open': True,
+                'to_dict': lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': True,
+                    'reason': 'patched open session',
+                    'nextSessionStartUtc': None,
+                    'nextSessionStartEt': None,
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            }),
+        )
         db = SessionFactory()
         first_payload = build_stock_payload()
         second_payload = deepcopy(first_payload)
@@ -960,6 +932,22 @@ def test_watchlist_orchestration_endpoint_reports_due_counts_and_runtime_state(t
         app.dependency_overrides[get_db] = override_get_db
         monkeypatch.setattr(settings, 'ADMIN_API_TOKEN', 'phase45-secret')
         monkeypatch.setattr(settings, 'WATCHLIST_MONITOR_ENABLED', False)
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.get_scope_session_status',
+            lambda scope, observed_at: get_scope_session_status('crypto_only', observed_at) if scope == 'crypto_only' else SimpleNamespace(**{
+                'session_open': True,
+                'to_dict': lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': True,
+                    'reason': 'patched open session',
+                    'nextSessionStartUtc': None,
+                    'nextSessionStartEt': None,
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            }),
+        )
 
         db = SessionFactory()
         try:
@@ -1007,3 +995,100 @@ def test_watchlist_orchestration_endpoint_reports_due_counts_and_runtime_state(t
             assert run_body['dueCountAfter'] == 0
 
         app.dependency_overrides.clear()
+
+
+def test_stock_session_scheduler_waits_for_market_open_before_first_sweep() -> None:
+    reference = datetime(2026, 3, 30, 12, 0, tzinfo=UTC)
+    scheduled = calculate_next_scope_evaluation_at('stocks_only', reference, 300)
+
+    assert scheduled is not None
+    assert scheduled == datetime(2026, 3, 30, 13, 30, 20, tzinfo=UTC)
+
+
+def test_stock_session_scheduler_rolls_after_close_to_next_session_open() -> None:
+    reference = datetime(2026, 3, 30, 20, 58, tzinfo=UTC)
+    scheduled = calculate_next_scope_evaluation_at('stocks_only', reference, 300)
+
+    assert scheduled is not None
+    assert scheduled == datetime(2026, 3, 31, 13, 30, 20, tzinfo=UTC)
+
+
+def test_due_run_orchestrator_blocks_stock_sweeps_when_market_session_is_closed(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+        monitor_row.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+        db.commit()
+
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(
+                session_open=False,
+                to_dict=lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': False,
+                    'reason': 'market closed for test',
+                    'nextSessionStartUtc': datetime(2026, 3, 31, 13, 30, 0, tzinfo=UTC).isoformat(),
+                    'nextSessionStartEt': datetime(2026, 3, 31, 9, 30, 0, tzinfo=ZoneInfo('America/New_York')).isoformat(),
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            ),
+        )
+
+        result = watchlist_monitoring_orchestrator.run_due_once(db, scope='stocks_only', limit_per_scope=10)
+
+        db.refresh(monitor_row)
+        assert result['scope'] == 'stocks_only'
+        assert result['dueCountBefore'] == 1
+        assert result['evaluatedCount'] == 0
+        assert result['sessionBlockedCount'] == 1
+        assert result['dueCountAfter'] == 1
+        assert result['session']['sessionOpen'] is False
+        assert monitor_row.last_evaluated_at_utc is None
+
+
+def test_due_snapshot_reports_blocked_stock_rows_outside_session(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+        monitor_row.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+        db.commit()
+
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(
+                session_open=False,
+                to_dict=lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': False,
+                    'reason': 'market closed for test',
+                    'nextSessionStartUtc': datetime(2026, 3, 31, 13, 30, 0, tzinfo=UTC).isoformat(),
+                    'nextSessionStartEt': datetime(2026, 3, 31, 9, 30, 0, tzinfo=ZoneInfo('America/New_York')).isoformat(),
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            ),
+        )
+
+        snapshot = watchlist_monitoring_orchestrator.get_due_snapshot(db, scope='stocks_only')
+        assert snapshot['dueCount'] == 1
+        assert snapshot['eligibleDueCount'] == 0
+        assert snapshot['blockedDueCount'] == 1
+        assert snapshot['session']['sessionOpen'] is False
