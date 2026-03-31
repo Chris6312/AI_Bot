@@ -42,7 +42,11 @@ function stateTone(state?: string | null) {
       return 'good' as const
     case 'PAUSED':
     case 'DEGRADED':
+    case 'STALE':
+    case 'STARTING':
       return 'warn' as const
+    case 'DISABLED':
+      return 'muted' as const
     case 'LOCKED':
     case 'READ_ONLY':
     case 'REJECTED':
@@ -141,12 +145,12 @@ export default function Settings() {
           </>
         }
         title="Control plane truth board"
-        description="Real dependency probes, gate observations, and runtime controls. This page is the bot's actual pulse, not a decorative heartbeat lamp."
+        description="Real dependency probes, worker loop health, gate observations, and runtime controls. This page is the bot's actual pulse, not a decorative heartbeat lamp."
         aside={
           <>
             <StatusPill tone={getStatusMeta(status?.controlPlane.state).tone} label={`Control ${getStatusMeta(status?.controlPlane.state).canonicalLabel}`} />
             <StatusPill tone={getStatusMeta(status?.executionGate.state).tone} label={`Gate ${getStatusMeta(status?.executionGate.state).canonicalLabel}`} />
-            <StatusPill tone={runtimeVisibility?.dependencies.summary.criticalReady ? 'good' : 'warn'} label={runtimeVisibility?.dependencies.summary.criticalReady ? 'Dependencies ready' : 'Dependencies degraded'} />
+            <StatusPill tone={runtimeVisibility?.dependencies.summary.operationalReady ? 'good' : 'warn'} label={runtimeVisibility?.dependencies.summary.operationalReady ? 'Operationally ready' : 'Operational review needed'} />
           </>
         }
       />
@@ -154,7 +158,7 @@ export default function Settings() {
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
         <MetricCard label="Control state" value={getStatusMeta(status?.controlPlane.state).canonicalLabel} detail={status?.controlPlane.reason ?? 'No control-plane status returned'} icon={<Shield className="h-5 w-5" />} />
         <MetricCard label="Gate" value={getStatusMeta(status?.executionGate.state).canonicalLabel} detail={status?.executionGate.reason || (status?.executionGate.allowed ? 'Execution path armed' : 'Execution currently blocked')} icon={<ArrowRightLeft className="h-5 w-5" />} />
-        <MetricCard label="Dependencies" value={`${runtimeVisibility?.dependencies.summary.readyCount ?? 0}/${Object.keys(dependencyChecks ?? {}).length || 0}`} detail={runtimeVisibility?.dependencies.summary.criticalReady ? 'Critical probes healthy' : 'One or more critical probes degraded'} icon={<Wifi className="h-5 w-5" />} />
+        <MetricCard label="Operational readiness" value={runtimeVisibility?.dependencies.summary.operationalReady ? 'Ready' : 'Review'} detail={runtimeVisibility?.dependencies.summary.workerReady ? 'Dependency and worker probes look healthy' : 'At least one worker or dependency probe needs attention'} icon={<Wifi className="h-5 w-5" />} />
         <MetricCard label="Last heartbeat" value={formatRelative(status?.lastHeartbeat)} detail={formatAbsolute(status?.lastHeartbeat)} icon={<Clock3 className="h-5 w-5" />} />
       </div>
 
@@ -253,8 +257,8 @@ export default function Settings() {
                 action={
                   <div className="flex flex-wrap gap-2">
                     <StatusBadge tone={stateTone(status?.controlPlane.state)}>{status?.controlPlane.state ?? 'UNKNOWN'}</StatusBadge>
-                    <StatusBadge tone={runtimeVisibility?.dependencies.summary.criticalReady ? 'good' : 'warn'}>
-                      {runtimeVisibility?.dependencies.summary.criticalReady ? 'Critical ready' : 'Critical degraded'}
+                    <StatusBadge tone={runtimeVisibility?.dependencies.summary.operationalReady ? 'good' : 'warn'}>
+                      {runtimeVisibility?.dependencies.summary.operationalReady ? 'Operationally ready' : 'Operational review'}
                     </StatusBadge>
                   </div>
                 }
@@ -327,7 +331,7 @@ export default function Settings() {
           <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5">
             <div className="flex items-center gap-2 text-sm font-semibold text-slate-200">
               <Wifi className="h-4 w-4 text-emerald-300" />
-              Dependency probes
+              Dependency & worker probes
             </div>
             <div className="mt-4 space-y-3">
               {dependencyChecks ? (
@@ -346,6 +350,8 @@ export default function Settings() {
 
             <div className="mt-4 space-y-3">
               <SummaryRow label="Recent rejections" value={String(recentRejections.length)} />
+              <SummaryRow label="Stale probes" value={String(runtimeVisibility?.dependencies.summary.staleCount ?? 0)} />
+              <SummaryRow label="Disabled probes" value={String(runtimeVisibility?.dependencies.summary.disabledCount ?? 0)} />
               <SummaryRow label="Last rejection" value={formatRelative(gateSummary?.lastRejected?.recordedAtUtc ?? null)} />
               <SummaryRow label="Last allowed" value={formatRelative(gateSummary?.lastAllowed?.recordedAtUtc ?? null)} />
               <SummaryRow label="Observed" value={formatRelative(runtimeVisibility?.capturedAtUtc ?? null)} />
@@ -378,7 +384,7 @@ export default function Settings() {
             <ul className="mt-4 space-y-3 text-sm leading-6 text-slate-400">
               <li>The execution gate state matters more than the button color.</li>
               <li>Dependency readiness is broker truth, not optimism.</li>
-              <li>Recent rejections are often the fastest clue when a system rail has gone crooked.</li>
+              <li>Worker loops can go stale even when the API still answers. That is why this board now probes the rails, not just the paint.</li>
             </ul>
           </section>
         </aside>
@@ -418,18 +424,25 @@ function ActionCard({
 }
 
 function DependencyTruthCard({ check }: { check: DependencyCheck }) {
+  const details = Object.entries(check.details ?? {})
+    .filter(([, value]) => value !== null && value !== undefined && value !== '')
+    .slice(0, 2)
+
   return (
     <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
       <div className="flex items-start justify-between gap-3">
         <div>
           <div className="font-semibold text-white">{humanize(check.name)}</div>
-          <div className="mt-1 text-sm text-slate-400">{check.reason}</div>
+          <div className="mt-1 text-sm text-slate-400">{check.reason || 'Probe healthy.'}</div>
         </div>
         <StatusBadge tone={stateTone(check.state)}>{check.state}</StatusBadge>
       </div>
       <div className="mt-3 grid grid-cols-1 gap-2 text-sm text-slate-400">
         <MiniMetric label="Ready" value={check.ready ? 'true' : 'false'} />
         <MiniMetric label="Checked" value={formatRelative(check.checkedAtUtc)} />
+        {details.map(([key, value]) => (
+          <MiniMetric key={key} label={humanize(key)} value={formatDetailValue(value)} />
+        ))}
       </div>
     </div>
   )
@@ -531,4 +544,13 @@ function humanize(value: string) {
     .replace(/([a-z])([A-Z])/g, '$1 $2')
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+function formatDetailValue(value: unknown) {
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : '—'
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) return `${value.length} items`
+  if (value && typeof value === 'object') return 'Structured detail'
+  return '—'
 }

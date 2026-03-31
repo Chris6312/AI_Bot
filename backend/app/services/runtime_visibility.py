@@ -7,9 +7,12 @@ from threading import Lock
 from typing import Any
 
 from app.core.config import settings
+from app.core.database import SessionLocal
 from app.services.control_plane import get_control_plane_status, get_execution_gate_status
 from app.services.kraken_service import kraken_service
 from app.services.tradier_client import tradier_client
+from app.services.watchlist_exit_worker import watchlist_exit_worker
+from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
 
 UTC = timezone.utc
 
@@ -119,17 +122,27 @@ class RuntimeVisibilityService:
                 'tradierPaper': self._probe_tradier('PAPER', observed_at),
                 'tradierLive': self._probe_tradier('LIVE', observed_at),
                 'krakenMarketData': self._probe_kraken(observed_at),
+                'watchlistMonitor': self._probe_watchlist_monitor(observed_at),
+                'watchlistExitWorker': self._probe_watchlist_exit_worker(observed_at),
             },
         }
         checks = payload['checks']
         ready_count = sum(1 for item in checks.values() if item['ready'])
-        missing_count = sum(1 for item in checks.values() if item['state'] == 'MISSING')
         degraded_count = sum(1 for item in checks.values() if item['state'] == 'DEGRADED')
+        missing_count = sum(1 for item in checks.values() if item['state'] == 'MISSING')
+        stale_count = sum(1 for item in checks.values() if item['state'] == 'STALE')
+        disabled_count = sum(1 for item in checks.values() if item['state'] == 'DISABLED')
+        critical_ready = bool(checks['tradierPaper']['ready'] and checks['krakenMarketData']['ready'])
+        worker_ready = bool(checks['watchlistMonitor']['ready'] and checks['watchlistExitWorker']['ready'])
         payload['summary'] = {
             'readyCount': ready_count,
             'degradedCount': degraded_count,
             'missingCount': missing_count,
-            'criticalReady': bool(checks['tradierPaper']['ready'] and checks['krakenMarketData']['ready']),
+            'staleCount': stale_count,
+            'disabledCount': disabled_count,
+            'criticalReady': critical_ready,
+            'workerReady': worker_ready,
+            'operationalReady': bool(critical_ready and worker_ready),
         }
         return payload
 
@@ -204,6 +217,164 @@ class RuntimeVisibilityService:
             'checkedAtUtc': observed_at.isoformat(),
             'details': {'pair': probe_pair},
         }
+
+    def _probe_watchlist_monitor(self, observed_at: datetime) -> dict[str, Any]:
+        db = SessionLocal()
+        try:
+            status = watchlist_monitoring_orchestrator.get_runtime_status(db)
+        except Exception as exc:  # pragma: no cover - exercised by tests with monkeypatch
+            return {
+                'name': 'Watchlist Monitor',
+                'state': 'DEGRADED',
+                'ready': False,
+                'reason': str(exc),
+                'checkedAtUtc': observed_at.isoformat(),
+                'details': {},
+            }
+        finally:
+            db.close()
+        return self._build_worker_probe(
+            name='Watchlist Monitor',
+            observed_at=observed_at,
+            enabled=bool(status.get('enabled')),
+            poll_seconds=int(status.get('pollSeconds') or 0),
+            last_started_at=status.get('lastStartedAtUtc'),
+            last_finished_at=status.get('lastFinishedAtUtc'),
+            last_error=status.get('lastError'),
+            consecutive_failures=int(status.get('consecutiveFailures') or 0),
+            details={
+                'dueSnapshot': status.get('dueSnapshot'),
+                'lastRunSummary': status.get('lastRunSummary') or {},
+            },
+        )
+
+    def _probe_watchlist_exit_worker(self, observed_at: datetime) -> dict[str, Any]:
+        db = SessionLocal()
+        try:
+            status = watchlist_exit_worker.get_status(db)
+        except Exception as exc:  # pragma: no cover - exercised by tests with monkeypatch
+            return {
+                'name': 'Watchlist Exit Worker',
+                'state': 'DEGRADED',
+                'ready': False,
+                'reason': str(exc),
+                'checkedAtUtc': observed_at.isoformat(),
+                'details': {},
+            }
+        finally:
+            db.close()
+        return self._build_worker_probe(
+            name='Watchlist Exit Worker',
+            observed_at=observed_at,
+            enabled=bool(status.get('enabled')),
+            poll_seconds=int(status.get('pollSeconds') or 0),
+            last_started_at=status.get('lastStartedAtUtc'),
+            last_finished_at=status.get('lastFinishedAtUtc'),
+            last_error=status.get('lastError'),
+            consecutive_failures=int(status.get('consecutiveFailures') or 0),
+            details={
+                'summary': status.get('summary') or {},
+                'session': status.get('session') or {},
+                'lastRunSummary': status.get('lastRunSummary') or {},
+            },
+        )
+
+    def _build_worker_probe(
+        self,
+        *,
+        name: str,
+        observed_at: datetime,
+        enabled: bool,
+        poll_seconds: int,
+        last_started_at: str | None,
+        last_finished_at: str | None,
+        last_error: str | None,
+        consecutive_failures: int,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload_details: dict[str, Any] = {
+            'pollSeconds': poll_seconds,
+            'lastStartedAtUtc': last_started_at,
+            'lastFinishedAtUtc': last_finished_at,
+            'consecutiveFailures': consecutive_failures,
+        }
+        if details:
+            payload_details.update(details)
+
+        if not enabled:
+            return {
+                'name': name,
+                'state': 'DISABLED',
+                'ready': True,
+                'reason': 'Worker loop is disabled by configuration.',
+                'checkedAtUtc': observed_at.isoformat(),
+                'details': payload_details,
+            }
+
+        if last_error and consecutive_failures > 0:
+            return {
+                'name': name,
+                'state': 'DEGRADED',
+                'ready': False,
+                'reason': last_error,
+                'checkedAtUtc': observed_at.isoformat(),
+                'details': payload_details,
+            }
+
+        freshness_window = max(poll_seconds * 3, 30)
+        fresh_cutoff = observed_at - timedelta(seconds=freshness_window)
+        finished_at = self._parse_timestamp(last_finished_at)
+        started_at = self._parse_timestamp(last_started_at)
+
+        if finished_at and finished_at >= fresh_cutoff:
+            return {
+                'name': name,
+                'state': 'READY',
+                'ready': True,
+                'reason': '',
+                'checkedAtUtc': observed_at.isoformat(),
+                'details': payload_details,
+            }
+
+        if started_at and started_at >= fresh_cutoff:
+            return {
+                'name': name,
+                'state': 'READY',
+                'ready': True,
+                'reason': 'Worker loop is running its current sweep.',
+                'checkedAtUtc': observed_at.isoformat(),
+                'details': payload_details,
+            }
+
+        last_seen = finished_at or started_at
+        if last_seen is None:
+            return {
+                'name': name,
+                'state': 'DEGRADED',
+                'ready': False,
+                'reason': 'Worker loop has not reported a run yet.',
+                'checkedAtUtc': observed_at.isoformat(),
+                'details': payload_details,
+            }
+
+        age_seconds = int((observed_at - last_seen).total_seconds())
+        return {
+            'name': name,
+            'state': 'STALE',
+            'ready': False,
+            'reason': f'Last worker activity was {age_seconds}s ago, outside the expected poll window.',
+            'checkedAtUtc': observed_at.isoformat(),
+            'details': payload_details,
+        }
+
+    @staticmethod
+    def _parse_timestamp(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
 
 
 runtime_visibility_service = RuntimeVisibilityService()

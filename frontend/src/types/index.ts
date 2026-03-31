@@ -34,13 +34,13 @@ export interface DependencyVisibility {
     readyCount: number
     degradedCount: number
     missingCount: number
+    staleCount?: number
+    disabledCount?: number
     criticalReady: boolean
+    workerReady?: boolean
+    operationalReady?: boolean
   }
-  checks: {
-    tradierPaper: DependencyCheck
-    tradierLive: DependencyCheck
-    krakenMarketData: DependencyCheck
-  }
+  checks: Record<string, DependencyCheck>
 }
 
 export interface GateCheck {
