@@ -911,7 +911,7 @@ class WatchlistService:
         decision_state, decision_reason = _decision_for_status(row.monitoring_status)
         interval_seconds = self._calculate_evaluation_interval_seconds(row.bot_timeframes or [])
         next_evaluation_at = self._calculate_next_evaluation_at(row.scope, observed_at, interval_seconds) if row.monitoring_status != INACTIVE else None
-        context = {
+        base_context = {
             'setupTemplate': row.setup_template,
             'exitTemplate': row.exit_template,
             'botTimeframes': row.bot_timeframes,
@@ -931,7 +931,7 @@ class WatchlistService:
                 monitoring_status=row.monitoring_status,
                 latest_decision_state=decision_state,
                 latest_decision_reason=decision_reason,
-                decision_context_json=context,
+                decision_context_json=base_context,
                 required_timeframes_json=row.bot_timeframes,
                 evaluation_interval_seconds=interval_seconds,
                 last_decision_at_utc=observed_at,
@@ -956,8 +956,10 @@ class WatchlistService:
         if should_reset_decision and monitor_state.latest_decision_reason != decision_reason:
             monitor_state.latest_decision_reason = decision_reason
             changed = True
-        if monitor_state.decision_context_json != context:
-            monitor_state.decision_context_json = context
+        merged_context = dict(monitor_state.decision_context_json or {})
+        merged_context.update(base_context)
+        if monitor_state.decision_context_json != merged_context:
+            monitor_state.decision_context_json = merged_context
             changed = True
         if required_timeframes_changed:
             monitor_state.required_timeframes_json = row.bot_timeframes

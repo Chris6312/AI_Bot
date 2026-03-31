@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { useMemo } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow, format } from 'date-fns'
 import { BrainCircuit, ClipboardList, FileSearch, Siren, Shield, TrendingUp } from 'lucide-react'
@@ -36,6 +36,8 @@ type AuditEvent = {
   tone: Tone
   statusLabel: string
   to: string
+  symbol?: string | null
+  scope?: 'stocks_only' | 'crypto_only' | null
 }
 
 const scopeLabels = {
@@ -62,8 +64,29 @@ function gateTone(allowed: boolean): Tone {
   return allowed ? 'good' : 'danger'
 }
 
+function buildLaneHref(base: string, options: { lane?: Exclude<AuditLane, 'all'> | AuditLane; symbol?: string | null; scope?: 'stocks_only' | 'crypto_only' | null } = {}) {
+  const params = new URLSearchParams()
+  if (options.lane && options.lane !== 'all') params.set('lane', options.lane)
+  if (options.symbol) params.set('symbol', options.symbol)
+  if (options.scope) params.set('scope', options.scope)
+  const query = params.toString()
+  return query ? `${base}?${query}` : base
+}
+
+function decisionScope(decision: { assetClass?: string | null } | { market?: string | null }): 'stocks_only' | 'crypto_only' | null {
+  const assetClass = 'assetClass' in decision ? String(decision.assetClass ?? '').toLowerCase() : ''
+  const market = 'market' in decision ? String(decision.market ?? '').toUpperCase() : ''
+  if (assetClass === 'stock' || market === 'STOCK') return 'stocks_only'
+  if (assetClass === 'crypto' || market === 'CRYPTO') return 'crypto_only'
+  return null
+}
+
 export default function AuditTrail() {
-  const [lane, setLane] = useState<AuditLane>('all')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const laneParam = searchParams.get('lane')
+  const lane = (['all', 'receipt', 'gate', 'stock', 'crypto', 'ai'] as AuditLane[]).includes((laneParam as AuditLane) ?? 'all') ? ((laneParam as AuditLane) || 'all') : 'all'
+  const symbolFilter = (searchParams.get('symbol') ?? '').trim().toUpperCase()
+  const scopeFilter = (searchParams.get('scope') ?? '').trim()
 
   const { data: stockWatchlist } = useQuery<WatchlistUploadRecord | null>({
     queryKey: ['activeWatchlist', 'stocks_only'],
@@ -113,7 +136,8 @@ export default function AuditTrail() {
         timestamp: record.receivedAtUtc ?? null,
         tone: isHealthyValidationStatus(record.validationStatus) ? 'good' : 'warn',
         statusLabel: getStatusMeta(record.validationStatus).canonicalLabel,
-        to: '/watchlists',
+        to: buildLaneHref('/watchlists', { scope: record.scope }),
+        scope: record.scope,
       }))
 
     const gateEvents: AuditEvent[] = (runtimeVisibility?.gate.recent ?? []).map((decision) => ({
@@ -125,7 +149,9 @@ export default function AuditTrail() {
       timestamp: decision.recordedAtUtc,
       tone: gateTone(decision.allowed),
       statusLabel: getStatusMeta(decision.state).canonicalLabel,
-      to: '/runtime',
+      to: buildLaneHref('/monitoring', { scope: decisionScope(decision), symbol: decision.symbol }),
+      symbol: decision.symbol,
+      scope: decisionScope(decision),
     }))
 
     const stockEvents: AuditEvent[] = stockHistory.map((row) => ({
@@ -137,7 +163,9 @@ export default function AuditTrail() {
       timestamp: row.lastFillAt ?? row.submittedAt ?? null,
       tone: row.status.toUpperCase().includes('REJECT') ? 'danger' : row.status.toUpperCase().includes('FILL') ? 'good' : 'info',
       statusLabel: getStatusMeta(row.status).canonicalLabel,
-      to: '/positions',
+      to: buildLaneHref('/monitoring', { scope: 'stocks_only', symbol: row.symbol }),
+      symbol: row.symbol,
+      scope: 'stocks_only',
     }))
 
     const cryptoEvents: AuditEvent[] = cryptoHistory.map((row) => ({
@@ -149,7 +177,9 @@ export default function AuditTrail() {
       timestamp: row.timestamp,
       tone: row.status.toUpperCase().includes('REJECT') ? 'danger' : row.side === 'SELL' ? 'warn' : 'good',
       statusLabel: getStatusMeta(row.status).canonicalLabel,
-      to: '/positions',
+      to: buildLaneHref('/monitoring', { scope: 'crypto_only', symbol: row.symbol ?? row.pair ?? undefined }),
+      symbol: row.symbol ?? row.pair ?? null,
+      scope: 'crypto_only',
     }))
 
     const aiEvents: AuditEvent[] = aiDecisions.map((row) => ({
@@ -161,7 +191,9 @@ export default function AuditTrail() {
       timestamp: row.timestamp,
       tone: row.rejected ? 'danger' : row.executed ? 'good' : 'info',
       statusLabel: row.rejected ? 'Blocked' : row.executed ? 'Healthy' : 'Warning',
-      to: '/audit',
+      to: buildLaneHref('/watchlists', { scope: decisionScope(row), symbol: row.symbol }),
+      symbol: row.symbol,
+      scope: decisionScope(row),
     }))
 
     return [...receiptEvents, ...gateEvents, ...stockEvents, ...cryptoEvents, ...aiEvents].sort((a, b) => {
@@ -171,7 +203,12 @@ export default function AuditTrail() {
     })
   }, [aiDecisions, cryptoHistory, cryptoWatchlist, runtimeVisibility?.gate.recent, stockHistory, stockWatchlist])
 
-  const filteredEvents = lane === 'all' ? events : events.filter((event) => event.lane === lane)
+  const filteredEvents = events.filter((event) => {
+    if (lane !== 'all' && event.lane !== lane) return false
+    if (symbolFilter && String(event.symbol ?? '').toUpperCase() != symbolFilter) return false
+    if (scopeFilter && String(event.scope ?? '') != scopeFilter && event.scope) return false
+    return true
+  })
   const latestAllowed = runtimeVisibility?.gate.summary.lastAllowed
   const latestRejected = runtimeVisibility?.gate.summary.lastRejected
 
@@ -191,6 +228,7 @@ export default function AuditTrail() {
             <StatusPill tone={stockWatchlist ? 'good' : 'warn'} label={stockWatchlist ? 'Stock receipt present' : 'No stock receipt'} />
             <StatusPill tone={cryptoWatchlist ? 'good' : 'warn'} label={cryptoWatchlist ? 'Crypto receipt present' : 'No crypto receipt'} />
             <StatusPill tone={(runtimeVisibility?.gate.summary.rejectedCount ?? 0) > 0 ? 'warn' : 'good'} label={`${runtimeVisibility?.gate.summary.rejectedCount ?? 0} gate rejections`} />
+            {symbolFilter ? <StatusPill tone="info" label={`Filtered: ${symbolFilter}`} /> : null}
           </>
         }
       />
@@ -211,7 +249,12 @@ export default function AuditTrail() {
             (['all', 'receipt', 'gate', 'stock', 'crypto', 'ai'] as AuditLane[]).map((option) => (
               <button
                 key={option}
-                onClick={() => setLane(option)}
+                onClick={() => {
+                  const next = new URLSearchParams(searchParams)
+                  if (option === 'all') next.delete('lane')
+                  else next.set('lane', option)
+                  setSearchParams(next)
+                }}
                 className={`rounded-full px-3 py-2 text-sm transition ${lane === option ? 'border border-cyan-700 bg-cyan-500/10 text-cyan-200' : 'border border-slate-700 bg-slate-950/60 text-slate-300 hover:border-slate-600'}`}
               >
                 {option === 'all' ? 'All lanes' : option}

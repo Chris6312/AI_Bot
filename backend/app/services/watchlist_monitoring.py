@@ -2,24 +2,36 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.models.order_intent import OrderIntent
+from app.models.position import Position
 from app.models.watchlist_monitor_state import WatchlistMonitorState
+from app.models.watchlist_symbol import WatchlistSymbol
+from app.services.execution_lifecycle import execution_lifecycle
 from app.services.market_sessions import get_scope_session_status
-from app.services.template_evaluator import template_evaluation_service
+from app.services.position_sizer import position_sizer
+from app.services.pre_trade_gate import pre_trade_gate
+from app.services.runtime_state import runtime_state
+from app.services.template_evaluator import ENTRY_CANDIDATE, template_evaluation_service
 from app.services.kraken_service import kraken_service
+from app.services.tradier_client import tradier_client
 from app.services.watchlist_service import ACTIVE, MANAGED_ONLY, PENDING_EVALUATION, WATCHLIST_SCOPE, watchlist_service
 
 logger = logging.getLogger(__name__)
 
 ELIGIBLE_DUE_STATUSES = (ACTIVE, MANAGED_ONLY)
 DEFAULT_SCOPES: tuple[WATCHLIST_SCOPE, ...] = ('stocks_only', 'crypto_only')
+ENTRY_EXECUTION_SOURCE = 'WATCHLIST_MONITOR_ENTRY'
+ACTIVE_ENTRY_INTENT_STATUSES = {'READY', 'SUBMITTED', 'PARTIALLY_FILLED'}
 
 
 @dataclass
@@ -183,6 +195,11 @@ class WatchlistMonitoringOrchestrator:
                 'totalBiasConflict': 0,
                 'totalEvaluationBlocked': 0,
                 'totalSessionBlocked': 0,
+                'totalEntryIntentCount': 0,
+                'totalEntrySubmitted': 0,
+                'totalEntryFilled': 0,
+                'totalEntryRejected': 0,
+                'totalEntrySkipped': 0,
             },
         }
 
@@ -208,6 +225,15 @@ class WatchlistMonitoringOrchestrator:
                 },
                 'rows': [],
                 'sessionBlockedCount': 0,
+                'entryExecution': {
+                    'candidateCount': 0,
+                    'intentCount': 0,
+                    'submittedCount': 0,
+                    'filledCount': 0,
+                    'rejectedCount': 0,
+                    'skippedCount': 0,
+                    'rows': [],
+                },
                 'monitoringSnapshot': watchlist_service.get_monitoring_snapshot(db, scope=scope_value, include_inactive=False),
             }
             if due_before > 0 and scope_value == 'stocks_only' and not session_status.session_open:
@@ -224,6 +250,10 @@ class WatchlistMonitoringOrchestrator:
                 scope_result['session'] = session_status.to_dict()
                 scope_result['sessionBlockedCount'] = 0
                 scope_result['dueCountBefore'] = due_before
+                if scope_value == 'stocks_only':
+                    entry_execution = self._execute_entry_candidates(db, evaluated_scope['rows'])
+                    scope_result['entryExecution'] = entry_execution
+                    scope_result['monitoringSnapshot'] = watchlist_service.get_monitoring_snapshot(db, scope=scope_value, include_inactive=False)
                 scope_result['dueCountAfter'] = self._count_due_rows(db, scope=scope_value, observed_at=datetime.now(UTC))
                 result['summary']['scopesWithDueRows'] += 1
 
@@ -239,6 +269,11 @@ class WatchlistMonitoringOrchestrator:
             result['summary']['totalBiasConflict'] += scope_result['summary']['biasConflictCount']
             result['summary']['totalEvaluationBlocked'] += scope_result['summary']['evaluationBlockedCount']
             result['summary']['totalSessionBlocked'] += scope_result.get('sessionBlockedCount', 0)
+            result['summary']['totalEntryIntentCount'] += scope_result.get('entryExecution', {}).get('intentCount', 0)
+            result['summary']['totalEntrySubmitted'] += scope_result.get('entryExecution', {}).get('submittedCount', 0)
+            result['summary']['totalEntryFilled'] += scope_result.get('entryExecution', {}).get('filledCount', 0)
+            result['summary']['totalEntryRejected'] += scope_result.get('entryExecution', {}).get('rejectedCount', 0)
+            result['summary']['totalEntrySkipped'] += scope_result.get('entryExecution', {}).get('skippedCount', 0)
 
         if scope is not None:
             return result['scopes'][scope]
@@ -283,6 +318,405 @@ class WatchlistMonitoringOrchestrator:
             finally:
                 db.close()
             await asyncio.sleep(self._runtime.poll_seconds)
+
+    def _execute_entry_candidates(self, db: Session, evaluated_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        runtime = runtime_state.get()
+        result: dict[str, Any] = {
+            'candidateCount': 0,
+            'intentCount': 0,
+            'submittedCount': 0,
+            'filledCount': 0,
+            'rejectedCount': 0,
+            'skippedCount': 0,
+            'rows': [],
+        }
+        if not runtime.running:
+            for row in evaluated_rows:
+                if str(row.get('scope') or '') == 'stocks_only' and str(row.get('latestDecisionState') or '') == ENTRY_CANDIDATE:
+                    result['candidateCount'] += 1
+                    result['skippedCount'] += 1
+                    result['rows'].append({
+                        'symbol': str(row.get('symbol') or '').upper(),
+                        'action': 'SKIPPED',
+                        'reason': 'RUNTIME_STOPPED',
+                        'intentId': None,
+                        'submittedOrderId': None,
+                        'positionId': None,
+                        'tradeId': None,
+                    })
+            return result
+
+        candidate_symbols = [
+            str(row.get('symbol') or '').upper()
+            for row in evaluated_rows
+            if str(row.get('scope') or '') == 'stocks_only' and str(row.get('latestDecisionState') or '') == ENTRY_CANDIDATE
+        ]
+        if not candidate_symbols:
+            return result
+
+        query = (
+            db.query(WatchlistMonitorState, WatchlistSymbol)
+            .join(WatchlistSymbol, WatchlistSymbol.id == WatchlistMonitorState.watchlist_symbol_id)
+            .filter(
+                WatchlistMonitorState.scope == 'stocks_only',
+                WatchlistMonitorState.symbol.in_(candidate_symbols),
+            )
+            .order_by(WatchlistSymbol.priority_rank.asc(), WatchlistSymbol.id.asc())
+        )
+
+        account_cache: dict[str, Any] = {
+            'loaded': False,
+            'error': None,
+            'account': None,
+            'cashAvailable': None,
+        }
+
+        for monitor_state, symbol_row in query.all():
+            result['candidateCount'] += 1
+            candidate = self._submit_stock_entry_candidate(
+                db,
+                monitor_state=monitor_state,
+                symbol_row=symbol_row,
+                mode=runtime.stock_mode,
+                account_cache=account_cache,
+            )
+            result['rows'].append(candidate)
+            if candidate.get('intentId'):
+                result['intentCount'] += 1
+            action = str(candidate.get('action') or '')
+            if action in {'ENTRY_SUBMITTED', 'ENTRY_FILLED'}:
+                result['submittedCount'] += 1
+            if action == 'ENTRY_FILLED':
+                result['filledCount'] += 1
+            elif action in {'GATE_REJECTED', 'SUBMISSION_REJECTED'}:
+                result['rejectedCount'] += 1
+            elif action not in {'ENTRY_SUBMITTED'}:
+                result['skippedCount'] += 1
+        return result
+
+    def _submit_stock_entry_candidate(
+        self,
+        db: Session,
+        *,
+        monitor_state: WatchlistMonitorState,
+        symbol_row: WatchlistSymbol,
+        mode: str,
+        account_cache: dict[str, Any],
+    ) -> dict[str, Any]:
+        symbol = str(symbol_row.symbol or '').upper()
+        payload: dict[str, Any] = {
+            'symbol': symbol,
+            'uploadId': symbol_row.upload_id,
+            'priorityRank': symbol_row.priority_rank,
+            'setupTemplate': symbol_row.setup_template,
+            'exitTemplate': symbol_row.exit_template,
+            'action': None,
+            'reason': None,
+            'intentId': None,
+            'submittedOrderId': None,
+            'positionId': None,
+            'tradeId': None,
+        }
+
+        if self._has_open_position(db, symbol):
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'OPEN_POSITION_EXISTS'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        if self._has_active_entry_intent(db, symbol):
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'ACTIVE_ENTRY_INTENT_EXISTS'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        latest_details = dict((monitor_state.decision_context_json or {}).get('latestEvaluation', {}).get('details', {}) or {})
+        current_price = self._safe_float(latest_details.get('currentPrice'))
+        if current_price <= 0:
+            quote = tradier_client.get_quote_sync(symbol, mode=mode)
+            current_price = self._safe_float((quote or {}).get('last') or (quote or {}).get('close'))
+        if current_price <= 0:
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'ENTRY_PRICE_UNAVAILABLE'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        account, cash_available, account_error = self._get_account_snapshot(mode=mode, account_cache=account_cache)
+        if account_error:
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = f'ACCOUNT_SNAPSHOT_UNAVAILABLE: {account_error}'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+        if cash_available <= 0:
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'NO_CASH_AVAILABLE'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        positions = position_sizer.calculate_stock_positions(
+            [{'ticker': symbol}],
+            cash_available,
+            prices={symbol: current_price},
+        )
+        sized = next((row for row in positions if int(row.get('shares') or 0) > 0), None)
+        if sized is None:
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'POSITION_SIZER_RETURNED_ZERO'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        shares = int(sized.get('shares') or 0)
+        gate_context = {
+            'watchlist': {
+                'uploadId': symbol_row.upload_id,
+                'scope': symbol_row.scope,
+                'priorityRank': symbol_row.priority_rank,
+                'tier': symbol_row.tier,
+                'bias': symbol_row.bias,
+                'setupTemplate': symbol_row.setup_template,
+                'exitTemplate': symbol_row.exit_template,
+                'riskFlags': symbol_row.risk_flags or [],
+                'botTimeframes': symbol_row.bot_timeframes or [],
+            }
+        }
+        gate = pre_trade_gate.evaluate_stock_order_sync(
+            ticker=symbol,
+            shares=shares,
+            mode=mode,
+            account=account,
+            db=db,
+            execution_source=ENTRY_EXECUTION_SOURCE,
+            decision_context=gate_context,
+        )
+        gate_payload = gate.to_dict()
+
+        account_id = str(
+            account.get('accountId')
+            or account.get('account_id')
+            or tradier_client._credentials_for_mode(mode).get('account_id')
+            or 'TRADIER'
+        )
+
+        if not gate.allowed:
+            reject_intent = execution_lifecycle.create_order_intent(
+                db,
+                account_id=account_id,
+                asset_class='stock',
+                symbol=symbol,
+                side='BUY',
+                requested_quantity=shares,
+                requested_price=current_price,
+                execution_source=ENTRY_EXECUTION_SOURCE,
+                context={
+                    'mode': mode,
+                    'watchlist': gate_context['watchlist'],
+                    'estimatedValue': sized.get('estimated_value'),
+                    'positionPct': sized.get('position_pct'),
+                    'gate': gate_payload,
+                },
+            )
+            execution_lifecycle.mark_rejected_by_gate(
+                db,
+                reject_intent,
+                reason=gate.rejection_reason or 'Pre-trade gate rejected the watchlist entry.',
+                gate_payload=gate_payload,
+            )
+            payload.update({
+                'action': 'GATE_REJECTED',
+                'reason': gate.rejection_reason or 'Pre-trade gate rejected the watchlist entry.',
+                'intentId': reject_intent.intent_id,
+            })
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        intent = execution_lifecycle.create_order_intent(
+            db,
+            account_id=account_id,
+            asset_class='stock',
+            symbol=symbol,
+            side='BUY',
+            requested_quantity=shares,
+            requested_price=current_price,
+            execution_source=ENTRY_EXECUTION_SOURCE,
+            context={
+                'mode': mode,
+                'watchlist': gate_context['watchlist'],
+                'estimatedValue': sized.get('estimated_value'),
+                'positionPct': sized.get('position_pct'),
+                'gate': gate_payload,
+            },
+        )
+        payload['intentId'] = intent.intent_id
+
+        try:
+            order_snapshot = tradier_client.place_order_sync(
+                ticker=symbol,
+                qty=shares,
+                side='buy',
+                mode=mode,
+                order_type='market',
+            )
+            execution_lifecycle.record_submission(db, intent, order_snapshot)
+        except Exception as exc:
+            execution_lifecycle.record_event(
+                db,
+                intent,
+                event_type='ORDER_SUBMISSION_FAILED',
+                status='REJECTED',
+                message=f'Watchlist entry submission failed for {symbol}: {exc}',
+                payload={'error': str(exc), 'gate': gate_payload},
+            )
+            intent.status = 'REJECTED'
+            intent.rejection_reason = str(exc)
+            db.commit()
+            db.refresh(intent)
+            payload.update({
+                'action': 'SUBMISSION_REJECTED',
+                'reason': str(exc),
+                'intentId': intent.intent_id,
+            })
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        confirmed_order = self._confirm_stock_order_sync(order_snapshot, mode=mode)
+        intent = execution_lifecycle.refresh_from_order_snapshot(db, intent, confirmed_order)
+        fill_record = execution_lifecycle.materialize_stock_fill(
+            db,
+            intent,
+            strategy='WATCHLIST_ENTRY',
+            stop_loss=current_price * (1 - settings.STOP_LOSS_PCT),
+            profit_target=current_price * (1 + settings.PROFIT_TARGET_PCT),
+            trailing_stop=current_price * (1 - settings.TRAILING_STOP_PCT),
+            current_price=current_price,
+        )
+        if fill_record is not None:
+            payload.update({
+                'action': 'ENTRY_FILLED',
+                'reason': intent.rejection_reason,
+                'submittedOrderId': intent.submitted_order_id,
+                'positionId': fill_record.get('position_id'),
+                'tradeId': fill_record.get('trade_id'),
+            })
+        else:
+            payload.update({
+                'action': 'ENTRY_SUBMITTED',
+                'reason': intent.rejection_reason,
+                'submittedOrderId': intent.submitted_order_id,
+            })
+        self._record_entry_execution(db, monitor_state, payload)
+        db.commit()
+        return payload
+
+    def _record_entry_execution(self, db: Session, monitor_state: WatchlistMonitorState, payload: dict[str, Any]) -> None:
+        recorded_at = datetime.now(UTC)
+        context = dict(monitor_state.decision_context_json or {})
+        context['entryExecution'] = {
+            'action': payload.get('action'),
+            'reason': payload.get('reason'),
+            'intentId': payload.get('intentId'),
+            'submittedOrderId': payload.get('submittedOrderId'),
+            'positionId': payload.get('positionId'),
+            'tradeId': payload.get('tradeId'),
+            'recordedAtUtc': recorded_at.isoformat(),
+        }
+        monitor_state.decision_context_json = context
+        flag_modified(monitor_state, 'decision_context_json')
+        action = str(payload.get('action') or '').strip()
+        reason = payload.get('reason')
+        if reason is not None:
+            monitor_state.latest_decision_reason = str(reason)
+        if action in {'ENTRY_FILLED', 'ENTRY_SUBMITTED', 'GATE_REJECTED', 'SUBMISSION_REJECTED'}:
+            monitor_state.latest_decision_state = action
+        monitor_state.last_decision_at_utc = recorded_at
+        db.add(monitor_state)
+        db.flush()
+        db.query(WatchlistMonitorState).filter(WatchlistMonitorState.id == monitor_state.id).update(
+            {
+                WatchlistMonitorState.decision_context_json: context,
+                WatchlistMonitorState.latest_decision_reason: monitor_state.latest_decision_reason,
+                WatchlistMonitorState.latest_decision_state: monitor_state.latest_decision_state,
+                WatchlistMonitorState.last_decision_at_utc: monitor_state.last_decision_at_utc,
+            },
+            synchronize_session=False,
+        )
+        db.flush()
+        db.refresh(monitor_state)
+
+    def _get_account_snapshot(
+        self,
+        *,
+        mode: str,
+        account_cache: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, float, str | None]:
+        if not account_cache.get('loaded'):
+            account_cache['loaded'] = True
+            try:
+                account = tradier_client.get_account_snapshot(mode)
+                cash_available = float(account.get('cash') or account.get('buyingPower') or account.get('portfolioValue') or 0.0)
+                account_cache['account'] = account
+                account_cache['cashAvailable'] = cash_available
+                account_cache['error'] = None
+            except Exception as exc:
+                account_cache['account'] = None
+                account_cache['cashAvailable'] = 0.0
+                account_cache['error'] = str(exc)
+        return account_cache.get('account'), float(account_cache.get('cashAvailable') or 0.0), account_cache.get('error')
+
+    @staticmethod
+    def _has_open_position(db: Session, symbol: str) -> bool:
+        return (
+            db.query(Position)
+            .filter(Position.ticker == symbol, Position.is_open.is_(True))
+            .first()
+            is not None
+        )
+
+    @staticmethod
+    def _has_active_entry_intent(db: Session, symbol: str) -> bool:
+        return (
+            db.query(OrderIntent)
+            .filter(
+                OrderIntent.asset_class == 'stock',
+                OrderIntent.symbol == symbol,
+                OrderIntent.side == 'BUY',
+                OrderIntent.execution_source == ENTRY_EXECUTION_SOURCE,
+                OrderIntent.status.in_(ACTIVE_ENTRY_INTENT_STATUSES),
+            )
+            .first()
+            is not None
+        )
+
+    @staticmethod
+    def _confirm_stock_order_sync(order_snapshot: dict[str, Any], *, mode: str) -> dict[str, Any]:
+        snapshot = order_snapshot
+        normalized = tradier_client.normalize_order_response(snapshot)
+        order_id = normalized.get('id')
+        if normalized.get('is_terminal') or normalized.get('filled_quantity', 0) > 0 or not order_id:
+            return snapshot
+
+        attempts = max(int(settings.ORDER_FILL_CONFIRM_RETRIES), 0)
+        for _ in range(attempts):
+            time.sleep(float(settings.ORDER_FILL_CONFIRM_DELAY_SECONDS))
+            snapshot = tradier_client.get_order_sync(str(order_id), mode=mode)
+            normalized = tradier_client.normalize_order_response(snapshot)
+            if normalized.get('is_terminal') or normalized.get('filled_quantity', 0) > 0:
+                break
+        return snapshot
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     @staticmethod
     def _query_due_rows(db: Session, *, scope: WATCHLIST_SCOPE, observed_at: datetime):

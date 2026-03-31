@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { useEffect, useMemo, useState } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -35,6 +35,7 @@ const scopeLabels: Record<WatchlistScope, string> = {
 }
 
 export default function Watchlists() {
+  const [searchParams, setSearchParams] = useSearchParams()
   const [selectedSymbol, setSelectedSymbol] = useState<{ scope: WatchlistScope; symbol: string } | null>(null)
 
   const { data: activeWatchlists = {} } = useQuery<WatchlistCollection>({
@@ -48,6 +49,52 @@ export default function Watchlists() {
     queryFn: () => api.getLatestWatchlists() as Promise<WatchlistCollection>,
     refetchInterval: 15000,
   })
+
+
+  useEffect(() => {
+    const requestedSymbol = (searchParams.get('symbol') ?? '').trim().toUpperCase()
+    const requestedScope = (searchParams.get('scope') ?? '').trim() as WatchlistScope | ''
+    if (!requestedSymbol) {
+      if (selectedSymbol) setSelectedSymbol(null)
+      return
+    }
+
+    const candidateScopes: WatchlistScope[] = requestedScope && ['stocks_only', 'crypto_only'].includes(requestedScope)
+      ? [requestedScope as WatchlistScope]
+      : ['stocks_only', 'crypto_only']
+
+    let resolved: { scope: WatchlistScope; symbol: string } | null = null
+    for (const scope of candidateScopes) {
+      const watchlist = activeWatchlists[scope]
+      const activeMatch = watchlist?.symbols.find((row) => row.symbol.toUpperCase() === requestedSymbol)
+      const managedMatch = watchlist?.managedOnlySymbols.find((row) => row.symbol.toUpperCase() === requestedSymbol)
+      const match = activeMatch ?? managedMatch
+      if (match) {
+        resolved = { scope, symbol: match.symbol }
+        break
+      }
+    }
+
+    if (!resolved) return
+    if (selectedSymbol?.scope === resolved.scope && selectedSymbol.symbol === resolved.symbol) return
+    setSelectedSymbol(resolved)
+  }, [activeWatchlists, searchParams, selectedSymbol])
+
+  const openSymbol = (scope: WatchlistScope, symbol: string) => {
+    setSelectedSymbol({ scope, symbol })
+    const next = new URLSearchParams(searchParams)
+    next.set('scope', scope)
+    next.set('symbol', symbol)
+    setSearchParams(next)
+  }
+
+  const closeSymbol = () => {
+    setSelectedSymbol(null)
+    const next = new URLSearchParams(searchParams)
+    next.delete('symbol')
+    next.delete('scope')
+    setSearchParams(next)
+  }
 
   const selectedContext = useMemo(() => {
     if (!selectedSymbol) return null
@@ -98,13 +145,13 @@ export default function Watchlists() {
               activeWatchlist={activeWatchlists[scope]}
               latestWatchlist={latestWatchlists[scope]}
               selectedSymbol={selectedSymbol?.scope === scope ? selectedSymbol.symbol : null}
-              onSelectSymbol={(symbol) => setSelectedSymbol({ scope, symbol })}
+              onSelectSymbol={(symbol) => openSymbol(scope, symbol)}
             />
           ))}
         </div>
       </div>
 
-      <SymbolContextDrawer selectedSymbol={selectedSymbol} context={selectedContext} onClose={() => setSelectedSymbol(null)} />
+      <SymbolContextDrawer selectedSymbol={selectedSymbol} context={selectedContext} onClose={closeSymbol} />
     </>
   )
 }
@@ -172,7 +219,7 @@ function ScopePanel({
           ) : activeRows.length === 0 ? (
             <EmptyState message="The active payload exists, but it does not currently contain any active rows." />
           ) : (
-            <SymbolTable rows={activeRows} selectedSymbol={selectedSymbol} onSelectSymbol={onSelectSymbol} />
+            <SymbolTable scope={scope} rows={activeRows} selectedSymbol={selectedSymbol} onSelectSymbol={onSelectSymbol} />
           )}
 
           {managedRows.length > 0 ? (
@@ -333,9 +380,9 @@ function SymbolContextDrawer({
 
           <div className="border-b border-slate-800 px-6 py-4">
             <div className="flex flex-wrap gap-2">
-              <QuickJump to="/monitoring" label="Open Monitoring" />
-              <QuickJump to="/positions" label="Open Positions" />
-              <QuickJump to="/audit" label="Open Audit Trail" />
+              <QuickJump to="/monitoring" label="Open Monitoring" scope={selectedSymbol?.scope} symbol={selectedSymbol?.symbol} />
+              <QuickJump to="/positions" label="Open Positions" scope={selectedSymbol?.scope} symbol={selectedSymbol?.symbol} />
+              <QuickJump to="/audit" label="Open Audit Trail" scope={selectedSymbol?.scope} symbol={selectedSymbol?.symbol} />
             </div>
           </div>
 
@@ -366,10 +413,12 @@ function SymbolContextDrawer({
 }
 
 function SymbolTable({
+  scope,
   rows,
   selectedSymbol,
   onSelectSymbol,
 }: {
+  scope: WatchlistScope
   rows: WatchlistSymbolRecord[]
   selectedSymbol: string | null
   onSelectSymbol: (symbol: string) => void
@@ -422,9 +471,9 @@ function SymbolTable({
                 </td>
                 <td className="py-3 pr-4 align-top">
                   <div className="flex flex-wrap gap-2">
-                    <QuickJump to="/monitoring" label="Monitoring" compact />
-                    <QuickJump to="/positions" label="Positions" compact />
-                    <QuickJump to="/audit" label="Audit" compact />
+                    <QuickJump to="/monitoring" label="Monitoring" compact scope={scope} symbol={row.symbol} />
+                    <QuickJump to="/positions" label="Positions" compact scope={scope} symbol={row.symbol} />
+                    <QuickJump to="/audit" label="Audit" compact scope={scope} symbol={row.symbol} />
                   </div>
                 </td>
               </tr>
@@ -436,10 +485,26 @@ function SymbolTable({
   )
 }
 
-function QuickJump({ to, label, compact = false }: { to: string; label: string; compact?: boolean }) {
+function QuickJump({
+  to,
+  label,
+  compact = false,
+  scope,
+  symbol,
+}: {
+  to: string
+  label: string
+  compact?: boolean
+  scope?: WatchlistScope
+  symbol?: string
+}) {
+  const query = new URLSearchParams()
+  if (scope) query.set('scope', scope)
+  if (symbol) query.set('symbol', symbol)
+  const href = query.toString() ? `${to}?${query.toString()}` : to
   return (
     <Link
-      to={to}
+      to={href}
       className={`inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/70 text-slate-200 transition hover:border-cyan-700 hover:text-white ${
         compact ? 'px-2.5 py-1 text-[11px]' : 'px-3 py-2 text-sm'
       }`}

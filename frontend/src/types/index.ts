@@ -20,7 +20,7 @@ export interface ExecutionGateStatus {
 
 export interface DependencyCheck {
   name: string
-  state: 'READY' | 'DEGRADED' | 'MISSING' | string
+  state: 'READY' | 'DEGRADED' | 'MISSING' | 'STALE' | 'DISABLED' | string
   ready: boolean
   reason: string
   checkedAtUtc: string
@@ -34,13 +34,19 @@ export interface DependencyVisibility {
     readyCount: number
     degradedCount: number
     missingCount: number
-    staleCount?: number
-    disabledCount?: number
+    staleCount: number
+    disabledCount: number
     criticalReady: boolean
-    workerReady?: boolean
-    operationalReady?: boolean
+    workerReady: boolean
+    operationalReady: boolean
   }
-  checks: Record<string, DependencyCheck>
+  checks: {
+    tradierPaper: DependencyCheck
+    tradierLive: DependencyCheck
+    krakenMarketData: DependencyCheck
+    watchlistMonitor: DependencyCheck
+    watchlistExitWorker: DependencyCheck
+  }
 }
 
 export interface GateCheck {

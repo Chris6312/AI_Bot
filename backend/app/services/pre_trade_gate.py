@@ -75,6 +75,27 @@ class PreTradeGateService:
         execution_source: str,
         decision_context: dict[str, Any] | None = None,
     ) -> PreTradeGateDecision:
+        return self.evaluate_stock_order_sync(
+            ticker=ticker,
+            shares=shares,
+            mode=mode,
+            account=account,
+            db=db,
+            execution_source=execution_source,
+            decision_context=decision_context,
+        )
+
+    def evaluate_stock_order_sync(
+        self,
+        *,
+        ticker: str,
+        shares: int,
+        mode: str,
+        account: dict[str, Any],
+        db: Session,
+        execution_source: str,
+        decision_context: dict[str, Any] | None = None,
+    ) -> PreTradeGateDecision:
         symbol = str(ticker or '').upper().strip()
         selected_mode = str(mode or 'PAPER').upper()
         context = {
@@ -187,6 +208,16 @@ class PreTradeGateService:
             or tradier_client._credentials_for_mode(selected_mode)['account_id']
             or 'TRADIER'
         )
+        session_open_hint = None
+        session_payload = (decision_context or {}).get('session') if isinstance(decision_context, dict) else None
+        if isinstance(decision_context, dict):
+            if 'marketSessionOpen' in decision_context:
+                session_open_hint = bool(decision_context.get('marketSessionOpen'))
+            elif 'sessionOpen' in decision_context:
+                session_open_hint = bool(decision_context.get('sessionOpen'))
+            elif isinstance(session_payload, dict) and 'sessionOpen' in session_payload:
+                session_open_hint = bool(session_payload.get('sessionOpen'))
+
         safety_payload = {
             'candidates': [
                 {
@@ -197,8 +228,10 @@ class PreTradeGateService:
                 }
             ],
             'vix': (decision_context or {}).get('vix', 0),
+            'require_market_hours': bool(selected_mode == 'LIVE'),
+            'marketSessionOpen': session_open_hint,
         }
-        safety_result = await self.safety.validate(
+        safety_result = self.safety.validate_sync(
             safety_payload,
             account,
             db,

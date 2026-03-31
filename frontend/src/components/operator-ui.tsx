@@ -143,10 +143,6 @@ export function getStatusMeta(raw?: string | null): {
     return { canonical: 'idle', canonicalLabel: 'Idle', rawLabel: 'Idle', tone: 'muted' }
   }
 
-  if (normalized.includes('DISABLED') || normalized.includes('IDLE')) {
-    return { canonical: 'idle', canonicalLabel: 'Idle', rawLabel: startCase(raw), tone: 'muted' }
-  }
-
   if (normalized.includes('MANAGED_ONLY')) {
     return { canonical: 'managed-only', canonicalLabel: 'Managed-only', rawLabel: startCase(raw), tone: 'warn' }
   }
@@ -175,7 +171,6 @@ export function getStatusMeta(raw?: string | null): {
     normalized.includes('WAITING') ||
     normalized.includes('PENDING') ||
     normalized.includes('CLOSED') ||
-    normalized.includes('STARTING') ||
     normalized.includes('MONITOR_ONLY')
   ) {
     return { canonical: 'warning', canonicalLabel: 'Warning', rawLabel: startCase(raw), tone: 'warn' }

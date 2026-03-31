@@ -12,7 +12,6 @@ from app.services.control_plane import get_control_plane_status, get_execution_g
 from app.services.kraken_service import kraken_service
 from app.services.tradier_client import tradier_client
 from app.services.watchlist_exit_worker import watchlist_exit_worker
-from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
 
 UTC = timezone.utc
 
@@ -219,6 +218,8 @@ class RuntimeVisibilityService:
         }
 
     def _probe_watchlist_monitor(self, observed_at: datetime) -> dict[str, Any]:
+        from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
+
         db = SessionLocal()
         try:
             status = watchlist_monitoring_orchestrator.get_runtime_status(db)

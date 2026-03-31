@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { Activity, ArrowRight, Clock3, Radar, ShieldCheck, Siren } from 'lucide-react'
 import { formatDistanceToNowStrict } from 'date-fns'
@@ -32,6 +32,9 @@ const scopeLabels: Record<WatchlistScope, string> = {
 }
 
 export default function Monitoring() {
+  const [searchParams] = useSearchParams()
+  const symbolFilter = (searchParams.get('symbol') ?? '').trim().toUpperCase()
+  const scopeFilter = (searchParams.get('scope') ?? '').trim() as WatchlistScope | ''
   const { data: monitoring = {} } = useQuery<MonitoringCollection>({
     queryKey: ['watchlists', 'monitoring'],
     queryFn: () => api.getMonitoringSnapshot() as Promise<MonitoringCollection>,
@@ -77,6 +80,7 @@ export default function Monitoring() {
             <StatusPill tone={Boolean(orchestration?.enabled) ? 'good' : 'warn'} label={orchestration?.enabled ? 'Monitor healthy' : 'Monitor warning'} />
             <StatusPill tone={Boolean(exitWorker?.enabled) ? 'good' : 'warn'} label={exitWorker?.enabled ? 'Exit worker healthy' : 'Exit worker warning'} />
             <StatusPill tone={totalProtective > 0 ? 'warn' : 'muted'} label={totalProtective > 0 ? `${totalProtective} protective exits` : 'No protective exits'} />
+            {symbolFilter ? <StatusPill tone="info" label={`Filtered: ${symbolFilter}`} /> : null}
           </>
         }
       />
@@ -140,6 +144,7 @@ export default function Monitoring() {
             monitoring={monitoring[scope]}
             exitReadiness={exitReadiness[scope]}
             orchestration={extractScopeSnapshot(orchestration, scope)}
+            selectedSymbol={scopeFilter === '' || scopeFilter === scope ? symbolFilter || null : null}
           />
         ))}
       </div>
@@ -152,6 +157,7 @@ function ScopeMonitoringPanel({
   monitoring,
   exitReadiness,
   orchestration,
+  selectedSymbol,
 }: {
   scope: WatchlistScope
   monitoring?: WatchlistMonitoringSnapshot
@@ -172,8 +178,10 @@ function ScopeMonitoringPanel({
       nextCloseUtc?: string | null
     }
   }
+  selectedSymbol?: string | null
 }) {
   const rows = monitoring?.rows ?? []
+  const filteredRows = selectedSymbol ? rows.filter((row) => row.symbol.toUpperCase() === selectedSymbol.toUpperCase()) : rows
   const sessionMeta = getScopeSessionMeta(scope, orchestration?.session)
 
   return (
@@ -203,10 +211,10 @@ function ScopeMonitoringPanel({
         <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
           {!monitoring ? (
             <EmptyState message={`No ${scopeLabels[scope].toLowerCase()} monitoring snapshot is available yet.`} />
-          ) : rows.length === 0 ? (
+          ) : filteredRows.length === 0 ? (
             <EmptyState message="A monitoring snapshot exists, but there are no rows to display yet." />
           ) : (
-            <MonitoringTable rows={rows} />
+            <MonitoringTable scope={scope} rows={filteredRows} selectedSymbol={selectedSymbol ?? null} />
           )}
         </div>
 
@@ -238,7 +246,7 @@ function ScopeMonitoringPanel({
   )
 }
 
-function MonitoringTable({ rows }: { rows: WatchlistSymbolRecord[] }) {
+function MonitoringTable({ scope, rows, selectedSymbol }: { scope: WatchlistScope; rows: WatchlistSymbolRecord[]; selectedSymbol: string | null }) {
   return (
     <div className="overflow-x-auto">
       <table className="w-full min-w-[1380px] text-sm">
@@ -259,8 +267,13 @@ function MonitoringTable({ rows }: { rows: WatchlistSymbolRecord[] }) {
             const lifecycleMeta = getStatusMeta(row.monitoringStatus)
             const decisionMeta = getStatusMeta(row.monitoring?.latestDecisionState)
 
+            const entryExecution = (row.monitoring?.decisionContext as Record<string, unknown> | undefined)?.entryExecution as Record<string, unknown> | undefined
+            const executionAction = String(entryExecution?.action ?? '').trim()
+            const executionReason = String(entryExecution?.reason ?? '').trim()
+            const isFocused = selectedSymbol != null && row.symbol.toUpperCase() === selectedSymbol.toUpperCase()
+
             return (
-              <tr key={`${row.uploadId}-${row.symbol}`} className="border-b border-slate-900/80 align-top text-slate-300">
+              <tr key={`${row.uploadId}-${row.symbol}`} className={`border-b border-slate-900/80 align-top text-slate-300 ${isFocused ? 'bg-cyan-500/5' : ''}`}>
                 <td className="py-3 pr-4 align-top">
                   <div className="font-semibold text-white">{row.symbol}</div>
                   <div className="text-xs text-slate-500">{row.assetClass}</div>
@@ -278,7 +291,8 @@ function MonitoringTable({ rows }: { rows: WatchlistSymbolRecord[] }) {
                   </div>
                 </td>
                 <td className="py-3 pr-4 align-top text-slate-400 whitespace-normal break-words [overflow-wrap:anywhere]">
-                  {row.monitoring?.latestDecisionReason ?? '—'}
+                  <div>{row.monitoring?.latestDecisionReason ?? '—'}</div>
+                  {executionAction ? <div className="mt-2 text-xs text-slate-500">Entry rail: {executionAction}{executionReason ? ` · ${executionReason}` : ''}</div> : null}
                 </td>
                 <td className="py-3 pr-4 align-top text-slate-400 whitespace-normal break-words">
                   {formatTimestamp(row.monitoring?.nextEvaluationAtUtc)}
@@ -302,9 +316,9 @@ function MonitoringTable({ rows }: { rows: WatchlistSymbolRecord[] }) {
                 <td className="py-3 pr-4 align-top text-slate-400 whitespace-normal break-words">{buildExitFlags(row)}</td>
                 <td className="py-3 pr-4 align-top">
                   <div className="flex flex-wrap gap-2">
-                    <JumpLane to="/watchlists" label="Watchlists" />
-                    <JumpLane to="/positions" label="Positions" />
-                    <JumpLane to="/audit" label="Audit" />
+                    <JumpLane to="/watchlists" label="Watchlists" scope={scope} symbol={row.symbol} />
+                    <JumpLane to="/positions" label="Positions" scope={scope} symbol={row.symbol} />
+                    <JumpLane to="/audit" label="Audit" scope={scope} symbol={row.symbol} />
                   </div>
                 </td>
               </tr>
@@ -316,10 +330,14 @@ function MonitoringTable({ rows }: { rows: WatchlistSymbolRecord[] }) {
   )
 }
 
-function JumpLane({ to, label }: { to: string; label: string }) {
+function JumpLane({ to, label, scope, symbol }: { to: string; label: string; scope?: WatchlistScope; symbol?: string }) {
+  const params = new URLSearchParams()
+  if (scope) params.set('scope', scope)
+  if (symbol) params.set('symbol', symbol)
+  const href = params.toString() ? `${to}?${params.toString()}` : to
   return (
     <Link
-      to={to}
+      to={href}
       className="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/70 px-2.5 py-1 text-[11px] text-slate-200 transition hover:border-cyan-700 hover:text-white"
     >
       <span>{label}</span>

@@ -27,6 +27,23 @@ class SafetyValidator:
         account_id: str,
         asset_class: str = 'stock',
     ) -> Dict[str, Any]:
+        return self.validate_sync(
+            decision,
+            account,
+            db,
+            account_id=account_id,
+            asset_class=asset_class,
+        )
+
+    def validate_sync(
+        self,
+        decision: Dict[str, Any],
+        account: Dict[str, Any],
+        db,
+        *,
+        account_id: str,
+        asset_class: str = 'stock',
+    ) -> Dict[str, Any]:
         candidates = decision.get('candidates', [])
 
         if len(candidates) > settings.SAFETY_MAX_TRADES_PER_DAY:
@@ -52,11 +69,16 @@ class SafetyValidator:
         if vix > settings.SAFETY_VIX_MAX:
             return self._fail(f"VIX too high ({vix:.1f} > {settings.SAFETY_VIX_MAX})")
 
-        if (
-            asset_class == 'stock'
-            and runtime_state.get().safety_require_market_hours
-            and not self._is_market_hours_et()
-        ):
+        require_market_hours = bool(
+            decision.get('require_market_hours', runtime_state.get().safety_require_market_hours)
+        )
+        session_open_hint = decision.get('marketSessionOpen', decision.get('sessionOpen'))
+        if session_open_hint is not None:
+            session_is_open = bool(session_open_hint)
+        else:
+            session_is_open = self._is_market_hours_et()
+
+        if asset_class == 'stock' and require_market_hours and not session_is_open:
             return self._fail('Market is closed')
 
         account_cash = float(account.get('cash') or account.get('buyingPower') or account.get('portfolioValue') or 0)

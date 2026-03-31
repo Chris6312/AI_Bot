@@ -2780,3 +2780,177 @@ def test_crypto_exit_readiness_uses_ledger_entry_time_and_watchlist_max_hold(tmp
         assert readiness['rows'][0]['positionState']['exitDeadlineSource'] == 'watchlist_max_hold'
         assert readiness['rows'][0]['positionState']['marketValue'] == 47.5
         assert readiness['rows'][0]['positionState']['costBasis'] == 50.0
+
+
+def test_due_run_submits_watchlist_entry_candidates_into_order_intents(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+        monitor_row.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+        monitor_row.latest_decision_state = 'WAITING_FOR_SETUP'
+        db.commit()
+
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(**{
+                'session_open': True,
+                'to_dict': lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': True,
+                    'reason': 'patched open session',
+                    'nextSessionStartUtc': None,
+                    'nextSessionStartEt': None,
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            }),
+        )
+        monkeypatch.setattr(
+            'app.services.pre_trade_gate.get_execution_gate_status',
+            lambda: SimpleNamespace(allowed=True, state='ARMED', reason='', status_code=200),
+        )
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+        monkeypatch.setattr(
+            tradier_client,
+            'get_account_snapshot',
+            lambda mode=None: {
+                'mode': (mode or 'PAPER').upper(),
+                'connected': True,
+                'accountId': 'paper-watchlist',
+                'cash': 25_000.0,
+                'buyingPower': 25_000.0,
+                'portfolioValue': 25_000.0,
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 110.0,
+                'prevclose': 100.0,
+                'open': 105.0,
+                'volume': 2_500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'place_order_sync',
+            lambda ticker, qty, side, mode=None, order_type='market', duration='day': {
+                'order': {'id': 'watch-ord-1', 'status': 'open', 'quantity': qty},
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_order_sync',
+            lambda order_id, mode=None: {
+                'order': {
+                    'id': order_id,
+                    'status': 'filled',
+                    'quantity': 22,
+                    'exec_quantity': 22,
+                    'avg_fill_price': 111.0,
+                }
+            },
+        )
+
+        result = watchlist_monitoring_orchestrator.run_due_once(db, scope='stocks_only', limit_per_scope=10)
+
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+        intent = db.query(OrderIntent).filter(OrderIntent.execution_source == 'WATCHLIST_MONITOR_ENTRY').one()
+        position = db.query(Position).filter(Position.ticker == 'AAPL', Position.is_open.is_(True)).one()
+        trade = db.query(Trade).filter(Trade.ticker == 'AAPL').one()
+
+        assert result['scope'] == 'stocks_only'
+        assert result['summary']['entryCandidateCount'] == 1
+        assert result['entryExecution']['candidateCount'] == 1
+        assert result['entryExecution']['intentCount'] == 1
+        assert result['entryExecution']['submittedCount'] == 1
+        assert result['entryExecution']['filledCount'] == 1
+        assert intent.symbol == 'AAPL'
+        assert intent.status == 'FILLED'
+        assert position.shares == 22
+        assert trade.entry_order_id == 'watch-ord-1'
+        assert monitor_row.decision_context_json['entryExecution']['action'] == 'ENTRY_FILLED'
+        assert monitor_row.decision_context_json['entryExecution']['positionId'] == position.id
+
+
+def test_due_run_skips_watchlist_entry_when_open_position_exists(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+        monitor_row.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+        db.add(
+            Position(
+                account_id='paper-watchlist',
+                ticker='AAPL',
+                shares=10,
+                avg_entry_price=100.0,
+                current_price=110.0,
+                unrealized_pnl=100.0,
+                unrealized_pnl_pct=0.1,
+                strategy='WATCHLIST_ENTRY',
+                entry_time=datetime.now(UTC),
+                entry_reasoning={'source': 'test'},
+                stop_loss=98.5,
+                profit_target=102.5,
+                peak_price=110.0,
+                trailing_stop=106.7,
+                is_open=True,
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(**{
+                'session_open': True,
+                'to_dict': lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': True,
+                    'reason': 'patched open session',
+                    'nextSessionStartUtc': None,
+                    'nextSessionStartEt': None,
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            }),
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 110.0,
+                'prevclose': 100.0,
+                'open': 105.0,
+                'volume': 2_500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+
+        result = watchlist_monitoring_orchestrator.run_due_once(db, scope='stocks_only', limit_per_scope=10)
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+
+        assert result['entryExecution']['candidateCount'] == 1
+        assert result['entryExecution']['intentCount'] == 0
+        assert result['entryExecution']['skippedCount'] == 1
+        assert db.query(OrderIntent).filter(OrderIntent.execution_source == 'WATCHLIST_MONITOR_ENTRY').count() == 0
+        assert monitor_row.decision_context_json['entryExecution']['reason'] == 'OPEN_POSITION_EXISTS'
