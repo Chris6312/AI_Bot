@@ -472,6 +472,41 @@ def test_watchlist_endpoints_return_active_and_latest_payloads(tmp_path, monkeyp
         app.dependency_overrides.clear()
 
 
+def test_ai_decisions_endpoint_derives_entries_from_watchlist_uploads(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        def override_get_db():
+            db = SessionFactory()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+
+        db = SessionFactory()
+        try:
+            watchlist_service.ingest_watchlist(db, build_stock_payload(), source='api')
+        finally:
+            db.close()
+
+        with TestClient(app) as client:
+            response = client.get('/api/ai/decisions?limit=5')
+
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 2
+        first = payload[0]
+        assert first['market'] == 'STOCK'
+        assert first['type'] == 'SCREENING'
+        assert first['executed'] is False
+        assert first['confidence'] >= 0.5
+        assert first['symbol'] == 'AAPL'
+        assert 'thesis:' in first['reasoning']
+        assert first['rejected'] is False
+
+
 def test_reconcile_endpoint_returns_status_transition_summary(tmp_path, monkeypatch) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
         def override_get_db():

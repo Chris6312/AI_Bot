@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +13,8 @@ from app.core.config import settings
 
 TradingMode = Literal['PAPER', 'LIVE']
 CryptoMode = Literal['PAPER']
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,7 +81,16 @@ class RuntimeStateStore:
 
     def _save(self, state: RuntimeState) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(asdict(state), indent=2), encoding='utf-8')
+        payload = json.dumps(asdict(state), indent=2)
+        try:
+            self.path.write_text(payload, encoding='utf-8')
+            return
+        except OSError as exc:
+            fallback_path = Path(tempfile.gettempdir()) / 'ai_bot_runtime_state.json'
+            logger.warning('Runtime state write failed at %s, falling back to %s: %s', self.path, fallback_path, exc)
+            fallback_path.parent.mkdir(parents=True, exist_ok=True)
+            fallback_path.write_text(payload, encoding='utf-8')
+            self.path = fallback_path
 
     @staticmethod
     def _now_iso() -> str:

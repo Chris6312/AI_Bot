@@ -1,6 +1,92 @@
 import type { ReactNode } from 'react'
 
+import type { WatchlistScope } from '@/types'
+
 export type Tone = 'good' | 'warn' | 'danger' | 'info' | 'muted'
+export type CanonicalStatus = 'healthy' | 'warning' | 'blocked' | 'stale' | 'managed-only' | 'unmanaged' | 'idle'
+
+
+export interface ScopeSessionLike {
+  scope?: WatchlistScope
+  sessionOpen?: boolean | null
+  reason?: string | null
+  sessionLabel?: string | null
+  observedAtUtc?: string | null
+  observedAtEt?: string | null
+  nextSessionStartUtc?: string | null
+  nextSessionStartEt?: string | null
+  sessionCloseUtc?: string | null
+  sessionCloseEt?: string | null
+  nextOpenUtc?: string | null
+  nextCloseUtc?: string | null
+}
+
+export function getScopeSessionMeta(scope: WatchlistScope, session?: ScopeSessionLike | null): {
+  label: string
+  tone: Tone
+  detail: string | null
+} {
+  const label = resolveScopeSessionLabel(scope, session)
+  const detail = resolveScopeSessionDetail(scope, session)
+  const tone: Tone = session?.sessionOpen ? 'good' : scope === 'crypto_only' ? 'info' : 'warn'
+  return { label, tone, detail }
+}
+
+function resolveScopeSessionLabel(scope: WatchlistScope, session?: ScopeSessionLike | null): string {
+  const explicit = (session?.sessionLabel ?? '').trim()
+  if (explicit) return explicit
+
+  const reason = (session?.reason ?? '').toLowerCase()
+  if (scope === 'crypto_only') {
+    return '24/7 session'
+  }
+  if (session?.sessionOpen) {
+    return 'Session open'
+  }
+  if (reason.includes('weekend')) {
+    return 'Weekend pause'
+  }
+  if (reason.includes('waiting for the regular et market open')) {
+    return 'Pre-market'
+  }
+  if (reason.includes('after the regular et market close')) {
+    return 'After-hours'
+  }
+  if (reason.includes('outside the regular et market session')) {
+    return 'Session closed'
+  }
+  return scope === 'stocks_only' ? 'Session closed' : '24/7 session'
+}
+
+function resolveScopeSessionDetail(scope: WatchlistScope, session?: ScopeSessionLike | null): string | null {
+  if (!session) return null
+  if (scope === 'crypto_only') {
+    return session.reason ?? 'Crypto monitoring is always on.'
+  }
+  const reason = (session.reason ?? '').trim()
+  const nextStart = session.nextSessionStartEt ?? session.nextSessionStartUtc ?? session.nextOpenUtc ?? null
+  const sessionClose = session.sessionCloseEt ?? session.sessionCloseUtc ?? session.nextCloseUtc ?? null
+  if (session.sessionOpen && sessionClose) {
+    return `Regular session until ${formatSessionDateTime(sessionClose)}`
+  }
+  if (nextStart) {
+    return `${reason || 'Monitoring is paused.'} Next open ${formatSessionDateTime(nextStart)}`
+  }
+  return reason || null
+}
+
+function formatSessionDateTime(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+  return date.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
 
 export function toneBadgeClass(tone: Tone): string {
   switch (tone) {
@@ -30,6 +116,75 @@ export function toneTextClass(tone: Tone): string {
     default:
       return 'text-right text-slate-300'
   }
+}
+
+function toUpperKey(value?: string | null): string {
+  return (value ?? '').trim().replace(/[\s-]+/g, '_').toUpperCase()
+}
+
+function startCase(value?: string | null): string {
+  if (!value || !value.trim()) return 'Idle'
+  return value
+    .trim()
+    .replace(/[_-]+/g, ' ')
+    .toLowerCase()
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+export function getStatusMeta(raw?: string | null): {
+  canonical: CanonicalStatus
+  canonicalLabel: string
+  rawLabel: string
+  tone: Tone
+} {
+  const normalized = toUpperKey(raw)
+
+  if (!normalized) {
+    return { canonical: 'idle', canonicalLabel: 'Idle', rawLabel: 'Idle', tone: 'muted' }
+  }
+
+  if (normalized.includes('MANAGED_ONLY')) {
+    return { canonical: 'managed-only', canonicalLabel: 'Managed-only', rawLabel: startCase(raw), tone: 'warn' }
+  }
+
+  if (normalized.includes('STALE')) {
+    return { canonical: 'stale', canonicalLabel: 'Stale', rawLabel: startCase(raw), tone: 'warn' }
+  }
+
+  if (
+    normalized.includes('LOCKED') ||
+    normalized.includes('READ_ONLY') ||
+    normalized.includes('REJECT') ||
+    normalized.includes('MISSING') ||
+    normalized.includes('UNAVAILABLE') ||
+    normalized.includes('BLOCKED') ||
+    normalized.includes('FAILED') ||
+    normalized.includes('ERROR') ||
+    normalized.includes('CONFLICT')
+  ) {
+    return { canonical: 'blocked', canonicalLabel: 'Blocked', rawLabel: startCase(raw), tone: 'danger' }
+  }
+
+  if (
+    normalized.includes('PAUSED') ||
+    normalized.includes('DEGRADED') ||
+    normalized.includes('WAITING') ||
+    normalized.includes('PENDING') ||
+    normalized.includes('CLOSED') ||
+    normalized.includes('MONITOR_ONLY')
+  ) {
+    return { canonical: 'warning', canonicalLabel: 'Warning', rawLabel: startCase(raw), tone: 'warn' }
+  }
+
+  if (normalized.includes('INACTIVE') || normalized.includes('UNMANAGED') || normalized === 'FLAT') {
+    return { canonical: 'unmanaged', canonicalLabel: 'Unmanaged', rawLabel: startCase(raw), tone: 'muted' }
+  }
+
+  return { canonical: 'healthy', canonicalLabel: 'Healthy', rawLabel: startCase(raw), tone: 'good' }
+}
+
+export function canonicalStatusLabel(raw?: string | null): string {
+  return getStatusMeta(raw).canonicalLabel
 }
 
 export function PageHero({

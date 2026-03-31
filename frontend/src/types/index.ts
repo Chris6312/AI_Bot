@@ -395,13 +395,14 @@ export interface WatchlistMonitoringSnapshot {
 
 export interface ScopeSessionStatus {
   scope: WatchlistScope
+  observedAtUtc: string
   sessionOpen: boolean
-  referenceTimeUtc: string
-  timezone: string
-  sessionLabel: string
-  sessionDateEt?: string | null
-  nextOpenUtc?: string | null
-  nextCloseUtc?: string | null
+  reason: string
+  nextSessionStartUtc?: string | null
+  nextSessionStartEt?: string | null
+  sessionCloseUtc?: string | null
+  sessionCloseEt?: string | null
+  sessionLabel?: string | null
 }
 
 export interface WatchlistDueScopeSnapshot {

@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow, format } from 'date-fns'
 import { BrainCircuit, ClipboardList, FileSearch, Siren, Shield, TrendingUp } from 'lucide-react'
@@ -12,6 +13,7 @@ import {
   SectionCard,
   StatusPill,
   ToneBadge,
+  getStatusMeta,
   type Tone,
 } from '@/components/operator-ui'
 import type {
@@ -32,6 +34,8 @@ type AuditEvent = {
   detail: string
   timestamp: string | null
   tone: Tone
+  statusLabel: string
+  to: string
 }
 
 const scopeLabels = {
@@ -108,6 +112,8 @@ export default function AuditTrail() {
         detail: `${record.selectedCount} selected, ${record.statusSummary.managedOnlyCount} managed-only, hash ${record.payloadHash?.slice(0, 12) ?? '—'}`,
         timestamp: record.receivedAtUtc ?? null,
         tone: isHealthyValidationStatus(record.validationStatus) ? 'good' : 'warn',
+        statusLabel: getStatusMeta(record.validationStatus).canonicalLabel,
+        to: '/watchlists',
       }))
 
     const gateEvents: AuditEvent[] = (runtimeVisibility?.gate.recent ?? []).map((decision) => ({
@@ -118,6 +124,8 @@ export default function AuditTrail() {
       detail: decision.rejectionReason || 'Gate allowed the request to continue.',
       timestamp: decision.recordedAtUtc,
       tone: gateTone(decision.allowed),
+      statusLabel: getStatusMeta(decision.state).canonicalLabel,
+      to: '/runtime',
     }))
 
     const stockEvents: AuditEvent[] = stockHistory.map((row) => ({
@@ -128,6 +136,8 @@ export default function AuditTrail() {
       detail: row.rejectionReason ?? row.events[row.events.length - 1]?.message ?? 'Lifecycle record stored.',
       timestamp: row.lastFillAt ?? row.submittedAt ?? null,
       tone: row.status.toUpperCase().includes('REJECT') ? 'danger' : row.status.toUpperCase().includes('FILL') ? 'good' : 'info',
+      statusLabel: getStatusMeta(row.status).canonicalLabel,
+      to: '/positions',
     }))
 
     const cryptoEvents: AuditEvent[] = cryptoHistory.map((row) => ({
@@ -138,6 +148,8 @@ export default function AuditTrail() {
       detail: `Amount ${row.amount ?? row.shares ?? 0} at ${row.price ?? 0}`,
       timestamp: row.timestamp,
       tone: row.status.toUpperCase().includes('REJECT') ? 'danger' : row.side === 'SELL' ? 'warn' : 'good',
+      statusLabel: getStatusMeta(row.status).canonicalLabel,
+      to: '/positions',
     }))
 
     const aiEvents: AuditEvent[] = aiDecisions.map((row) => ({
@@ -148,6 +160,8 @@ export default function AuditTrail() {
       detail: row.rejectionReason ?? row.reasoning,
       timestamp: row.timestamp,
       tone: row.rejected ? 'danger' : row.executed ? 'good' : 'info',
+      statusLabel: row.rejected ? 'Blocked' : row.executed ? 'Healthy' : 'Warning',
+      to: '/audit',
     }))
 
     return [...receiptEvents, ...gateEvents, ...stockEvents, ...cryptoEvents, ...aiEvents].sort((a, b) => {
@@ -171,7 +185,7 @@ export default function AuditTrail() {
           </>
         }
         title="Receipts, gate decisions, and execution breadcrumbs"
-        description="This page gathers the evidence we actually persist right now: watchlist receipts, gate outcomes, stock lifecycle records, crypto paper tape, and whatever AI-decision crumbs currently exist."
+        description="This page gathers the evidence we actually persist right now: watchlist receipts, gate outcomes, stock lifecycle records, crypto paper tape, and the derived AI watchlist feed built from stored uploads."
         aside={
           <>
             <StatusPill tone={stockWatchlist ? 'good' : 'warn'} label={stockWatchlist ? 'Stock receipt present' : 'No stock receipt'} />
@@ -185,7 +199,7 @@ export default function AuditTrail() {
         <MetricCard label="Watchlist receipts" value={String([stockWatchlist, cryptoWatchlist].filter(Boolean).length)} detail="Latest stock + crypto uploads" icon={<ClipboardList className="h-5 w-5" />} />
         <MetricCard label="Recent gate decisions" value={String(runtimeVisibility?.gate.summary.total ?? 0)} detail={`${runtimeVisibility?.gate.summary.rejectedCount ?? 0} rejected`} icon={<Shield className="h-5 w-5" />} />
         <MetricCard label="Stock lifecycle records" value={String(stockHistory.length)} detail="Order intents with event trails" icon={<TrendingUp className="h-5 w-5" />} />
-        <MetricCard label="AI decision feed" value={String(aiDecisions.length)} detail={aiDecisions.length > 0 ? 'Decision feed alive' : 'Backend placeholder still empty'} icon={<BrainCircuit className="h-5 w-5" />} />
+        <MetricCard label="AI decision feed" value={String(aiDecisions.length)} detail={aiDecisions.length > 0 ? 'Derived from stored watchlist uploads' : 'No derived decisions stored yet'} icon={<BrainCircuit className="h-5 w-5" />} />
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(340px,0.95fr)]">
@@ -215,13 +229,19 @@ export default function AuditTrail() {
                     <div>
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="text-base font-semibold text-white">{event.title}</span>
-                        <ToneBadge tone={event.tone}>{event.lane}</ToneBadge>
+                        <ToneBadge tone={event.tone}>{event.statusLabel}</ToneBadge>
+                        <ToneBadge tone="muted">{event.lane}</ToneBadge>
                       </div>
                       <div className="mt-2 text-sm text-slate-400">{event.subtitle}</div>
                     </div>
                     <div className="text-sm text-slate-500">{formatRelative(event.timestamp)}</div>
                   </div>
-                  <div className="mt-3 text-sm text-slate-300">{event.detail}</div>
+                  <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="text-sm text-slate-300">{event.detail}</div>
+                    <Link to={event.to} className="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs text-slate-200 transition hover:border-cyan-700 hover:text-white">
+                      Open lane
+                    </Link>
+                  </div>
                 </div>
               ))
             )}
@@ -244,7 +264,7 @@ export default function AuditTrail() {
 
           <SectionCard title="Gaps still visible" eyebrow="Known holes" icon={<Siren className="h-4 w-4 text-amber-300" />}>
             <div className="space-y-3 text-sm text-slate-400">
-              <DetailRow label="AI decisions feed" value={aiDecisions.length > 0 ? 'Present' : 'Placeholder endpoint still empty'} tone={aiDecisions.length > 0 ? 'good' : 'warn'} />
+              <DetailRow label="AI decisions feed" value={aiDecisions.length > 0 ? 'Present' : 'No derived entries yet'} tone={aiDecisions.length > 0 ? 'good' : 'warn'} />
               <DetailRow label="Replay rejection stream" value="Not yet exposed in frontend API" tone="warn" />
               <DetailRow label="System error timeline" value="Not yet exposed in frontend API" tone="warn" />
               <DetailRow label="Exit decision timeline" value="Partially visible through stock lifecycle and tape" tone="info" />

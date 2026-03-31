@@ -61,6 +61,10 @@ KNOWN_QUOTES = (
     'ETH',
 )
 
+QUOTE_ALIAS_CANDIDATES = tuple(
+    sorted({*KNOWN_QUOTES, *ASSET_CODE_ALIASES.keys()}, key=len, reverse=True)
+)
+
 
 @dataclass(frozen=True)
 class KrakenPairMetadata:
@@ -121,7 +125,7 @@ class KrakenAPIService:
         if not compact:
             return None
 
-        for quote in KNOWN_QUOTES:
+        for quote in QUOTE_ALIAS_CANDIDATES:
             if compact.endswith(quote) and len(compact) > len(quote):
                 base = self._normalize_asset_code(compact[:-len(quote)])
                 normalized_quote = self._normalize_asset_code(quote)
@@ -561,14 +565,25 @@ class CryptoPaperLedger:
                     continue
 
         normalized_aliases = {
-            self.kraken._normalize_pair_alias(alias)
+            self.kraken._normalize_pair_alias(variant)
             for alias in aliases
+            for variant in self.kraken._pair_alias_variants(alias)
             if str(alias or '').strip()
         }
         normalized_aliases.discard('')
 
         for price_key, price_value in prices.items():
-            if self.kraken._normalize_pair_alias(price_key) not in normalized_aliases:
+            price_variants = {
+                self.kraken._normalize_pair_alias(variant)
+                for variant in self.kraken._pair_alias_variants(price_key)
+            }
+            components = self.kraken._split_pair_components(price_key)
+            if components is not None:
+                base, quote = components
+                for variant in self.kraken._pair_alias_variants(f'{base}/{quote}'):
+                    price_variants.add(self.kraken._normalize_pair_alias(variant))
+            price_variants.discard('')
+            if normalized_aliases.isdisjoint(price_variants):
                 continue
             try:
                 return float(price_value)
@@ -584,14 +599,13 @@ class CryptoPaperLedger:
             return positions
 
         pairs_to_check = list(self.positions.keys())
-        ohlcv_pairs = [self.kraken.get_ohlcv_pair(pair) for pair in pairs_to_check if self.kraken.get_ohlcv_pair(pair)]
+        ohlcv_pairs = [self._resolve_position_ohlcv_pair(pair) for pair in pairs_to_check]
+        ohlcv_pairs = [pair for pair in ohlcv_pairs if pair]
         prices = self.kraken.get_prices(ohlcv_pairs)
         analytics = self._build_position_analytics()
 
         for pair, pos in self.positions.items():
-            ohlcv_pair = self.kraken.get_ohlcv_pair(pair)
-            if not ohlcv_pair:
-                continue
+            ohlcv_pair = self._resolve_position_ohlcv_pair(pair)
             current_price = self._get_price_for_pair(pair, prices, ohlcv_pair)
             if current_price <= 0:
                 continue
@@ -622,6 +636,18 @@ class CryptoPaperLedger:
             })
 
         return positions
+
+    def _resolve_position_ohlcv_pair(self, pair: str) -> str | None:
+        resolved_pair = self.kraken.get_ohlcv_pair(pair)
+        if resolved_pair:
+            return resolved_pair
+
+        raw_pair = str(pair or '').strip().upper()
+        if not raw_pair:
+            return None
+        if '/' in raw_pair:
+            return raw_pair.replace('/', '')
+        return raw_pair
 
     def get_ledger(self) -> Dict:
         """Get full ledger including balance, market value, equity, and P&L."""

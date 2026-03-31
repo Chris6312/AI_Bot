@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.main import app
 from app.services import control_plane
 from app.services.runtime_state import runtime_state
+import main as compatibility_main
 
 
 @contextmanager
@@ -106,3 +107,7 @@ def test_crypto_trade_route_refuses_execution_when_control_plane_is_read_only() 
     assert response.status_code == 503
     assert 'Execution blocked' in response.json()['detail']
     assert 'Discord authorization settings are incomplete' in response.json()['detail']
+
+
+def test_compatibility_main_reexports_canonical_app() -> None:
+    assert compatibility_main.app is app

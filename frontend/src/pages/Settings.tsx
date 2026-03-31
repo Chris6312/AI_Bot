@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 
 import { api } from '@/lib/api'
+import { MetricCard, PageHero, StatusPill, getStatusMeta } from '@/components/operator-ui'
 import type {
   BotStatus,
   DependencyCheck,
@@ -132,31 +133,30 @@ export default function Settings() {
 
   return (
     <div className="space-y-6">
-      <header className="rounded-3xl border border-slate-800 bg-slate-900/70 p-6 shadow-2xl shadow-slate-950/30">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-          <div>
-            <div className="mb-2 flex items-center gap-2 text-sm font-medium uppercase tracking-[0.22em] text-cyan-300">
-              <Shield className="h-4 w-4" />
-              Runtime & risk
-            </div>
-            <h1 className="text-3xl font-semibold text-white">Control plane truth board</h1>
-            <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-400">
-              Real dependency probes, gate observations, and runtime controls. No decorative heartbeat glitter. Just the bot’s actual pulse.
-            </p>
-          </div>
+      <PageHero
+        eyebrow={
+          <>
+            <Shield className="h-4 w-4" />
+            Runtime & risk
+          </>
+        }
+        title="Control plane truth board"
+        description="Real dependency probes, gate observations, and runtime controls. This page is the bot's actual pulse, not a decorative heartbeat lamp."
+        aside={
+          <>
+            <StatusPill tone={getStatusMeta(status?.controlPlane.state).tone} label={`Control ${getStatusMeta(status?.controlPlane.state).canonicalLabel}`} />
+            <StatusPill tone={getStatusMeta(status?.executionGate.state).tone} label={`Gate ${getStatusMeta(status?.executionGate.state).canonicalLabel}`} />
+            <StatusPill tone={runtimeVisibility?.dependencies.summary.criticalReady ? 'good' : 'warn'} label={runtimeVisibility?.dependencies.summary.criticalReady ? 'Dependencies ready' : 'Dependencies degraded'} />
+          </>
+        }
+      />
 
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <HeadlineMetric label="Control state" value={status?.controlPlane.state ?? 'UNKNOWN'} tone={stateTone(status?.controlPlane.state)} />
-            <HeadlineMetric label="Gate" value={status?.executionGate.state ?? 'UNKNOWN'} tone={status?.executionGate.allowed ? 'good' : 'danger'} />
-            <HeadlineMetric
-              label="Dependencies"
-              value={`${runtimeVisibility?.dependencies.summary.readyCount ?? 0}/${Object.keys(dependencyChecks ?? {}).length || 0}`}
-              tone={runtimeVisibility?.dependencies.summary.criticalReady ? 'good' : 'warn'}
-            />
-            <HeadlineMetric label="Last heartbeat" value={formatRelative(status?.lastHeartbeat)} tone="info" />
-          </div>
-        </div>
-      </header>
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <MetricCard label="Control state" value={getStatusMeta(status?.controlPlane.state).canonicalLabel} detail={status?.controlPlane.reason ?? 'No control-plane status returned'} icon={<Shield className="h-5 w-5" />} />
+        <MetricCard label="Gate" value={getStatusMeta(status?.executionGate.state).canonicalLabel} detail={status?.executionGate.reason || (status?.executionGate.allowed ? 'Execution path armed' : 'Execution currently blocked')} icon={<ArrowRightLeft className="h-5 w-5" />} />
+        <MetricCard label="Dependencies" value={`${runtimeVisibility?.dependencies.summary.readyCount ?? 0}/${Object.keys(dependencyChecks ?? {}).length || 0}`} detail={runtimeVisibility?.dependencies.summary.criticalReady ? 'Critical probes healthy' : 'One or more critical probes degraded'} icon={<Wifi className="h-5 w-5" />} />
+        <MetricCard label="Last heartbeat" value={formatRelative(status?.lastHeartbeat)} detail={formatAbsolute(status?.lastHeartbeat)} icon={<Clock3 className="h-5 w-5" />} />
+      </div>
 
       {message ? <Notice tone="success" message={message} /> : null}
       {errorMessage ? <Notice tone="error" message={errorMessage} /> : null}
@@ -387,26 +387,6 @@ export default function Settings() {
   )
 }
 
-function HeadlineMetric({
-  label,
-  value,
-  tone,
-}: {
-  label: string
-  value: string
-  tone: 'good' | 'warn' | 'danger' | 'info' | 'muted'
-}) {
-  return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
-      <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
-      <div className="mt-1 flex items-center gap-2 text-lg font-semibold text-white">
-        <span>{value}</span>
-        <StatusDot tone={tone} />
-      </div>
-    </div>
-  )
-}
-
 function ActionCard({
   title,
   description,
@@ -523,21 +503,6 @@ function EmptyState({ message, compact = false }: { message: string; compact?: b
       {message}
     </div>
   )
-}
-
-function StatusDot({ tone }: { tone: 'good' | 'warn' | 'danger' | 'info' | 'muted' }) {
-  const className =
-    tone === 'good'
-      ? 'bg-emerald-400'
-      : tone === 'warn'
-        ? 'bg-amber-400'
-        : tone === 'danger'
-          ? 'bg-rose-400'
-          : tone === 'info'
-            ? 'bg-cyan-400'
-            : 'bg-slate-500'
-
-  return <span className={`inline-block h-2.5 w-2.5 rounded-full ${className}`} />
 }
 
 function StatusBadge({

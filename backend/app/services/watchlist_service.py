@@ -492,6 +492,72 @@ class WatchlistService:
             grouped[upload.scope] = self.serialize_upload(db, upload)
         return grouped
 
+    def get_ai_decision_feed(self, db: Session, *, limit: int = 50) -> list[dict[str, Any]]:
+        requested_limit = max(1, min(int(limit or 50), 500))
+        upload_fetch_limit = max(3, min(requested_limit, 25))
+        uploads = (
+            db.query(WatchlistUpload)
+            .order_by(WatchlistUpload.received_at_utc.desc(), WatchlistUpload.id.desc())
+            .limit(upload_fetch_limit)
+            .all()
+        )
+
+        decisions: list[dict[str, Any]] = []
+        for upload in uploads:
+            if len(decisions) >= requested_limit:
+                break
+
+            ui_context = (
+                db.query(WatchlistUiContext)
+                .filter(WatchlistUiContext.upload_id == upload.upload_id)
+                .order_by(WatchlistUiContext.id.desc())
+                .first()
+            )
+            summary_json = (ui_context.summary_json if ui_context else {}) or {}
+            symbol_context_json = (ui_context.symbol_context_json if ui_context else {}) or {}
+            primary_focus = {
+                str(item or '').upper()
+                for item in summary_json.get('primary_focus', [])
+                if str(item or '').strip()
+            }
+            symbols = (
+                db.query(WatchlistSymbol)
+                .filter(WatchlistSymbol.upload_id == upload.upload_id)
+                .order_by(WatchlistSymbol.priority_rank.asc(), WatchlistSymbol.id.asc())
+                .all()
+            )
+            for row in symbols:
+                if len(decisions) >= requested_limit:
+                    break
+
+                symbol_key = str(row.symbol or '').upper()
+                context = symbol_context_json.get(row.symbol) or symbol_context_json.get(symbol_key) or {}
+                reasoning = self._build_ai_decision_reasoning(
+                    upload=upload,
+                    row=row,
+                    symbol_context=context if isinstance(context, dict) else {},
+                    summary_json=summary_json if isinstance(summary_json, dict) else {},
+                )
+                decisions.append(
+                    {
+                        'id': f'{upload.upload_id}:{symbol_key}:{row.priority_rank}',
+                        'timestamp': (
+                            upload.received_at_utc or upload.generated_at_utc or datetime.now(UTC)
+                        ).isoformat(),
+                        'type': 'SCREENING',
+                        'market': 'CRYPTO' if upload.scope == 'crypto_only' else 'STOCK',
+                        'symbol': row.symbol,
+                        'confidence': self._estimate_ai_confidence(row, primary_focus=primary_focus),
+                        'reasoning': reasoning,
+                        'executed': False,
+                        'rejected': not self._is_accepted_validation_status(upload.validation_status),
+                        'rejectionReason': upload.rejection_reason,
+                        'vix': None,
+                    }
+                )
+
+        return decisions[:requested_limit]
+
     def get_monitoring_snapshot(
         self,
         db: Session,
@@ -1361,6 +1427,53 @@ class WatchlistService:
             'uploadId': row.upload_id,
             'monitoring': monitoring_payload,
         }
+
+    @staticmethod
+    def _is_accepted_validation_status(status: str | None) -> bool:
+        normalized = str(status or '').strip().lower()
+        return normalized in {'accepted', 'valid'}
+
+    @classmethod
+    def _estimate_ai_confidence(cls, row: WatchlistSymbol, *, primary_focus: set[str]) -> float:
+        tier_base = {
+            'tier_1': 0.86,
+            'tier_2': 0.74,
+            'tier_3': 0.62,
+        }
+        symbol_key = str(row.symbol or '').upper()
+        base = tier_base.get(str(row.tier or '').strip().lower(), 0.66)
+        priority_bonus = max(0.0, 0.05 - max(row.priority_rank - 1, 0) * 0.01)
+        focus_bonus = 0.03 if symbol_key in primary_focus else 0.0
+        return round(min(0.95, max(0.51, base + priority_bonus + focus_bonus)), 2)
+
+    @classmethod
+    def _build_ai_decision_reasoning(
+        cls,
+        *,
+        upload: WatchlistUpload,
+        row: WatchlistSymbol,
+        symbol_context: dict[str, Any],
+        summary_json: dict[str, Any],
+    ) -> str:
+        context_bits = []
+        for key in ('thesis', 'why_now', 'notes', 'scan_reason', 'role', 'sector', 'radar_bucket'):
+            value = symbol_context.get(key)
+            if isinstance(value, str) and value.strip():
+                label = key.replace('_', ' ')
+                context_bits.append(f'{label}: {value.strip()}')
+        if context_bits:
+            return ' | '.join(context_bits)
+
+        regime_note = summary_json.get('regime_note') if isinstance(summary_json, dict) else None
+        fallback = [
+            f'Watchlist upload {upload.schema_version} from {upload.provider}',
+            f'setup {row.setup_template}',
+            f'exit {row.exit_template}',
+            f'tier {row.tier}',
+        ]
+        if isinstance(regime_note, str) and regime_note.strip():
+            fallback.append(regime_note.strip())
+        return ' · '.join(fallback)
 
 
 watchlist_service = WatchlistService()

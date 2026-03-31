@@ -25,6 +25,7 @@ from app.services.kraken_service import crypto_ledger
 from app.services.runtime_visibility import runtime_visibility_service
 from app.services.runtime_state import runtime_state
 from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
+from app.services.watchlist_service import watchlist_service
 from app.services.watchlist_exit_worker import watchlist_exit_worker
 from app.services.tradier_client import tradier_client
 
@@ -279,9 +280,11 @@ async def get_stock_history(
 
 
 @app.get('/api/ai/decisions')
-async def get_ai_decisions(limit: int = Query(50, ge=1, le=500)):
-    # Placeholder until Discord/webhook audit log storage is added.
-    return []
+async def get_ai_decisions(
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    return watchlist_service.get_ai_decision_feed(db, limit=limit)
 
 
 @app.get('/api/market-status')

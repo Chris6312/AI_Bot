@@ -25,6 +25,8 @@ import {
   SectionCard,
   StatusPill,
   ToneBadge,
+  getScopeSessionMeta,
+  getStatusMeta,
   type Tone,
 } from '@/components/operator-ui'
 import type {
@@ -54,48 +56,12 @@ function formatRelative(value?: string | null) {
   return formatDistanceToNow(new Date(value), { addSuffix: true })
 }
 
-function isHealthyValidationStatus(status?: string | null) {
-  const normalized = (status ?? '').trim().toLowerCase()
-  return normalized === 'accepted' || normalized === 'valid'
-}
-
-function stateTone(state?: string | null): Tone {
-  switch ((state ?? '').toUpperCase()) {
-    case 'ARMED':
-    case 'READY':
-    case 'RUNNING':
-    case 'OPEN':
-      return 'good'
-    case 'PAUSED':
-    case 'DEGRADED':
-    case 'CLOSED':
-      return 'warn'
-    case 'LOCKED':
-    case 'READ_ONLY':
-    case 'REJECTED':
-    case 'MISSING':
-    case 'DATA_UNAVAILABLE':
-      return 'danger'
-    default:
-      return 'muted'
-  }
-}
 
 function getAvailableToTrade(account?: StockAccount) {
   if (!account) return 0
   return account.availableToTrade ?? account.cash ?? account.buyingPower ?? 0
 }
 
-function getSessionBadgeLabel(scope: WatchlistScope, sessionLabel?: string | null, sessionOpen?: boolean) {
-  const trimmed = (sessionLabel ?? '').trim()
-  if (trimmed) {
-    return trimmed
-  }
-  if (scope === 'crypto_only') {
-    return '24/7 session'
-  }
-  return sessionOpen ? 'Session open' : 'Session closed'
-}
 
 export default function Dashboard() {
   const { data: botStatus } = useQuery<BotStatus>({
@@ -287,14 +253,14 @@ export default function Dashboard() {
             <StatusPill tone={marketStatus?.stock.isOpen ? 'good' : 'warn'} label={`Stocks ${marketStatus?.stock.isOpen ? 'open' : 'closed'}`} />
             <StatusPill tone="info" label="Crypto 24/7" />
             <StatusPill tone={botStatus?.running ? 'good' : 'warn'} label={botStatus?.running ? 'Runtime active' : 'Runtime paused'} />
-            <StatusPill tone={stateTone(botStatus?.executionGate.state)} label={`Gate ${botStatus?.executionGate.state ?? 'UNKNOWN'}`} />
+            <StatusPill tone={getStatusMeta(botStatus?.executionGate.state).tone} label={`Gate ${getStatusMeta(botStatus?.executionGate.state).canonicalLabel}`} />
           </>
         }
       />
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-5">
-        <MetricCard label="Combined paper equity" value={formatMoney(summary.totalEquity)} detail={`${formatMoney(summary.openPnl)} open P&L across stock + crypto`} icon={<Wallet className="h-5 w-5" />} />
-        <MetricCard label="Combined deployable cash" value={formatMoney(summary.availableCapital)} detail="Tradier available-to-trade plus crypto ledger cash" icon={<Shield className="h-5 w-5" />} />
+        <MetricCard label="Combined equity" value={formatMoney(summary.totalEquity)} detail={`${formatMoney(summary.openPnl)} open P&L across stock + crypto`} icon={<Wallet className="h-5 w-5" />} />
+        <MetricCard label="Deployable capital" value={formatMoney(summary.availableCapital)} detail="Stock available-to-trade plus crypto ledger cash" icon={<Shield className="h-5 w-5" />} />
         <MetricCard label="Active positions" value={String(summary.activePositions)} detail={`${stockPositions.length} stock · ${cryptoPositions.length} crypto`} icon={<TrendingUp className="h-5 w-5" />} />
         <MetricCard label="Watch symbols" value={String(summary.watchSymbols)} detail={`${stockWatchlist?.selectedCount ?? 0} stock · ${cryptoWatchlist?.selectedCount ?? 0} crypto`} icon={<ClipboardList className="h-5 w-5" />} />
         <MetricCard label="Dependency readiness" value={`${dependencySummary?.readyCount ?? 0}/${(dependencySummary?.readyCount ?? 0) + (dependencySummary?.degradedCount ?? 0) + (dependencySummary?.missingCount ?? 0)}`} detail={dependencySummary?.criticalReady ? 'Critical rails ready' : 'Critical rails degraded'} icon={<Activity className="h-5 w-5" />} />
@@ -363,8 +329,8 @@ export default function Dashboard() {
                     <div>
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="text-base font-semibold text-white">{decision.symbol}</span>
-                        <ToneBadge tone={decision.allowed ? 'good' : 'danger'}>{decision.allowed ? 'Allowed' : 'Rejected'}</ToneBadge>
-                        <ToneBadge tone={stateTone(decision.state)}>{decision.state}</ToneBadge>
+                        <ToneBadge tone={decision.allowed ? 'good' : 'danger'}>{decision.allowed ? 'Healthy' : 'Blocked'}</ToneBadge>
+                        <ToneBadge tone={getStatusMeta(decision.state).tone}>{getStatusMeta(decision.state).rawLabel}</ToneBadge>
                       </div>
                       <div className="mt-2 text-sm text-slate-400">{decision.executionSource} · {decision.assetClass}</div>
                     </div>
@@ -387,7 +353,10 @@ export default function Dashboard() {
                       <div className="font-medium text-white">{dependency.name}</div>
                       <div className="mt-1 text-sm text-slate-400">{dependency.reason || 'No detail provided.'}</div>
                     </div>
-                    <ToneBadge tone={stateTone(dependency.state)}>{dependency.state}</ToneBadge>
+                    <div className="flex flex-col items-end gap-2">
+                      <ToneBadge tone={getStatusMeta(dependency.state).tone}>{getStatusMeta(dependency.state).canonicalLabel}</ToneBadge>
+                      <span className="text-xs text-slate-500">Raw: {getStatusMeta(dependency.state).rawLabel}</span>
+                    </div>
                   </div>
                 </div>
               ))
@@ -419,8 +388,8 @@ function ScopePulseCard({
   const eligibleDueCount = dueSnapshot && 'summary' in dueSnapshot ? dueSnapshot.summary.eligibleDueCount : dueSnapshot && 'eligibleDueCount' in dueSnapshot ? dueSnapshot.eligibleDueCount : 0
   const blockedDueCount = dueSnapshot && 'summary' in dueSnapshot ? dueSnapshot.summary.blockedDueCount : dueSnapshot && 'blockedDueCount' in dueSnapshot ? dueSnapshot.blockedDueCount : 0
   const nextRun = dueSnapshot && 'scopes' in dueSnapshot ? dueSnapshot.scopes?.[scope]?.nextEvaluationAtUtc : dueSnapshot && 'nextEvaluationAtUtc' in dueSnapshot ? dueSnapshot.nextEvaluationAtUtc : null
-  const sessionLabel = dueSnapshot && 'scopes' in dueSnapshot ? dueSnapshot.scopes?.[scope]?.session.sessionLabel : dueSnapshot && 'session' in dueSnapshot ? dueSnapshot.session.sessionLabel : 'Unknown session'
-  const sessionOpen = dueSnapshot && 'scopes' in dueSnapshot ? dueSnapshot.scopes?.[scope]?.session.sessionOpen : dueSnapshot && 'session' in dueSnapshot ? dueSnapshot.session.sessionOpen : false
+  const session = dueSnapshot && 'scopes' in dueSnapshot ? dueSnapshot.scopes?.[scope]?.session : dueSnapshot && 'session' in dueSnapshot ? dueSnapshot.session : undefined
+  const sessionMeta = getScopeSessionMeta(scope, session)
 
   return (
     <SectionCard title={`${scopeLabels[scope]} pulse`} eyebrow="Scope snapshot" icon={<TimerReset className="h-4 w-4 text-cyan-300" />}>
@@ -428,8 +397,8 @@ function ScopePulseCard({
         <div>
           <div className="text-2xl font-semibold text-white">{watchlist?.provider ?? 'No active watchlist'}</div>
           <div className="mt-3 flex flex-wrap gap-2">
-            <ToneBadge tone={isHealthyValidationStatus(watchlist?.validationStatus) ? 'good' : 'warn'}>{watchlist?.validationStatus ?? 'missing'}</ToneBadge>
-            <ToneBadge tone={sessionOpen ? 'good' : 'warn'}>{getSessionBadgeLabel(scope, sessionLabel, sessionOpen)}</ToneBadge>
+            <ToneBadge tone={getStatusMeta(watchlist?.validationStatus).tone}>{getStatusMeta(watchlist?.validationStatus).canonicalLabel}</ToneBadge>
+            <ToneBadge tone={sessionMeta.tone}>{sessionMeta.label}</ToneBadge>
             <ToneBadge tone="info">{watchlist?.marketRegime ?? 'regime unavailable'}</ToneBadge>
           </div>
         </div>
