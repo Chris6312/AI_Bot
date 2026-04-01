@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.models.order_intent import OrderIntent
 from app.models.position import Position
 from app.models.trade import Trade
 from app.models.watchlist_monitor_state import WatchlistMonitorState
@@ -81,6 +82,7 @@ PROFIT_TARGET_SCALE_OUT_TEMPLATES = {'scale_out_then_trail', 'sell_into_strength
 FOLLOW_THROUGH_EXIT_TEMPLATES = {'first_failed_follow_through'}
 IMPULSE_TRAIL_TEMPLATES = {'trail_after_impulse'}
 IMPULSE_TRAIL_STOP_FACTOR = 0.5
+POSITION_MIRROR_SYNC_SOURCE = 'broker_position_mirror'
 
 
 class WatchlistValidationError(ValueError):
@@ -435,7 +437,13 @@ class WatchlistService:
                 for row in db.query(WatchlistSymbol).filter(WatchlistSymbol.upload_id == active_upload.upload_id).all()
             }
 
-        open_symbols = self._get_open_symbols(db, scope)
+        broker_positions: dict[str, dict[str, Any]] | None = None
+        if scope == 'stocks_only':
+            broker_positions = self._get_open_stock_broker_positions()
+            self._sync_stock_position_mirror_from_broker(db, observed_at=observed_at, broker_positions=broker_positions)
+            open_symbols = self._get_open_stock_symbols(db, broker_positions=broker_positions)
+        else:
+            open_symbols = self._get_open_symbols(db, scope)
         candidate_rows = db.query(WatchlistSymbol).filter(WatchlistSymbol.scope == scope).all()
 
         changed = 0
@@ -846,13 +854,20 @@ class WatchlistService:
             return self._get_open_stock_symbols(db)
         return self._get_open_crypto_symbols()
 
-    def _get_open_stock_symbols(self, db: Session) -> set[str]:
+    def _get_open_stock_symbols(
+        self,
+        db: Session,
+        *,
+        broker_positions: dict[str, dict[str, Any]] | None = None,
+    ) -> set[str]:
         open_symbols = {
             str(row.ticker or '').upper()
             for row in db.query(Position).filter(Position.is_open.is_(True)).all()
             if str(row.ticker or '').strip()
         }
-        open_symbols.update(self._get_open_stock_broker_symbols())
+        if broker_positions is None:
+            broker_positions = self._get_open_stock_broker_positions()
+        open_symbols.update(broker_positions.keys())
         return open_symbols
 
     def _get_open_stock_broker_symbols(self) -> set[str]:
@@ -873,6 +888,207 @@ class WatchlistService:
                 continue
             broker_positions[symbol] = position
         return broker_positions
+
+
+    @staticmethod
+    def _is_broker_sync_position(position: Position) -> bool:
+        reasoning = position.entry_reasoning if isinstance(position.entry_reasoning, dict) else {}
+        return str(reasoning.get('syncSource') or '').strip().lower() == POSITION_MIRROR_SYNC_SOURCE
+
+    def _sync_stock_position_mirror_from_broker(
+        self,
+        db: Session,
+        *,
+        observed_at: datetime,
+        broker_positions: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, int]:
+        if broker_positions is None:
+            broker_positions = self._get_open_stock_broker_positions()
+
+        open_rows = (
+            db.query(Position)
+            .filter(Position.is_open.is_(True))
+            .order_by(Position.id.desc())
+            .all()
+        )
+        rows_by_symbol: dict[str, list[Position]] = {}
+        for row in open_rows:
+            symbol = str(row.ticker or '').upper().strip()
+            if not symbol:
+                continue
+            rows_by_symbol.setdefault(symbol, []).append(row)
+
+        inserted = 0
+        updated = 0
+        closed = 0
+
+        for symbol, rows in rows_by_symbol.items():
+            if symbol in broker_positions:
+                continue
+            synthetic_rows = [row for row in rows if self._is_broker_sync_position(row)]
+            for row in synthetic_rows:
+                if row.is_open:
+                    row.is_open = False
+                    row.shares = 0
+                    row.updated_at = observed_at
+                    closed += 1
+
+        for symbol, broker_position in broker_positions.items():
+            rows = rows_by_symbol.get(symbol, [])
+            synthetic_row = next((row for row in rows if self._is_broker_sync_position(row)), None)
+            if synthetic_row is not None:
+                if self._apply_broker_snapshot_to_position_row(synthetic_row, broker_position, observed_at=observed_at):
+                    updated += 1
+                continue
+
+            if rows:
+                if len(rows) == 1 and self._apply_broker_snapshot_to_position_row(rows[0], broker_position, observed_at=observed_at):
+                    updated += 1
+                continue
+
+            watchlist_row = (
+                db.query(WatchlistSymbol)
+                .filter(WatchlistSymbol.scope == 'stocks_only', WatchlistSymbol.symbol == symbol)
+                .order_by(WatchlistSymbol.id.desc())
+                .first()
+            )
+            seed = self._resolve_stock_position_seed(
+                db,
+                symbol=symbol,
+                watchlist_row=watchlist_row,
+                broker_position=broker_position,
+                observed_at=observed_at,
+            )
+            entry_price = seed['avgEntryPrice']
+            current_price = seed['currentPrice']
+            new_row = Position(
+                account_id=seed['accountId'],
+                ticker=symbol,
+                shares=seed['shares'],
+                avg_entry_price=entry_price,
+                current_price=current_price,
+                unrealized_pnl=seed['unrealizedPnl'],
+                unrealized_pnl_pct=seed['unrealizedPnlPct'],
+                strategy=seed['strategy'],
+                entry_time=seed['entryTime'],
+                entry_reasoning=seed['entryReasoning'],
+                stop_loss=seed['stopLoss'],
+                profit_target=seed['profitTarget'],
+                peak_price=max(float(current_price or 0.0), float(entry_price or 0.0)),
+                trailing_stop=seed['trailingStop'],
+                is_open=True,
+                execution_id=seed['executionId'],
+            )
+            db.add(new_row)
+            inserted += 1
+
+        if inserted or updated or closed:
+            db.commit()
+        else:
+            db.rollback()
+        return {'inserted': inserted, 'updated': updated, 'closed': closed}
+
+    def _apply_broker_snapshot_to_position_row(
+        self,
+        row: Position,
+        broker_position: dict[str, Any],
+        *,
+        observed_at: datetime,
+    ) -> bool:
+        changed = False
+        broker_shares = int(round(float(broker_position.get('shares') or 0.0))) if broker_position.get('shares') is not None else 0
+        broker_avg = float(broker_position.get('avgPrice') or 0.0) if broker_position.get('avgPrice') is not None else None
+        broker_current = float(broker_position.get('currentPrice') or 0.0) if broker_position.get('currentPrice') is not None else None
+        broker_pnl = float(broker_position.get('pnl') or 0.0) if broker_position.get('pnl') is not None else None
+        broker_pnl_pct = float(broker_position.get('pnlPercent') or 0.0) if broker_position.get('pnlPercent') is not None else None
+
+        updates = {
+            'shares': broker_shares,
+            'avg_entry_price': broker_avg,
+            'current_price': broker_current,
+            'unrealized_pnl': broker_pnl,
+            'unrealized_pnl_pct': broker_pnl_pct,
+        }
+        for field_name, field_value in updates.items():
+            if getattr(row, field_name) != field_value and field_value is not None:
+                setattr(row, field_name, field_value)
+                changed = True
+
+        reference_price = max(float(row.peak_price or 0.0), float(broker_current or 0.0), float(broker_avg or 0.0))
+        if reference_price > float(row.peak_price or 0.0):
+            row.peak_price = reference_price
+            changed = True
+        if changed:
+            row.updated_at = observed_at
+        return changed
+
+    def _resolve_stock_position_seed(
+        self,
+        db: Session,
+        *,
+        symbol: str,
+        watchlist_row: WatchlistSymbol | None,
+        broker_position: dict[str, Any],
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        latest_buy_intent = (
+            db.query(OrderIntent)
+            .filter(
+                OrderIntent.asset_class == 'stock',
+                OrderIntent.symbol == symbol,
+                OrderIntent.side.in_(['BUY', 'buy']),
+                OrderIntent.status.in_(['FILLED', 'PARTIALLY_FILLED']),
+            )
+            .order_by(OrderIntent.last_fill_at.desc(), OrderIntent.first_fill_at.desc(), OrderIntent.submitted_at.desc(), OrderIntent.created_at.desc())
+            .first()
+        )
+        avg_entry_price = float(broker_position.get('avgPrice') or 0.0) if broker_position.get('avgPrice') is not None else 0.0
+        current_price = float(broker_position.get('currentPrice') or 0.0) if broker_position.get('currentPrice') is not None else avg_entry_price
+        entry_time = observed_at
+        if latest_buy_intent is not None:
+            entry_time = latest_buy_intent.last_fill_at or latest_buy_intent.first_fill_at or latest_buy_intent.submitted_at or latest_buy_intent.created_at or observed_at
+        strategy = str(watchlist_row.setup_template or '').strip() if watchlist_row is not None else ''
+        if not strategy:
+            strategy = 'WATCHLIST_ENTRY'
+        stop_loss = avg_entry_price * (1 - settings.STOP_LOSS_PCT) if avg_entry_price > 0 else 0.0
+        profit_target = avg_entry_price * (1 + settings.PROFIT_TARGET_PCT) if avg_entry_price > 0 else 0.0
+        trailing_stop = avg_entry_price * (1 - settings.TRAILING_STOP_PCT) if avg_entry_price > 0 else None
+        entry_reasoning = {
+            'syncSource': POSITION_MIRROR_SYNC_SOURCE,
+            'syncedAtUtc': observed_at.isoformat(),
+            'brokerSnapshot': {
+                'shares': int(round(float(broker_position.get('shares') or 0.0))),
+                'avgPrice': avg_entry_price,
+                'currentPrice': current_price,
+                'marketValue': float(broker_position.get('marketValue') or 0.0),
+                'pnl': float(broker_position.get('pnl') or 0.0),
+                'pnlPercent': float(broker_position.get('pnlPercent') or 0.0),
+            },
+            'watchlist': {
+                'setupTemplate': watchlist_row.setup_template if watchlist_row is not None else None,
+                'exitTemplate': watchlist_row.exit_template if watchlist_row is not None else None,
+                'maxHoldHours': watchlist_row.max_hold_hours if watchlist_row is not None else None,
+            },
+        }
+        if latest_buy_intent is not None:
+            entry_reasoning['seedIntentId'] = latest_buy_intent.intent_id
+            entry_reasoning['seedIntentStatus'] = latest_buy_intent.status
+            entry_reasoning['seedExecutionSource'] = latest_buy_intent.execution_source
+        return {
+            'accountId': latest_buy_intent.account_id if latest_buy_intent is not None else None,
+            'shares': int(round(float(broker_position.get('shares') or 0.0))),
+            'avgEntryPrice': avg_entry_price,
+            'currentPrice': current_price,
+            'unrealizedPnl': float(broker_position.get('pnl') or 0.0) if broker_position.get('pnl') is not None else None,
+            'unrealizedPnlPct': float(broker_position.get('pnlPercent') or 0.0) if broker_position.get('pnlPercent') is not None else None,
+            'strategy': strategy,
+            'entryTime': entry_time,
+            'entryReasoning': entry_reasoning,
+            'stopLoss': float(stop_loss),
+            'profitTarget': float(profit_target),
+            'trailingStop': float(trailing_stop) if trailing_stop is not None else None,
+            'executionId': latest_buy_intent.intent_id if latest_buy_intent is not None else None,
+        }
 
     def _get_open_crypto_symbols(self) -> set[str]:
         open_symbols: set[str] = set()
@@ -1054,6 +1270,8 @@ class WatchlistService:
         return self._build_crypto_position_state_map(db, observed_at=observed_at)
 
     def _build_stock_position_state_map(self, db: Session, *, observed_at: datetime) -> dict[str, dict[str, Any]]:
+        broker_positions = self._get_open_stock_broker_positions()
+        self._sync_stock_position_mirror_from_broker(db, observed_at=observed_at, broker_positions=broker_positions)
         state_map: dict[str, dict[str, Any]] = {}
         positions = (
             db.query(Position)
@@ -1151,11 +1369,13 @@ class WatchlistService:
                 stop_loss_breached=stop_loss_breached,
                 trailing_stop_breached=trailing_stop_breached,
             )
+            is_broker_sync_position = self._is_broker_sync_position(position)
             state_map[symbol] = {
                 'hasOpenPosition': True,
-                'accountId': position.account_id,
-                'positionId': position.id,
-                'positionSource': 'database',
+                'accountId': None if is_broker_sync_position else position.account_id,
+                'positionId': None if is_broker_sync_position else position.id,
+                'positionSource': 'broker' if is_broker_sync_position else 'database',
+                'positionSyncGap': is_broker_sync_position,
                 'shares': int(position.shares or 0),
                 'avgEntryPrice': avg_entry_price,
                 'currentPrice': current_price,
@@ -1188,7 +1408,6 @@ class WatchlistService:
                 'trailingStopBreached': trailing_stop_breached,
             }
 
-        broker_positions = self._get_open_stock_broker_positions()
         for symbol, broker_position in broker_positions.items():
             if symbol in state_map:
                 continue

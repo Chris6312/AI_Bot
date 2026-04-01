@@ -237,7 +237,9 @@ export default function Positions() {
               ['Mode', botStatus?.stockMode ?? 'PAPER', 'info'],
               ['Portfolio value', formatMoney(stockAccount?.portfolioValue ?? 0), 'muted'],
               ['Available to trade', formatMoney(getAvailableToTrade(stockAccount)), 'good'],
-              ['Cash', formatMoney(stockAccount?.cash ?? 0), 'muted'],
+              ...(Math.abs((stockAccount?.cash ?? 0) - getAvailableToTrade(stockAccount)) >= 0.01
+                ? [['Cash', formatMoney(stockAccount?.cash ?? 0), 'muted'] as [string, string, Tone]]
+                : []),
               ...(Math.abs(getBrokerBuyingPower(stockAccount) - getAvailableToTrade(stockAccount)) >= 0.01
                 ? [['Broker buying power', formatMoney(getBrokerBuyingPower(stockAccount)), 'warn'] as [string, string, Tone]]
                 : []),

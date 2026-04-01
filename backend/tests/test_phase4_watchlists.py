@@ -603,6 +603,70 @@ def test_reconcile_revives_inactive_stock_row_from_broker_snapshot(tmp_path, mon
         assert historical_aapl.monitoring_status == MANAGED_ONLY
 
 
+
+def test_reconcile_scope_backfills_broker_only_stock_position_into_db(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        db.add(
+            OrderIntent(
+                intent_id='intent_aapl_fill',
+                account_id='paper',
+                asset_class='stock',
+                symbol='AAPL',
+                side='BUY',
+                requested_quantity=10,
+                requested_price=190.0,
+                filled_quantity=10,
+                avg_fill_price=190.5,
+                status='FILLED',
+                execution_source='WATCHLIST_MONITOR_ENTRY',
+                submitted_at=datetime.now(UTC) - timedelta(minutes=5),
+                first_fill_at=datetime.now(UTC) - timedelta(minutes=4),
+                last_fill_at=datetime.now(UTC) - timedelta(minutes=4),
+                context_json={'setupTemplate': 'pullback_reclaim'},
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_positions_snapshot',
+            lambda mode=None: [
+                {
+                    'symbol': 'AAPL',
+                    'shares': 10,
+                    'avgPrice': 190.5,
+                    'currentPrice': 192.25,
+                    'marketValue': 1922.5,
+                    'pnl': 17.5,
+                    'pnlPercent': 0.92,
+                }
+            ],
+        )
+
+        result = watchlist_service.reconcile_scope_statuses(db, scope='stocks_only')
+        assert result['changedRows'] >= 0
+
+        mirrored = db.query(Position).filter(Position.ticker == 'AAPL', Position.is_open.is_(True)).order_by(Position.id.desc()).first()
+        assert mirrored is not None
+        assert mirrored.shares == 10
+        assert mirrored.avg_entry_price == 190.5
+        assert mirrored.current_price == 192.25
+        assert mirrored.execution_id == 'intent_aapl_fill'
+        assert isinstance(mirrored.entry_reasoning, dict)
+        assert mirrored.entry_reasoning.get('syncSource') == 'broker_position_mirror'
+        assert mirrored.entry_reasoning.get('seedIntentId') == 'intent_aapl_fill'
+
+        monkeypatch.setattr(tradier_client, 'get_positions_snapshot', lambda mode=None: [])
+        watchlist_service.reconcile_scope_statuses(db, scope='stocks_only')
+        db.refresh(mirrored)
+        assert mirrored.is_open is False
+        assert mirrored.shares == 0
+
+
 def test_db_positions_endpoint_returns_position_rows(tmp_path) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
         def override_get_db():
