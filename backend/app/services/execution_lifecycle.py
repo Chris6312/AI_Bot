@@ -10,6 +10,7 @@ from app.models.order_event import OrderEvent
 from app.models.order_intent import OrderIntent
 from app.models.position import Position
 from app.models.trade import Trade
+from app.services.discord_notifications import discord_notifications
 
 
 def _utcnow() -> datetime:
@@ -314,6 +315,19 @@ class ExecutionLifecycleService:
         )
         db.commit()
         db.refresh(intent)
+        discord_notifications.send_trade_alert(
+            asset_class='stock',
+            side='BUY',
+            symbol=intent.symbol,
+            quantity=filled_shares,
+            price=entry_price,
+            execution_source=intent.execution_source,
+            account_id=intent.account_id,
+            extra={
+                'mode': (intent.context_json or {}).get('mode'),
+                'reason': (intent.context_json or {}).get('setupTemplate') or (intent.context_json or {}).get('strategy'),
+            },
+        )
         return {
             'position_id': position.id,
             'trade_id': trade.id,
@@ -436,6 +450,22 @@ class ExecutionLifecycleService:
         )
         db.commit()
         db.refresh(intent)
+        discord_notifications.send_trade_alert(
+            asset_class='stock',
+            side='SELL',
+            symbol=intent.symbol,
+            quantity=applied_shares,
+            price=exit_price,
+            execution_source=intent.execution_source,
+            account_id=intent.account_id,
+            status='FILLED',
+            extra={
+                'mode': (intent.context_json or {}).get('mode'),
+                'trigger': exit_trigger,
+                'remainingShares': remaining_shares,
+                'pnl': trade.gross_pnl if remaining_shares <= 0 else None,
+            },
+        )
         return {
             'position_id': position.id,
             'trade_id': trade.id,

@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from app.services.discord_notifications import discord_notifications
+
 logger = logging.getLogger(__name__)
 
 PAIR_SYMBOL_SYNONYMS: dict[str, set[str]] = {
@@ -484,6 +486,20 @@ class CryptoPaperLedger:
             'balance': float(self.balance),
         }
         self.trades.append(trade)
+
+        discord_notifications.send_trade_alert(
+            asset_class='crypto',
+            side=side,
+            symbol=pair,
+            quantity=float(amount_dec),
+            price=float(price_dec),
+            execution_source='CRYPTO_PAPER_LEDGER',
+            account_id='paper-crypto-ledger',
+            status=str(trade.get('status') or 'FILLED').upper(),
+            extra={
+                'mode': 'PAPER',
+            },
+        )
 
         logger.info('Paper trade executed: %s %s %s @ $%.2f', side, amount, pair, price)
         return trade

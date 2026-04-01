@@ -191,11 +191,11 @@ function ScopeMonitoringPanel({
           <div className="text-sm font-semibold uppercase tracking-[0.18em] text-slate-500">{scopeLabels[scope]}</div>
           <h2 className="mt-1 text-2xl font-semibold text-white">Monitoring snapshot</h2>
           <div className="mt-3 flex flex-wrap gap-2">
-            <ToneBadge tone={sessionMeta.tone}>{sessionMeta.label}</ToneBadge>
+            <ToneBadge tone={sessionMeta.tone} tooltip={sessionMeta.detail ?? undefined}>{sessionMeta.label}</ToneBadge>
             {sessionMeta.detail ? <span className="self-center text-xs text-slate-500">{sessionMeta.detail}</span> : null}
-            <ToneBadge tone="muted">Due {orchestration?.dueCount ?? 0}</ToneBadge>
-            <ToneBadge tone="info">Eligible {orchestration?.eligibleDueCount ?? 0}</ToneBadge>
-            {orchestration?.blockedDueCount ? <ToneBadge tone="warn">Blocked {orchestration.blockedDueCount}</ToneBadge> : null}
+            <ToneBadge tone="muted" tooltip="Rows scheduled for evaluation in this scope.">Due {orchestration?.dueCount ?? 0}</ToneBadge>
+            <ToneBadge tone="info" tooltip="Rows due now and currently unblocked for evaluation.">Eligible {orchestration?.eligibleDueCount ?? 0}</ToneBadge>
+            {orchestration?.blockedDueCount ? <ToneBadge tone="warn" tooltip="Rows due for evaluation but blocked by session, data freshness, or control state.">Blocked {orchestration.blockedDueCount}</ToneBadge> : null}
           </div>
         </div>
 

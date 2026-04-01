@@ -17,6 +17,7 @@ from app.core.database import SessionLocal
 from app.services.control_plane import discord_decision_guard, get_control_plane_status, get_execution_gate_status
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.position_sizer import position_sizer
+from app.services.discord_notifications import discord_notifications
 
 try:
     from app.services.crypto_analyzer import crypto_analyzer
@@ -72,6 +73,7 @@ class TradingBot(commands.Bot):
 
     async def on_ready(self):
         logger.info('Discord bot connected as %s', self.user)
+        discord_notifications.register_bot(self)
         channel = self.get_channel(self.trading_channel_id)
         if channel:
             control_plane = get_control_plane_status()
@@ -85,6 +87,10 @@ class TradingBot(commands.Bot):
 
         if settings.APP_ENV == 'production' and not self.daily_summary.is_running():
             self.daily_summary.start()
+
+    async def close(self):
+        discord_notifications.unregister_bot(self)
+        await super().close()
 
     def _authorize_discord_message(self, message):
         authorization = discord_decision_guard.authorize_message(message)

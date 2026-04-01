@@ -1,13 +1,12 @@
 import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { Activity, Bitcoin, Clock3, ShieldCheck, TrendingUp, Wallet } from 'lucide-react'
+import { Activity, Bitcoin, Clock3, TrendingUp, Wallet } from 'lucide-react'
 
 import { api } from '@/lib/api'
 import {
   DetailRow,
   EmptyState,
-  MetricCard,
   PageHero,
   SectionCard,
   StatusPill,
@@ -161,12 +160,41 @@ export default function Positions() {
         }
       />
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-5">
-        <MetricCard label="Open positions" value={String(summary.totalPositions)} detail={`${stockPositions.length} stock · ${cryptoPositions.length} crypto`} icon={<TrendingUp className="h-5 w-5" />} />
-        <MetricCard label="Open P&L" value={formatMoney(summary.openPnl)} detail="Across stock and crypto inventory" icon={<Activity className="h-5 w-5" />} />
-        <MetricCard label="Stock exposure" value={formatMoney(summary.stockExposure)} detail={`${formatMoney(getAvailableToTrade(stockAccount))} available`} icon={<ShieldCheck className="h-5 w-5" />} />
-        <MetricCard label="Crypto exposure" value={formatMoney(summary.cryptoExposure)} detail={`${formatMoney(cryptoLedger?.balance ?? 0)} cash balance`} icon={<Bitcoin className="h-5 w-5" />} />
-        <MetricCard label="Expiring within 24h" value={String(summary.expiringSoon)} detail="Time-stop pressure" icon={<Clock3 className="h-5 w-5" />} />
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
+        <AccountCard
+          title="Stock account"
+          rows={[
+            ['Mode', botStatus?.stockMode ?? 'PAPER', 'info'],
+            ['Portfolio value', formatMoney(stockAccount?.portfolioValue ?? 0), 'muted'],
+            ['Available to trade', formatMoney(getAvailableToTrade(stockAccount)), 'good'],
+            ['Cash', formatMoney(stockAccount?.cash ?? 0), 'muted'],
+            ...(Math.abs(getBrokerBuyingPower(stockAccount) - getAvailableToTrade(stockAccount)) >= 0.01
+              ? [['Broker buying power', formatMoney(getBrokerBuyingPower(stockAccount)), 'warn'] as [string, string, Tone]]
+              : []),
+          ]}
+        />
+
+        <AccountCard
+          title="Crypto paper ledger"
+          rows={[
+            ['Equity', formatMoney(cryptoLedger?.equity ?? 0), 'info'],
+            ['Market value', formatMoney(cryptoLedger?.marketValue ?? 0), 'muted'],
+            ['Realized P&L', formatMoney(cryptoLedger?.realizedPnL ?? 0), toneFromPnl(cryptoLedger?.realizedPnL ?? 0)],
+            ['Net P&L', formatMoney(cryptoLedger?.netPnL ?? cryptoLedger?.totalPnL ?? 0), toneFromPnl(cryptoLedger?.netPnL ?? cryptoLedger?.totalPnL ?? 0)],
+          ]}
+        />
+
+        <SectionCard title="Inventory summary" eyebrow="Pressure board" icon={<Clock3 className="h-4 w-4 text-amber-300" />}>
+          <div className="space-y-3 text-sm text-slate-400">
+            <DetailRow label="Open positions" value={String(summary.totalPositions)} tone="info" />
+            <DetailRow label="Open split" value={`${stockPositions.length} stock · ${cryptoPositions.length} crypto`} tone="muted" />
+            <DetailRow label="Protective pending" value={String(summary.protectivePending)} tone={summary.protectivePending > 0 ? 'warn' : 'good'} />
+            <DetailRow label="Expiring within 24h" value={String(summary.expiringSoon)} tone={summary.expiringSoon > 0 ? 'warn' : 'good'} />
+            <DetailRow label="Stock exposure" value={formatMoney(summary.stockExposure)} tone="muted" />
+            <DetailRow label="Crypto exposure" value={formatMoney(summary.cryptoExposure)} tone="muted" />
+            <DetailRow label="Open P&L" value={formatMoney(summary.openPnl)} tone={toneFromPnl(summary.openPnl)} />
+          </div>
+        </SectionCard>
       </div>
 
       <div className="grid grid-cols-1 gap-6 2xl:grid-cols-[minmax(0,1.45fr)_minmax(360px,0.95fr)]">
@@ -203,29 +231,6 @@ export default function Positions() {
               </div>
             )}
           </SectionCard>
-
-          <AccountCard
-            title="Stock account"
-            rows={[
-              ['Mode', botStatus?.stockMode ?? 'PAPER', 'info'],
-              ['Portfolio value', formatMoney(stockAccount?.portfolioValue ?? 0), 'muted'],
-              ['Available to trade', formatMoney(getAvailableToTrade(stockAccount)), 'good'],
-              ['Cash', formatMoney(stockAccount?.cash ?? 0), 'muted'],
-              ...(Math.abs(getBrokerBuyingPower(stockAccount) - getAvailableToTrade(stockAccount)) >= 0.01
-                ? [['Broker buying power', formatMoney(getBrokerBuyingPower(stockAccount)), 'warn'] as [string, string, Tone]]
-                : []),
-            ]}
-          />
-
-          <AccountCard
-            title="Crypto paper ledger"
-            rows={[
-              ['Equity', formatMoney(cryptoLedger?.equity ?? 0), 'info'],
-              ['Market value', formatMoney(cryptoLedger?.marketValue ?? 0), 'muted'],
-              ['Realized P&L', formatMoney(cryptoLedger?.realizedPnL ?? 0), toneFromPnl(cryptoLedger?.realizedPnL ?? 0)],
-              ['Net P&L', formatMoney(cryptoLedger?.netPnL ?? cryptoLedger?.totalPnL ?? 0), toneFromPnl(cryptoLedger?.netPnL ?? cryptoLedger?.totalPnL ?? 0)],
-            ]}
-          />
         </div>
       </div>
 

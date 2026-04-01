@@ -187,6 +187,34 @@ export function canonicalStatusLabel(raw?: string | null): string {
   return getStatusMeta(raw).canonicalLabel
 }
 
+
+const BADGE_TOOLTIP_MAP: Record<string, string> = {
+  'stocks closed': 'Stock monitoring is outside the regular market session right now.',
+  'crypto 24/7': 'Crypto monitoring runs continuously because crypto markets do not close.',
+  'runtime active': 'The bot runtime is running and its worker loops should be active.',
+  'runtime paused': 'The bot runtime is paused, so automated actions are not advancing.',
+  'gate healthy': 'The centralized pre-trade gate is currently allowing eligible orders to proceed.',
+  'gate blocked': 'The centralized pre-trade gate is currently preventing new orders from advancing.',
+  'operationally ready': 'Dependencies and worker probes look healthy enough for normal operation.',
+  'operational review needed': 'One or more dependencies or worker probes need attention before trusting the system fully.',
+  'operational review': 'One or more dependencies or worker probes need attention before trusting the system fully.',
+  'due': 'Rows already scheduled for evaluation in this scope.',
+  'eligible': 'Rows due now and currently unblocked for evaluation.',
+  'blocked': 'Rows due now but blocked by session, data freshness, or control state.',
+  '0 protective': 'Open positions currently waiting on protective exit handling.',
+  '0 expiring soon': 'Positions nearing their time-stop deadline.',
+}
+
+export function getBadgeTooltip(label?: string | null): string | null {
+  const normalized = (label ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if (BADGE_TOOLTIP_MAP[normalized]) return BADGE_TOOLTIP_MAP[normalized]
+  if (normalized.startsWith('due ')) return BADGE_TOOLTIP_MAP['due']
+  if (normalized.startsWith('eligible ')) return BADGE_TOOLTIP_MAP['eligible']
+  if (normalized.startsWith('blocked ')) return BADGE_TOOLTIP_MAP['blocked']
+  return null
+}
+
 export function PageHero({
   eyebrow,
   title,
@@ -247,14 +275,16 @@ export function MetricCard({
   value,
   detail,
   icon,
+  tooltip,
 }: {
   label: string
   value: string
   detail: string
   icon?: ReactNode
+  tooltip?: string
 }) {
   return (
-    <div className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
+    <div title={tooltip} className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
       <div className="flex items-center justify-between gap-3">
         <div className="text-sm text-slate-400">{label}</div>
         {icon ? <div className="text-cyan-300">{icon}</div> : null}
@@ -284,12 +314,12 @@ export function DetailRow({ label, value, tone = 'muted' }: { label: string; val
   )
 }
 
-export function StatusPill({ label, tone, compact = false }: { label: string; tone: Tone; compact?: boolean }) {
-  return <span className={`${compact ? 'px-2 py-1 text-[11px]' : 'px-3 py-2 text-sm'} rounded-full ${toneBadgeClass(tone)}`}>{label}</span>
+export function StatusPill({ label, tone, compact = false, tooltip }: { label: string; tone: Tone; compact?: boolean; tooltip?: string }) {
+  return <span title={tooltip} className={`${compact ? 'px-2 py-1 text-[11px]' : 'px-3 py-2 text-sm'} rounded-full ${toneBadgeClass(tone)}`}>{label}</span>
 }
 
-export function ToneBadge({ children, tone }: { children: ReactNode; tone: Tone }) {
-  return <span className={`rounded-full px-2.5 py-1 text-xs font-semibold uppercase tracking-wide ${toneBadgeClass(tone)}`}>{children}</span>
+export function ToneBadge({ children, tone, tooltip }: { children: ReactNode; tone: Tone; tooltip?: string }) {
+  return <span title={tooltip} className={`rounded-full px-2.5 py-1 text-xs font-semibold uppercase tracking-wide ${toneBadgeClass(tone)}`}>{children}</span>
 }
 
 export function EmptyState({ message }: { message: string }) {

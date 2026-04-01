@@ -1,17 +1,14 @@
-import { useMemo } from 'react'
+import { useMemo, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import {
-  Activity,
   AlertTriangle,
   ArrowRight,
-  ClipboardList,
   FileSearch,
   Radar,
   Shield,
   TimerReset,
-  TrendingUp,
   Wallet,
 } from 'lucide-react'
 
@@ -19,7 +16,6 @@ import { api } from '@/lib/api'
 import {
   DetailRow,
   EmptyState,
-  MetricCard,
   MiniMetric,
   PageHero,
   SectionCard,
@@ -56,12 +52,10 @@ function formatRelative(value?: string | null) {
   return formatDistanceToNow(new Date(value), { addSuffix: true })
 }
 
-
 function getAvailableToTrade(account?: StockAccount) {
   if (!account) return 0
   return account.availableToTrade ?? account.cash ?? account.buyingPower ?? 0
 }
-
 
 export default function Dashboard() {
   const { data: botStatus } = useQuery<BotStatus>({
@@ -155,19 +149,32 @@ export default function Dashboard() {
   })
 
   const summary = useMemo(() => {
-    const stockEquity = stockAccount?.portfolioValue ?? 0
-    const cryptoEquity = cryptoLedger?.equity ?? 0
-    const stockPnl = stockAccount?.unrealizedPnL ?? 0
-    const cryptoPnl = cryptoLedger?.netPnL ?? cryptoLedger?.totalPnL ?? 0
+    const stockCash = getAvailableToTrade(stockAccount)
+    const stockExposure = stockPositions.reduce((sum, position) => sum + (position.marketValue ?? 0), 0)
+    const stockEquity = stockAccount?.portfolioValue ?? stockCash + stockExposure
+    const stockPnl = stockAccount?.unrealizedPnL ?? stockPositions.reduce((sum, position) => sum + (position.pnl ?? 0), 0)
+
+    const cryptoCash = cryptoLedger?.balance ?? 0
+    const cryptoExposure = cryptoLedger?.marketValue ?? cryptoPositions.reduce((sum, position) => sum + (position.marketValue ?? 0), 0)
+    const cryptoEquity = cryptoLedger?.equity ?? cryptoCash + cryptoExposure
+    const cryptoPnl = cryptoLedger?.netPnL ?? cryptoLedger?.totalPnL ?? cryptoPositions.reduce((sum, position) => sum + (position.pnl ?? 0), 0)
 
     return {
       totalEquity: stockEquity + cryptoEquity,
-      openPnl: stockPnl + cryptoPnl,
+      totalOpenPnl: stockPnl + cryptoPnl,
+      stockEquity,
+      stockOpenPnl: stockPnl,
+      stockCash,
+      stockExposure,
+      cryptoEquity,
+      cryptoOpenPnl: cryptoPnl,
+      cryptoCash,
+      cryptoExposure,
       activePositions: stockPositions.length + cryptoPositions.length,
       watchSymbols: (stockWatchlist?.selectedCount ?? 0) + (cryptoWatchlist?.selectedCount ?? 0),
-      availableCapital: getAvailableToTrade(stockAccount) + (cryptoLedger?.balance ?? 0),
+      availableCapital: stockCash + cryptoCash,
     }
-  }, [cryptoLedger, cryptoPositions.length, stockAccount, stockPositions.length, stockWatchlist?.selectedCount, cryptoWatchlist?.selectedCount])
+  }, [cryptoLedger, cryptoPositions, stockAccount, stockPositions, stockWatchlist?.selectedCount, cryptoWatchlist?.selectedCount])
 
   const dependencySummary = runtimeVisibility?.dependencies.summary
   const recentGateDecisions = runtimeVisibility?.gate.recent ?? []
@@ -258,12 +265,56 @@ export default function Dashboard() {
         }
       />
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-5">
-        <MetricCard label="Combined equity" value={formatMoney(summary.totalEquity)} detail={`${formatMoney(summary.openPnl)} open P&L across stock + crypto`} icon={<Wallet className="h-5 w-5" />} />
-        <MetricCard label="Deployable capital" value={formatMoney(summary.availableCapital)} detail="Stock available-to-trade plus crypto ledger cash" icon={<Shield className="h-5 w-5" />} />
-        <MetricCard label="Active positions" value={String(summary.activePositions)} detail={`${stockPositions.length} stock · ${cryptoPositions.length} crypto`} icon={<TrendingUp className="h-5 w-5" />} />
-        <MetricCard label="Watch symbols" value={String(summary.watchSymbols)} detail={`${stockWatchlist?.selectedCount ?? 0} stock · ${cryptoWatchlist?.selectedCount ?? 0} crypto`} icon={<ClipboardList className="h-5 w-5" />} />
-        <MetricCard label="Dependency readiness" value={`${dependencySummary?.readyCount ?? 0}/${(dependencySummary?.readyCount ?? 0) + (dependencySummary?.degradedCount ?? 0) + (dependencySummary?.missingCount ?? 0)}`} detail={dependencySummary?.criticalReady ? 'Critical rails ready' : 'Critical rails degraded'} icon={<Activity className="h-5 w-5" />} />
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+        <EquityGroupCard
+          title="Total book"
+          icon={<Wallet className="h-5 w-5" />}
+          eyebrow="Whole account"
+          primaryLabel="Total equity"
+          primaryValue={formatMoney(summary.totalEquity)}
+          secondaryLabel="Total open P&L"
+          secondaryValue={formatMoney(summary.totalOpenPnl)}
+          secondaryTone={summary.totalOpenPnl >= 0 ? 'good' : 'danger'}
+          details={[
+            { label: 'Deployable cash', value: formatMoney(summary.availableCapital) },
+            { label: 'Capital in market', value: formatMoney(summary.stockExposure + summary.cryptoExposure) },
+          ]}
+        />
+        <EquityGroupCard
+          title="Stock sleeve"
+          icon={<Shield className="h-5 w-5" />}
+          eyebrow="Equity + inventory"
+          primaryLabel="Stock equity"
+          primaryValue={formatMoney(summary.stockEquity)}
+          secondaryLabel="Stock open P&L"
+          secondaryValue={formatMoney(summary.stockOpenPnl)}
+          secondaryTone={summary.stockOpenPnl >= 0 ? 'good' : 'danger'}
+          details={[
+            { label: 'Deployable stock cash', value: formatMoney(summary.stockCash) },
+            { label: 'Stock exposure', value: formatMoney(summary.stockExposure) },
+          ]}
+        />
+        <EquityGroupCard
+          title="Crypto sleeve"
+          icon={<Wallet className="h-5 w-5" />}
+          eyebrow="Equity + inventory"
+          primaryLabel="Crypto equity"
+          primaryValue={formatMoney(summary.cryptoEquity)}
+          secondaryLabel="Crypto open P&L"
+          secondaryValue={formatMoney(summary.cryptoOpenPnl)}
+          secondaryTone={summary.cryptoOpenPnl >= 0 ? 'good' : 'danger'}
+          details={[
+            { label: 'Deployable crypto cash', value: formatMoney(summary.cryptoCash) },
+            { label: 'Crypto exposure', value: formatMoney(summary.cryptoExposure) },
+          ]}
+        />
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <MiniMetric label="Deployable capital" value={formatMoney(summary.availableCapital)} detail="Stock available-to-trade plus crypto ledger cash" />
+        <MiniMetric label="Active positions" value={String(summary.activePositions)} detail={`${stockPositions.length} stock · ${cryptoPositions.length} crypto`} />
+        <MiniMetric label="Watch symbols" value={String(summary.watchSymbols)} detail={`${stockWatchlist?.selectedCount ?? 0} stock · ${cryptoWatchlist?.selectedCount ?? 0} crypto`} />
+        <MiniMetric label="Dependency readiness" value={`${dependencySummary?.readyCount ?? 0}/${(dependencySummary?.readyCount ?? 0) + (dependencySummary?.degradedCount ?? 0) + (dependencySummary?.missingCount ?? 0)}`} detail={dependencySummary?.criticalReady ? 'Critical rails ready' : 'Critical rails degraded'} />
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.95fr)]">
@@ -367,6 +418,59 @@ export default function Dashboard() {
         </SectionCard>
       </div>
     </div>
+  )
+}
+
+function EquityGroupCard({
+  title,
+  eyebrow,
+  icon,
+  primaryLabel,
+  primaryValue,
+  secondaryLabel,
+  secondaryValue,
+  secondaryTone,
+  details,
+}: {
+  title: string
+  eyebrow: string
+  icon: ReactNode
+  primaryLabel: string
+  primaryValue: string
+  secondaryLabel: string
+  secondaryValue: string
+  secondaryTone: Tone
+  details: Array<{ label: string; value: string }>
+}) {
+  return (
+    <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{eyebrow}</div>
+          <div className="mt-1 text-base font-semibold text-white">{title}</div>
+        </div>
+        <div className="text-cyan-300">{icon}</div>
+      </div>
+
+      <div className="mt-5 space-y-5">
+        <div>
+          <div className="text-sm text-slate-400">{primaryLabel}</div>
+          <div className="mt-2 text-3xl font-semibold text-white">{primaryValue}</div>
+        </div>
+        <div>
+          <div className="text-sm text-slate-400">{secondaryLabel}</div>
+          <div className={`mt-2 text-3xl font-semibold ${secondaryTone === 'danger' ? 'text-rose-300' : secondaryTone === 'good' ? 'text-emerald-300' : 'text-white'}`}>{secondaryValue}</div>
+        </div>
+      </div>
+
+      <div className="mt-5 border-t border-slate-800 pt-4">
+        <div className="space-y-3 text-sm text-slate-400">
+          {details.map((detail) => (
+            <DetailRow key={detail.label} label={detail.label} value={detail.value} />
+          ))}
+        </div>
+      </div>
+    </section>
   )
 }
 

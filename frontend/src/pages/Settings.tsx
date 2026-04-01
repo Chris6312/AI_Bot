@@ -11,7 +11,7 @@ import {
 } from 'lucide-react'
 
 import { api } from '@/lib/api'
-import { MetricCard, PageHero, StatusPill, getStatusMeta } from '@/components/operator-ui'
+import { MetricCard, PageHero, StatusPill, getBadgeTooltip, getStatusMeta } from '@/components/operator-ui'
 import type {
   BotStatus,
   DependencyCheck,
@@ -521,9 +521,11 @@ function EmptyState({ message, compact = false }: { message: string; compact?: b
 function StatusBadge({
   tone,
   children,
+  tooltip,
 }: {
   tone: 'good' | 'warn' | 'danger' | 'info' | 'muted'
   children: string
+  tooltip?: string | null
 }) {
   const className =
     tone === 'good'
@@ -536,7 +538,18 @@ function StatusBadge({
             ? 'border-cyan-800/70 bg-cyan-500/10 text-cyan-300'
             : 'border-slate-800 bg-slate-950/80 text-slate-300'
 
-  return <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${className}`}>{children}</span>
+  const hint = (tooltip ?? getBadgeTooltip(children) ?? '').trim() || null
+
+  return (
+    <span className="group relative inline-flex">
+      <span title={hint ?? undefined} className={`rounded-full border px-2.5 py-1 text-xs font-medium ${className}`}>{children}</span>
+      {hint ? (
+        <span className="pointer-events-none absolute left-1/2 top-full z-30 mt-2 hidden w-56 -translate-x-1/2 rounded-2xl border border-slate-700 bg-slate-950/95 px-3 py-2 text-left text-xs font-medium text-slate-200 shadow-2xl group-hover:block">
+          {hint}
+        </span>
+      ) : null}
+    </span>
+  )
 }
 
 function humanize(value: string) {
