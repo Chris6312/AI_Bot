@@ -300,6 +300,55 @@ def test_new_upload_replaces_previous_active_scope(tmp_path) -> None:
         assert second['managedOnlySymbols'] == []
 
 
+def test_removed_stock_symbol_becomes_managed_only_from_broker_snapshot_when_db_position_is_missing(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        first_payload = build_stock_payload()
+        second_payload = deepcopy(first_payload)
+        second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][1]]
+        second_payload['bot_payload']['symbols'][0]['priority_rank'] = 1
+        second_payload['ui_payload']['summary']['selected_count'] = 1
+        second_payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        second_payload['ui_payload']['symbol_context'] = {'MSFT': second_payload['ui_payload']['symbol_context']['MSFT']}
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_positions_snapshot',
+            lambda mode=None: [
+                {
+                    'symbol': 'AAPL',
+                    'shares': 10,
+                    'avgPrice': 100.0,
+                    'currentPrice': 101.0,
+                    'marketValue': 1010.0,
+                    'pnl': 10.0,
+                    'pnlPercent': 1.0,
+                }
+            ],
+        )
+
+        watchlist_service.ingest_watchlist(db, first_payload, source='api')
+        active_payload = watchlist_service.ingest_watchlist(db, second_payload, source='api')
+
+        historical_aapl = (
+            db.query(WatchlistSymbol)
+            .filter(WatchlistSymbol.symbol == 'AAPL')
+            .order_by(WatchlistSymbol.id.asc())
+            .first()
+        )
+        assert historical_aapl is not None
+        assert historical_aapl.monitoring_status == MANAGED_ONLY
+        assert active_payload['managedOnlySymbols'][0]['symbol'] == 'AAPL'
+
+        snapshot = watchlist_service.get_monitoring_snapshot(db, scope='stocks_only')
+        managed_row = next(row for row in snapshot['rows'] if row['symbol'] == 'AAPL')
+        assert managed_row['managedOnly'] is True
+        assert managed_row['positionState']['hasOpenPosition'] is True
+        assert managed_row['positionState']['positionSource'] == 'broker'
+        assert managed_row['positionState']['positionId'] is None
+
+
 def test_removed_stock_symbol_becomes_managed_only_when_position_is_open(tmp_path) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
         db = SessionFactory()
@@ -505,6 +554,106 @@ def test_ai_decisions_endpoint_derives_entries_from_watchlist_uploads(tmp_path) 
         assert first['symbol'] == 'AAPL'
         assert 'thesis:' in first['reasoning']
         assert first['rejected'] is False
+
+
+def test_reconcile_revives_inactive_stock_row_from_broker_snapshot(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        first_payload = build_stock_payload()
+        second_payload = deepcopy(first_payload)
+        second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][1]]
+        second_payload['bot_payload']['symbols'][0]['priority_rank'] = 1
+        second_payload['ui_payload']['summary']['selected_count'] = 1
+        second_payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        second_payload['ui_payload']['symbol_context'] = {'MSFT': second_payload['ui_payload']['symbol_context']['MSFT']}
+
+        watchlist_service.ingest_watchlist(db, first_payload, source='api')
+        watchlist_service.ingest_watchlist(db, second_payload, source='api')
+
+        historical_aapl = (
+            db.query(WatchlistSymbol)
+            .filter(WatchlistSymbol.symbol == 'AAPL')
+            .order_by(WatchlistSymbol.id.asc())
+            .first()
+        )
+        assert historical_aapl is not None
+        historical_aapl.monitoring_status = INACTIVE
+        db.commit()
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_positions_snapshot',
+            lambda mode=None: [
+                {
+                    'symbol': 'AAPL',
+                    'shares': 289,
+                    'avgPrice': 65.49,
+                    'currentPrice': 66.33,
+                    'marketValue': 19169.37,
+                    'pnl': 242.01,
+                    'pnlPercent': 1.28,
+                }
+            ],
+        )
+
+        result = watchlist_service.reconcile_scope_statuses(db, scope='stocks_only')
+        db.refresh(historical_aapl)
+        assert result['changedRows'] >= 1
+        assert historical_aapl.monitoring_status == MANAGED_ONLY
+
+
+def test_db_positions_endpoint_returns_position_rows(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        def override_get_db():
+            db = SessionFactory()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+
+        db = SessionFactory()
+        try:
+            db.add(
+                Position(
+                    account_id='paper',
+                    ticker='AA',
+                    shares=289,
+                    avg_entry_price=65.49,
+                    current_price=66.33,
+                    unrealized_pnl=242.01,
+                    unrealized_pnl_pct=1.28,
+                    strategy='WATCHLIST_ENTRY',
+                    entry_time=datetime.now(UTC),
+                    entry_reasoning={'intentId': 'demo'},
+                    stop_loss=61.0,
+                    profit_target=71.0,
+                    peak_price=66.85,
+                    trailing_stop=63.5,
+                    is_open=True,
+                    execution_id='intent_demo',
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        with TestClient(app) as client:
+            response = client.get('/api/stocks/db-positions')
+
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert len(payload) == 1
+        assert payload[0]['ticker'] == 'AA'
+        assert payload[0]['shares'] == 289
+        assert payload[0]['avgEntryPrice'] == 65.49
+        assert payload[0]['currentPrice'] == 66.33
+        assert payload[0]['unrealizedPnl'] == 242.01
+        assert payload[0]['isOpen'] is True
 
 
 def test_reconcile_endpoint_returns_status_transition_summary(tmp_path, monkeypatch) -> None:

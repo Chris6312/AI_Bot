@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from app.routers import crypto, watchlists
 from app.core.database import get_db
 from app.models.order_intent import OrderIntent
+from app.models.position import Position
 from app.services.control_plane import get_control_plane_status, require_admin_token
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.kraken_service import crypto_ledger
@@ -262,6 +263,38 @@ async def get_stock_positions():
         return tradier_client.get_positions_snapshot(mode)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'Failed to fetch Tradier positions: {exc}') from exc
+
+
+@app.get('/api/stocks/db-positions')
+async def get_stock_db_positions(db: Session = Depends(get_db)):
+    rows = (
+        db.query(Position)
+        .order_by(Position.is_open.desc(), Position.entry_time.desc(), Position.created_at.desc(), Position.id.desc())
+        .all()
+    )
+    return [
+        {
+            'ticker': str(row.ticker or '').upper(),
+            'accountId': row.account_id,
+            'shares': int(row.shares or 0),
+            'avgEntryPrice': float(row.avg_entry_price or 0.0) if row.avg_entry_price is not None else None,
+            'currentPrice': float(row.current_price or 0.0) if row.current_price is not None else None,
+            'unrealizedPnl': float(row.unrealized_pnl or 0.0) if row.unrealized_pnl is not None else None,
+            'unrealizedPnlPct': float(row.unrealized_pnl_pct or 0.0) if row.unrealized_pnl_pct is not None else None,
+            'strategy': row.strategy,
+            'entryTime': row.entry_time.isoformat() if row.entry_time else None,
+            'entryReasoning': row.entry_reasoning or {},
+            'stopLoss': float(row.stop_loss or 0.0) if row.stop_loss is not None else None,
+            'profitTarget': float(row.profit_target or 0.0) if row.profit_target is not None else None,
+            'peakPrice': float(row.peak_price or 0.0) if row.peak_price is not None else None,
+            'trailingStop': float(row.trailing_stop or 0.0) if row.trailing_stop is not None else None,
+            'isOpen': bool(row.is_open),
+            'executionId': row.execution_id,
+            'createdAt': row.created_at.isoformat() if row.created_at else None,
+            'updatedAt': row.updated_at.isoformat() if row.updated_at else None,
+        }
+        for row in rows
+    ]
 
 
 @app.get('/api/stocks/history')

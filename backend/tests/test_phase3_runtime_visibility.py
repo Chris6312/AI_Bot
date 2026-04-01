@@ -236,3 +236,51 @@ def test_runtime_visibility_build_worker_probe_marks_stale_loop() -> None:
     assert payload['state'] == 'STALE'
     assert payload['ready'] is False
     assert 'outside the expected poll window' in payload['reason']
+
+
+def test_runtime_visibility_watchlist_probe_surfaces_scope_truth_issues(monkeypatch) -> None:
+    class DummyDb:
+        def close(self) -> None:
+            return None
+
+    observed_at = datetime(2026, 3, 31, 14, 30, tzinfo=UTC)
+    monkeypatch.setattr('app.services.runtime_visibility.SessionLocal', lambda: DummyDb())
+    monkeypatch.setattr(
+        'app.services.watchlist_monitoring.watchlist_monitoring_orchestrator.get_runtime_status',
+        lambda db: {
+            'enabled': True,
+            'pollSeconds': 20,
+            'lastStartedAtUtc': observed_at.isoformat(),
+            'lastFinishedAtUtc': observed_at.isoformat(),
+            'lastError': None,
+            'consecutiveFailures': 0,
+            'lastRunSummary': {},
+            'dueSnapshot': {'summary': {'eligibleDueCount': 0, 'blockedDueCount': 0}},
+        },
+    )
+    monkeypatch.setattr(
+        'app.services.watchlist_service.watchlist_service.get_monitoring_snapshot',
+        lambda db: {
+            'stocks_only': {'scopeTruth': {'state': 'STALE', 'reason': 'Latest stock watchlist expired.'}},
+            'crypto_only': {'scopeTruth': {'state': 'READY', 'reason': ''}},
+        },
+    )
+    monkeypatch.setattr(
+        runtime_visibility_service,
+        '_build_worker_probe',
+        lambda **kwargs: {
+            'name': kwargs['name'],
+            'state': 'READY',
+            'ready': True,
+            'reason': '',
+            'checkedAtUtc': kwargs['observed_at'].isoformat(),
+            'details': kwargs['details'],
+        },
+    )
+
+    payload = runtime_visibility_service._probe_watchlist_monitor(observed_at)
+
+    assert payload['state'] == 'DEGRADED'
+    assert payload['ready'] is True
+    assert payload['details']['scopeTruth']['stocks_only']['state'] == 'STALE'
+    assert payload['details']['scopeIssues'] == ['stocks_only: Latest stock watchlist expired.']

@@ -18,6 +18,8 @@ from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
 from app.services.kraken_service import crypto_ledger
 from app.services.market_sessions import calculate_next_scope_evaluation_at
+from app.services.runtime_state import runtime_state
+from app.services.tradier_client import tradier_client
 
 ALLOWED_SETUP_TEMPLATES = {
     'breakout_retest',
@@ -434,14 +436,7 @@ class WatchlistService:
             }
 
         open_symbols = self._get_open_symbols(db, scope)
-        candidate_rows = (
-            db.query(WatchlistSymbol)
-            .filter(
-                WatchlistSymbol.scope == scope,
-                WatchlistSymbol.monitoring_status.in_([ACTIVE, MANAGED_ONLY]),
-            )
-            .all()
-        )
+        candidate_rows = db.query(WatchlistSymbol).filter(WatchlistSymbol.scope == scope).all()
 
         changed = 0
         for row in candidate_rows:
@@ -823,14 +818,7 @@ class WatchlistService:
         observed_at: datetime,
     ) -> None:
         open_symbols = self._get_open_symbols(db, scope)
-        candidate_rows = (
-            db.query(WatchlistSymbol)
-            .filter(
-                WatchlistSymbol.scope == scope,
-                WatchlistSymbol.monitoring_status.in_([ACTIVE, MANAGED_ONLY]),
-            )
-            .all()
-        )
+        candidate_rows = db.query(WatchlistSymbol).filter(WatchlistSymbol.scope == scope).all()
         for row in candidate_rows:
             symbol = str(row.symbol or '').upper()
             if symbol in next_symbols:
@@ -859,8 +847,32 @@ class WatchlistService:
         return self._get_open_crypto_symbols()
 
     def _get_open_stock_symbols(self, db: Session) -> set[str]:
-        rows = db.query(Position).filter(Position.is_open.is_(True)).all()
-        return {str(row.ticker or '').upper() for row in rows if str(row.ticker or '').strip()}
+        open_symbols = {
+            str(row.ticker or '').upper()
+            for row in db.query(Position).filter(Position.is_open.is_(True)).all()
+            if str(row.ticker or '').strip()
+        }
+        open_symbols.update(self._get_open_stock_broker_symbols())
+        return open_symbols
+
+    def _get_open_stock_broker_symbols(self) -> set[str]:
+        return set(self._get_open_stock_broker_positions().keys())
+
+    def _get_open_stock_broker_positions(self) -> dict[str, dict[str, Any]]:
+        try:
+            mode = runtime_state.get().stock_mode
+            positions = tradier_client.get_positions_snapshot(mode)
+        except Exception:
+            return {}
+
+        broker_positions: dict[str, dict[str, Any]] = {}
+        for position in positions:
+            symbol = str(position.get('symbol') or '').upper().strip()
+            shares = int(round(float(position.get('shares') or 0))) if position.get('shares') is not None else 0
+            if not symbol or shares <= 0:
+                continue
+            broker_positions[symbol] = position
+        return broker_positions
 
     def _get_open_crypto_symbols(self) -> set[str]:
         open_symbols: set[str] = set()
@@ -1143,6 +1155,7 @@ class WatchlistService:
                 'hasOpenPosition': True,
                 'accountId': position.account_id,
                 'positionId': position.id,
+                'positionSource': 'database',
                 'shares': int(position.shares or 0),
                 'avgEntryPrice': avg_entry_price,
                 'currentPrice': current_price,
@@ -1173,6 +1186,60 @@ class WatchlistService:
                 'protectiveExitReasons': protective_exit_reasons,
                 'stopLossBreached': stop_loss_breached,
                 'trailingStopBreached': trailing_stop_breached,
+            }
+
+        broker_positions = self._get_open_stock_broker_positions()
+        for symbol, broker_position in broker_positions.items():
+            if symbol in state_map:
+                continue
+            watchlist_row = (
+                db.query(WatchlistSymbol)
+                .filter(WatchlistSymbol.scope == 'stocks_only', WatchlistSymbol.symbol == symbol)
+                .order_by(WatchlistSymbol.id.desc())
+                .first()
+            )
+            max_hold_hours = int(watchlist_row.max_hold_hours) if watchlist_row is not None and watchlist_row.max_hold_hours is not None else None
+            current_price = float(broker_position.get('currentPrice') or 0.0) if broker_position.get('currentPrice') is not None else None
+            avg_entry_price = float(broker_position.get('avgPrice') or 0.0) if broker_position.get('avgPrice') is not None else None
+            state_map[symbol] = {
+                'hasOpenPosition': True,
+                'accountId': None,
+                'positionId': None,
+                'positionSource': 'broker',
+                'positionSyncGap': True,
+                'shares': int(round(float(broker_position.get('shares') or 0.0))),
+                'avgEntryPrice': avg_entry_price,
+                'currentPrice': current_price,
+                'marketValue': float(broker_position.get('marketValue') or 0.0),
+                'unrealizedPnl': float(broker_position.get('pnl') or 0.0),
+                'unrealizedPnlPct': float(broker_position.get('pnlPercent') or 0.0),
+                'stopLoss': None,
+                'profitTarget': None,
+                'trailingStop': None,
+                'peakPrice': None,
+                'profitTargetReached': False,
+                'scaleOutReady': False,
+                'scaleOutAlreadyTaken': False,
+                'impulseTrailArmed': False,
+                'impulseTrailingStop': None,
+                'entryTimeUtc': None,
+                'maxHoldHours': max_hold_hours,
+                'basePositionExpiresAtUtc': None,
+                'positionExpiresAtUtc': None,
+                'positionExpired': False,
+                'hoursUntilExpiry': None,
+                'hoursSinceEntry': None,
+                'followThroughWindowHours': self._resolve_follow_through_window_hours(max_hold_hours),
+                'followThroughFailed': False,
+                'timeStopStructureCheckPassed': False,
+                'timeStopExtended': False,
+                'timeStopExtensionHours': None,
+                'timeStopExtendedUntilUtc': None,
+                'exitDeadlineSource': 'BROKER_ONLY_POSITION',
+                'protectiveExitPending': False,
+                'protectiveExitReasons': ['BROKER_POSITION_NOT_SYNCED_TO_DB'],
+                'stopLossBreached': False,
+                'trailingStopBreached': False,
             }
         return state_map
 

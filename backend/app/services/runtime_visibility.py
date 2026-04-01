@@ -219,10 +219,12 @@ class RuntimeVisibilityService:
 
     def _probe_watchlist_monitor(self, observed_at: datetime) -> dict[str, Any]:
         from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
+        from app.services.watchlist_service import watchlist_service
 
         db = SessionLocal()
         try:
             status = watchlist_monitoring_orchestrator.get_runtime_status(db)
+            monitoring_snapshot = watchlist_service.get_monitoring_snapshot(db)
         except Exception as exc:  # pragma: no cover - exercised by tests with monkeypatch
             return {
                 'name': 'Watchlist Monitor',
@@ -234,7 +236,18 @@ class RuntimeVisibilityService:
             }
         finally:
             db.close()
-        return self._build_worker_probe(
+
+        scope_truth = {
+            scope: dict((snapshot or {}).get('scopeTruth') or {})
+            for scope, snapshot in (monitoring_snapshot or {}).items()
+            if isinstance(snapshot, dict)
+        }
+        scope_issues = [
+            f"{scope}: {truth.get('reason')}"
+            for scope, truth in scope_truth.items()
+            if str(truth.get('state') or 'READY') != 'READY'
+        ]
+        probe = self._build_worker_probe(
             name='Watchlist Monitor',
             observed_at=observed_at,
             enabled=bool(status.get('enabled')),
@@ -246,8 +259,15 @@ class RuntimeVisibilityService:
             details={
                 'dueSnapshot': status.get('dueSnapshot'),
                 'lastRunSummary': status.get('lastRunSummary') or {},
+                'scopeTruth': scope_truth,
+                'scopeIssues': scope_issues,
             },
         )
+        if probe['state'] == 'READY' and scope_issues:
+            probe['state'] = 'DEGRADED'
+            probe['ready'] = True
+            probe['reason'] = 'Worker loop is active, but one or more scopes need review.'
+        return probe
 
     def _probe_watchlist_exit_worker(self, observed_at: datetime) -> dict[str, Any]:
         db = SessionLocal()

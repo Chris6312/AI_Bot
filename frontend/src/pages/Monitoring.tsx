@@ -183,6 +183,7 @@ function ScopeMonitoringPanel({
   const rows = monitoring?.rows ?? []
   const filteredRows = selectedSymbol ? rows.filter((row) => row.symbol.toUpperCase() === selectedSymbol.toUpperCase()) : rows
   const sessionMeta = getScopeSessionMeta(scope, orchestration?.session)
+  const scopeTruthMeta = getStatusMeta(monitoring?.scopeTruth?.state)
 
   return (
     <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5 shadow-xl shadow-slate-950/20">
@@ -192,18 +193,23 @@ function ScopeMonitoringPanel({
           <h2 className="mt-1 text-2xl font-semibold text-white">Monitoring snapshot</h2>
           <div className="mt-3 flex flex-wrap gap-2">
             <ToneBadge tone={sessionMeta.tone} tooltip={sessionMeta.detail ?? undefined}>{sessionMeta.label}</ToneBadge>
-            {sessionMeta.detail ? <span className="self-center text-xs text-slate-500">{sessionMeta.detail}</span> : null}
+            {monitoring?.scopeTruth ? <ToneBadge tone={scopeTruthMeta.tone} tooltip={monitoring.scopeTruth.reason}>{scopeTruthMeta.rawLabel}</ToneBadge> : null}
             <ToneBadge tone="muted" tooltip="Rows scheduled for evaluation in this scope.">Due {orchestration?.dueCount ?? 0}</ToneBadge>
             <ToneBadge tone="info" tooltip="Rows due now and currently unblocked for evaluation.">Eligible {orchestration?.eligibleDueCount ?? 0}</ToneBadge>
             {orchestration?.blockedDueCount ? <ToneBadge tone="warn" tooltip="Rows due for evaluation but blocked by session, data freshness, or control state.">Blocked {orchestration.blockedDueCount}</ToneBadge> : null}
           </div>
+          {(monitoring?.scopeTruth?.reason || sessionMeta.detail) ? (
+            <div className="mt-2 text-xs text-slate-500">
+              {monitoring?.scopeTruth?.reason ?? sessionMeta.detail}
+            </div>
+          ) : null}
         </div>
 
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <MiniCard label="Entry" value={String(monitoring?.summary.entryCandidateCount ?? 0)} />
-          <MiniCard label="Warning" value={String(monitoring?.summary.waitingForSetupCount ?? 0)} />
+          <MiniCard label="Candidate" value={String(monitoring?.summary.entryCandidateCount ?? 0)} />
+          <MiniCard label="Submitted" value={String(monitoring?.summary.entrySubmittedCount ?? 0)} />
+          <MiniCard label="Rejected" value={String(monitoring?.summary.entryRejectedCount ?? 0)} />
           <MiniCard label="Open" value={String(exitReadiness?.summary.openPositionCount ?? 0)} />
-          <MiniCard label="Blocked" value={String((monitoring?.summary.dataUnavailableCount ?? 0) + (monitoring?.summary.evaluationBlockedCount ?? 0))} />
         </div>
       </div>
 
@@ -222,12 +228,13 @@ function ScopeMonitoringPanel({
           <SummaryCard
             title="Monitoring summary"
             rows={[
+              ['Scope truth', monitoring?.scopeTruth?.state ?? '—'],
               ['Pending evaluation', String(monitoring?.summary.pendingEvaluationCount ?? 0)],
-              ['Warning state', String(monitoring?.summary.waitingForSetupCount ?? 0)],
+              ['Entry filled', String(monitoring?.summary.entryFilledCount ?? 0)],
+              ['Entry skipped', String(monitoring?.summary.entrySkippedCount ?? 0)],
               ['Stale', String(monitoring?.summary.dataStaleCount ?? 0)],
               ['Blocked', String((monitoring?.summary.dataUnavailableCount ?? 0) + (monitoring?.summary.evaluationBlockedCount ?? 0) + (monitoring?.summary.biasConflictCount ?? 0))],
               ['Managed-only', String(monitoring?.summary.managedOnlyCount ?? 0)],
-              ['Unmanaged', String(monitoring?.summary.inactiveCount ?? 0)],
             ]}
           />
           <SummaryCard
@@ -255,7 +262,8 @@ function MonitoringTable({ scope, rows, selectedSymbol }: { scope: WatchlistScop
             <th className="w-[150px] pb-3 pr-4">Symbol</th>
             <th className="w-[180px] pb-3 pr-4">Lifecycle</th>
             <th className="w-[180px] pb-3 pr-4">Decision</th>
-            <th className="w-[360px] pb-3 pr-4">Reason</th>
+            <th className="w-[190px] pb-3 pr-4">Entry rail</th>
+            <th className="w-[320px] pb-3 pr-4">Reason</th>
             <th className="w-[220px] pb-3 pr-4">Next eval</th>
             <th className="w-[180px] pb-3 pr-4">Position</th>
             <th className="w-[180px] pb-3 pr-4">Exit flags</th>
@@ -290,9 +298,18 @@ function MonitoringTable({ scope, rows, selectedSymbol }: { scope: WatchlistScop
                     <span className="text-xs text-slate-500">Raw: {decisionMeta.rawLabel}</span>
                   </div>
                 </td>
+                <td className="py-3 pr-4 align-top text-slate-400 whitespace-normal break-words">
+                  {executionAction ? (
+                    <div className="flex flex-col gap-2">
+                      <ToneBadge tone={getStatusMeta(executionAction).tone}>{getStatusMeta(executionAction).rawLabel}</ToneBadge>
+                      <span className="text-xs text-slate-500">{executionReason || 'Entry rail updated.'}</span>
+                    </div>
+                  ) : (
+                    '—'
+                  )}
+                </td>
                 <td className="py-3 pr-4 align-top text-slate-400 whitespace-normal break-words [overflow-wrap:anywhere]">
                   <div>{row.monitoring?.latestDecisionReason ?? '—'}</div>
-                  {executionAction ? <div className="mt-2 text-xs text-slate-500">Entry rail: {executionAction}{executionReason ? ` · ${executionReason}` : ''}</div> : null}
                 </td>
                 <td className="py-3 pr-4 align-top text-slate-400 whitespace-normal break-words">
                   {formatTimestamp(row.monitoring?.nextEvaluationAtUtc)}

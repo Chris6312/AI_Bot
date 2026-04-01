@@ -171,7 +171,8 @@ export function getStatusMeta(raw?: string | null): {
     normalized.includes('WAITING') ||
     normalized.includes('PENDING') ||
     normalized.includes('CLOSED') ||
-    normalized.includes('MONITOR_ONLY')
+    normalized.includes('MONITOR_ONLY') ||
+    normalized.includes('SKIPPED')
   ) {
     return { canonical: 'warning', canonicalLabel: 'Warning', rawLabel: startCase(raw), tone: 'warn' }
   }

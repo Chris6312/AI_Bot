@@ -369,6 +369,12 @@ export interface WatchlistMonitoringSummary {
   inactiveCount: number
   pendingEvaluationCount: number
   entryCandidateCount: number
+  entrySubmittedCount: number
+  entryFilledCount: number
+  entryRejectedCount: number
+  entrySkippedCount: number
+  gateRejectedCount: number
+  submissionRejectedCount: number
   waitingForSetupCount: number
   dataStaleCount: number
   dataUnavailableCount: number
@@ -391,10 +397,26 @@ export interface WatchlistMonitoringSummary {
   lastEvaluatedAtUtc: string | null
 }
 
+export interface WatchlistScopeTruth {
+  scope: WatchlistScope
+  state: 'READY' | 'DEGRADED' | 'MISSING' | 'STALE' | string
+  ready: boolean
+  reason: string
+  activeUploadId: string | null
+  activeUploadReceivedAtUtc: string | null
+  watchlistExpiresAtUtc: string | null
+  watchlistExpired: boolean
+  activeSymbolCount: number
+  managedOnlyCount: number
+  openPositionCount: number
+  dataWarningCount: number
+}
+
 export interface WatchlistMonitoringSnapshot {
   scope: WatchlistScope
   capturedAtUtc: string
   activeUploadId: string | null
+  scopeTruth: WatchlistScopeTruth
   summary: WatchlistMonitoringSummary
   rows: WatchlistSymbolRecord[]
 }
