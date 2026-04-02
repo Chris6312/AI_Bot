@@ -647,7 +647,7 @@ class CryptoPaperLedger:
                 'costBasis': cost_basis,
                 'pnl': pnl,
                 'pnlPercent': pnl_percent,
-                'entryTimeUtc': analytics['entry_times'].get(pair),
+                'entryTimeUtc': analytics['entry_times'].get(pair) or pos.get('entry_time_utc'),
                 'realizedPnl': float(analytics['realized_pnl_by_pair'].get(pair, 0.0)),
             })
 

@@ -164,58 +164,50 @@ class PositionReconciliationService:
 
     def _restore_crypto_ledger_from_trades(self, trades: list[ReplayedCryptoTrade]) -> dict[str, Any]:
         balance = Decimal(str(crypto_ledger.starting_balance))
-        positions: dict[str, dict[str, Decimal]] = {}
-        replayed: list[dict[str, Any]] = []
+        positions: dict[str, dict[str, Any]] = {}
 
-        for index, trade in enumerate(trades, start=1):
+        for trade in trades:
             pair = trade.pair
-            ohlcv_pair = trade.ohlcv_pair or kraken_service.get_ohlcv_pair(pair) or pair.replace('/', '')
             total = trade.amount * trade.price
-            state = positions.setdefault(pair, {'amount': Decimal('0'), 'total_cost': Decimal('0')})
+            state = positions.setdefault(
+                pair,
+                {
+                    'amount': Decimal('0'),
+                    'total_cost': Decimal('0'),
+                    'entry_time_utc': None,
+                    'ohlcv_pair': trade.ohlcv_pair or kraken_service.get_ohlcv_pair(pair) or pair.replace('/', ''),
+                },
+            )
 
             if trade.side == 'BUY':
                 balance -= total
-                state['amount'] += trade.amount
-                state['total_cost'] += total
+                if Decimal(str(state['amount'])) <= Decimal('0.0000000001') and trade.amount > 0:
+                    state['entry_time_utc'] = trade.timestamp.isoformat()
+                state['amount'] = Decimal(str(state['amount'])) + trade.amount
+                state['total_cost'] = Decimal(str(state['total_cost'])) + total
             else:
-                sell_amount = min(trade.amount, state['amount'])
+                current_amount = Decimal(str(state['amount']))
+                sell_amount = min(trade.amount, current_amount)
                 if sell_amount > 0:
-                    avg_cost = (state['total_cost'] / state['amount']) if state['amount'] > 0 else Decimal('0')
+                    avg_cost = (Decimal(str(state['total_cost'])) / current_amount) if current_amount > 0 else Decimal('0')
                     closed_cost = avg_cost * sell_amount
-                    state['amount'] -= sell_amount
-                    state['total_cost'] -= closed_cost
+                    state['amount'] = current_amount - sell_amount
+                    state['total_cost'] = Decimal(str(state['total_cost'])) - closed_cost
                     balance += sell_amount * trade.price
-                if state['amount'] <= Decimal('0.0000000001'):
+                if Decimal(str(state['amount'])) <= Decimal('0.0000000001'):
                     state['amount'] = Decimal('0')
                     state['total_cost'] = Decimal('0')
+                    state['entry_time_utc'] = None
 
-            if state['amount'] <= Decimal('0.0000000001'):
+            if Decimal(str(state['amount'])) <= Decimal('0.0000000001'):
                 positions.pop(pair, None)
 
-            replayed.append(
-                {
-                    'id': str(index),
-                    'sourceIntentId': trade.intent_id,
-                    'timestamp': trade.timestamp.isoformat(),
-                    'market': 'CRYPTO',
-                    'pair': pair,
-                    'ohlcvPair': ohlcv_pair,
-                    'side': trade.side,
-                    'amount': float(trade.amount),
-                    'price': float(trade.price),
-                    'total': float(total),
-                    'status': 'FILLED',
-                    'balance': float(balance),
-                    'replayedFromPersistence': True,
-                }
-            )
-
-        crypto_ledger.trades = replayed
+        crypto_ledger.trades = []
         crypto_ledger.positions = positions
         crypto_ledger.balance = balance
         restored_symbols = sorted(positions.keys())
         return {
-            'replayedTradeCount': len(replayed),
+            'replayedTradeCount': len(trades),
             'restoredPositionCount': len(restored_symbols),
             'restoredSymbols': restored_symbols,
         }

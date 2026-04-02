@@ -67,8 +67,11 @@ def test_startup_reconciliation_restores_crypto_ledger_from_filled_intents(tmp_p
         assert 'TAO/USD' in crypto_ledger.positions
         assert round(float(crypto_ledger.positions['TAO/USD']['amount']), 8) == 1.25
         assert round(float(crypto_ledger.positions['TAO/USD']['total_cost']), 8) == 525.0
-        assert len(crypto_ledger.trades) == 1
-        assert crypto_ledger.trades[0]['pair'] == 'TAO/USD'
+        assert len(crypto_ledger.trades) == 0
+        restored_positions = crypto_ledger.get_positions()
+        assert len(restored_positions) == 1
+        assert restored_positions[0]['pair'] == 'TAO/USD'
+        assert restored_positions[0]['entryTimeUtc'] == filled_at.isoformat()
 
     _reset_crypto_ledger()
 
@@ -144,3 +147,66 @@ def test_stock_reconciliation_uses_same_service_entrypoint(tmp_path, monkeypatch
         assert len(rows) == 1
         assert int(rows[0].shares or 0) == 5
         assert float(rows[0].avg_entry_price or 0.0) == 180.0
+
+
+def test_startup_reconciliation_does_not_resurrect_closed_crypto_trade_history(tmp_path, monkeypatch) -> None:
+    _reset_crypto_ledger()
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        filled_at = datetime.now(UTC).replace(microsecond=0)
+        db.add_all(
+            [
+                OrderIntent(
+                    intent_id='intent_crypto_tao_buy_hist',
+                    account_id='paper-crypto-ledger',
+                    asset_class='crypto',
+                    symbol='TAO/USD',
+                    side='BUY',
+                    requested_quantity=2.0,
+                    requested_price=300.0,
+                    filled_quantity=2.0,
+                    avg_fill_price=300.0,
+                    status='CLOSED',
+                    execution_source='WATCHLIST_MONITOR_ENTRY',
+                    submitted_order_id='paper_hist_buy',
+                    context_json={'ohlcvPair': 'TAOUSD'},
+                    submitted_at=filled_at,
+                    first_fill_at=filled_at,
+                    last_fill_at=filled_at,
+                ),
+                OrderIntent(
+                    intent_id='intent_crypto_tao_sell_hist',
+                    account_id='paper-crypto-ledger',
+                    asset_class='crypto',
+                    symbol='TAO/USD',
+                    side='SELL',
+                    requested_quantity=2.0,
+                    requested_price=320.0,
+                    filled_quantity=2.0,
+                    avg_fill_price=320.0,
+                    status='CLOSED',
+                    execution_source='WATCHLIST_MONITOR_EXIT',
+                    submitted_order_id='paper_hist_sell',
+                    context_json={'ohlcvPair': 'TAOUSD'},
+                    submitted_at=filled_at + timedelta(minutes=5),
+                    first_fill_at=filled_at + timedelta(minutes=5),
+                    last_fill_at=filled_at + timedelta(minutes=5),
+                ),
+            ]
+        )
+        db.commit()
+
+        summary = position_reconciliation_service.reconcile_asset_class(
+            db,
+            asset_class='crypto',
+            observed_at=filled_at + timedelta(minutes=10),
+        )
+
+        assert summary['replayedTradeCount'] == 2
+        assert summary['restoredPositionCount'] == 0
+        assert summary['restoredSymbols'] == []
+        assert crypto_ledger.positions == {}
+        assert crypto_ledger.trades == []
+        assert crypto_ledger.get_ledger()['trades'] == []
+
+    _reset_crypto_ledger()
