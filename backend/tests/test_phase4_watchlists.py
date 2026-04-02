@@ -3338,3 +3338,149 @@ def test_due_run_executes_crypto_watchlist_entry_into_paper_ledger(tmp_path, mon
             crypto_ledger.balance = original_balance
             crypto_ledger.positions = original_positions
             crypto_ledger.trades = original_trades
+
+
+def test_crypto_active_watchlist_status_summary_uses_normalized_symbol_universe(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        persisted = watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        active_upload_id = persisted['uploadId']
+        generated_at = datetime.now(UTC).replace(microsecond=0)
+        historical_upload = WatchlistUpload(
+            upload_id='legacy-crypto-upload',
+            scan_id='legacy-crypto-scan',
+            schema_version='bot_watchlist_v3',
+            provider='chatgpt_kraken_app',
+            scope='crypto_only',
+            source='api',
+            payload_hash='legacy-hash',
+            generated_at_utc=generated_at,
+            received_at_utc=generated_at,
+            watchlist_expires_at_utc=generated_at + timedelta(days=1),
+            validation_status='accepted',
+            market_regime='mixed',
+            selected_count=2,
+            is_active=False,
+            validation_result_json={},
+            raw_payload_json={},
+            bot_payload_json={},
+        )
+        db.add(historical_upload)
+        db.flush()
+        db.add_all([
+            WatchlistSymbol(
+                upload_id=historical_upload.upload_id,
+                scope='crypto_only',
+                symbol='BTC/USD',
+                quote_currency='USD',
+                asset_class='crypto',
+                enabled=True,
+                trade_direction='long',
+                priority_rank=1,
+                tier='tier_1',
+                bias='bullish',
+                setup_template='trend_continuation',
+                bot_timeframes=['15m'],
+                exit_template='trail_after_impulse',
+                max_hold_hours=24,
+                risk_flags=[],
+                monitoring_status=INACTIVE,
+            ),
+            WatchlistSymbol(
+                upload_id=historical_upload.upload_id,
+                scope='crypto_only',
+                symbol='BTCUSD',
+                quote_currency='USD',
+                asset_class='crypto',
+                enabled=True,
+                trade_direction='long',
+                priority_rank=2,
+                tier='tier_1',
+                bias='bullish',
+                setup_template='trend_continuation',
+                bot_timeframes=['15m'],
+                exit_template='trail_after_impulse',
+                max_hold_hours=24,
+                risk_flags=[],
+                monitoring_status=INACTIVE,
+            ),
+            WatchlistSymbol(
+                upload_id=historical_upload.upload_id,
+                scope='crypto_only',
+                symbol='DOGE/USD',
+                quote_currency='USD',
+                asset_class='crypto',
+                enabled=True,
+                trade_direction='long',
+                priority_rank=3,
+                tier='tier_3',
+                bias='bullish',
+                setup_template='range_breakout',
+                bot_timeframes=['15m'],
+                exit_template='first_failed_follow_through',
+                max_hold_hours=24,
+                risk_flags=[],
+                monitoring_status=INACTIVE,
+            ),
+            WatchlistSymbol(
+                upload_id=historical_upload.upload_id,
+                scope='crypto_only',
+                symbol='DOGE',
+                quote_currency='USD',
+                asset_class='crypto',
+                enabled=True,
+                trade_direction='long',
+                priority_rank=4,
+                tier='tier_3',
+                bias='bullish',
+                setup_template='range_breakout',
+                bot_timeframes=['15m'],
+                exit_template='first_failed_follow_through',
+                max_hold_hours=24,
+                risk_flags=[],
+                monitoring_status=INACTIVE,
+            ),
+        ])
+        db.commit()
+
+        refreshed = watchlist_service.serialize_upload(
+            db,
+            db.query(WatchlistUpload).filter(WatchlistUpload.upload_id == active_upload_id).one(),
+        )
+
+        assert refreshed['selectedCount'] == 2
+        assert refreshed['statusSummary']['activeCount'] == 2
+        assert refreshed['statusSummary']['activeCount'] <= refreshed['selectedCount']
+        assert refreshed['statusSummary']['inactiveCount'] == 1
+
+
+def test_crypto_status_summary_counts_managed_only_off_watchlist_once(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        first_payload = build_crypto_payload()
+        second_payload = deepcopy(first_payload)
+        second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][1]]
+        second_payload['bot_payload']['symbols'][0]['priority_rank'] = 1
+        second_payload['ui_payload']['summary']['selected_count'] = 1
+        second_payload['ui_payload']['summary']['primary_focus'] = ['ETH']
+        second_payload['ui_payload']['symbol_context'] = {'ETH': second_payload['ui_payload']['symbol_context']['ETH']}
+
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda: [
+                {'pair': 'BTC/USD', 'amount': 0.25},
+                {'pair': 'BTCUSD', 'amount': 0.25},
+            ],
+        )
+
+        watchlist_service.ingest_watchlist(db, first_payload, source='api')
+        active_payload = watchlist_service.ingest_watchlist(db, second_payload, source='api')
+
+        assert active_payload['selectedCount'] == 1
+        assert active_payload['statusSummary']['activeCount'] == 1
+        assert active_payload['statusSummary']['activeCount'] <= active_payload['selectedCount']
+        assert active_payload['statusSummary']['managedOnlyCount'] == 1

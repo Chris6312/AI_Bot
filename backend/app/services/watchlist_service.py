@@ -734,6 +734,65 @@ class WatchlistService:
             .all()
         )
 
+    @staticmethod
+    def _normalize_scope_symbol(*, scope: WATCHLIST_SCOPE, symbol: str | None, quote_currency: str | None = None) -> str:
+        raw = str(symbol or '').upper().strip()
+        if not raw:
+            return ''
+        if scope != 'crypto_only':
+            return ''.join(char for char in raw if char.isalnum())
+
+        quote = ''.join(char for char in str(quote_currency or 'USD').upper().strip() if char.isalnum())
+        compact = ''.join(char for char in raw if char.isalnum())
+        if not compact:
+            return ''
+        if quote and compact.endswith(quote) and len(compact) > len(quote):
+            return compact[: -len(quote)]
+        return compact
+
+    def _build_status_summary(
+        self,
+        *,
+        scope: WATCHLIST_SCOPE,
+        active_symbols: list[WatchlistSymbol],
+        managed_only_symbols: list[WatchlistSymbol],
+        historical_rows: list[WatchlistSymbol],
+    ) -> dict[str, int]:
+        selected_keys = {
+            self._normalize_scope_symbol(scope=scope, symbol=row.symbol, quote_currency=row.quote_currency)
+            for row in active_symbols
+        }
+        selected_keys.discard('')
+
+        healthy_keys = {
+            self._normalize_scope_symbol(scope=scope, symbol=row.symbol, quote_currency=row.quote_currency)
+            for row in active_symbols
+            if row.monitoring_status == ACTIVE
+        }
+        healthy_keys.discard('')
+
+        managed_only_keys = {
+            self._normalize_scope_symbol(scope=scope, symbol=row.symbol, quote_currency=row.quote_currency)
+            for row in managed_only_symbols
+        }
+        managed_only_keys.discard('')
+        managed_only_keys -= selected_keys
+
+        unmanaged_keys = {
+            self._normalize_scope_symbol(scope=scope, symbol=row.symbol, quote_currency=row.quote_currency)
+            for row in historical_rows
+            if row.monitoring_status == INACTIVE
+        }
+        unmanaged_keys.discard('')
+        unmanaged_keys -= selected_keys
+        unmanaged_keys -= managed_only_keys
+
+        return {
+            'activeCount': len(healthy_keys),
+            'managedOnlyCount': len(managed_only_keys),
+            'inactiveCount': len(unmanaged_keys),
+        }
+
     def get_scope_status_counts(self, db: Session, *, scope: WATCHLIST_SCOPE) -> dict[str, int]:
         rows = db.query(WatchlistSymbol).filter(WatchlistSymbol.scope == scope).all()
         counts = {ACTIVE: 0, MANAGED_ONLY: 0, INACTIVE: 0}
@@ -776,7 +835,13 @@ class WatchlistService:
             for row in managed_only_rows
             if row.upload_id != upload.upload_id
         ]
-        status_counts = self.get_scope_status_counts(db, scope=upload.scope)
+        historical_rows = db.query(WatchlistSymbol).filter(WatchlistSymbol.scope == upload.scope).all()
+        status_summary = self._build_status_summary(
+            scope=upload.scope,
+            active_symbols=symbols,
+            managed_only_symbols=[row for row in managed_only_rows if row.upload_id != upload.upload_id],
+            historical_rows=historical_rows,
+        )
         return {
             'uploadId': upload.upload_id,
             'scanId': upload.scan_id,
@@ -799,11 +864,7 @@ class WatchlistService:
             'validation': upload.validation_result_json or {},
             'symbols': symbol_rows,
             'managedOnlySymbols': managed_only_symbols,
-            'statusSummary': {
-                'activeCount': status_counts.get(ACTIVE, 0),
-                'managedOnlyCount': status_counts.get(MANAGED_ONLY, 0),
-                'inactiveCount': status_counts.get(INACTIVE, 0),
-            },
+            'statusSummary': status_summary,
             'monitoringSummary': self.get_monitoring_snapshot(db, scope=upload.scope)['summary'],
             'uiPayload': {
                 'summary': (ui_context.summary_json if ui_context else {}),
