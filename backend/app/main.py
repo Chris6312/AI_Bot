@@ -269,7 +269,12 @@ async def get_stock_positions():
 async def get_stock_db_positions(db: Session = Depends(get_db)):
     rows = (
         db.query(Position)
-        .order_by(Position.is_open.desc(), Position.entry_time.desc(), Position.created_at.desc(), Position.id.desc())
+        .filter(Position.is_open.is_(True))
+        .order_by(
+            Position.entry_time.desc(),
+            Position.created_at.desc(),
+            Position.id.desc(),
+        )
         .all()
     )
     return [
