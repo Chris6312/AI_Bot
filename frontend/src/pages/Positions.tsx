@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { Activity, Bitcoin, Clock3, Database, TrendingUp, Wallet, X } from 'lucide-react'
@@ -21,6 +21,7 @@ import type {
   StockAccount,
   StockPosition,
   TradeHistoryEntry,
+  PositionInspectRecord,
   WatchlistExitReadinessSnapshot,
   WatchlistSymbolRecord,
 } from '@/types'
@@ -101,7 +102,10 @@ async function getDbStockPositions(): Promise<DbStockPosition[]> {
 }
 
 export default function Positions() {
-  const [selectedDbPosition, setSelectedDbPosition] = useState<DbStockPosition | null>(null)
+  const [selectedInspectTarget, setSelectedInspectTarget] = useState<{ assetClass: 'stock' | 'crypto'; symbol: string; fallbackTitle: string } | null>(null)
+  const [selectedInspect, setSelectedInspect] = useState<PositionInspectRecord | null>(null)
+  const [inspectLoading, setInspectLoading] = useState(false)
+  const [inspectError, setInspectError] = useState<string | null>(null)
 
   const { data: stockPositions = [] } = useQuery<StockPosition[]>({
     queryKey: ['stockPositions'],
@@ -193,6 +197,38 @@ export default function Positions() {
     collectActionRows(rows, 'Crypto', cryptoExitReadiness)
     return rows.slice(0, 10)
   }, [cryptoExitReadiness, stockExitReadiness])
+
+
+  useEffect(() => {
+    if (!selectedInspectTarget) {
+      setSelectedInspect(null)
+      setInspectLoading(false)
+      setInspectError(null)
+      return
+    }
+
+    let cancelled = false
+    setInspectLoading(true)
+    setInspectError(null)
+    getPositionInspect(selectedInspectTarget.assetClass, selectedInspectTarget.symbol)
+      .then((payload) => {
+        if (!cancelled) setSelectedInspect(payload)
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          const message = error instanceof Error ? error.message : 'Failed to load inspect payload.'
+          setInspectError(message)
+          setSelectedInspect(null)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setInspectLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [selectedInspectTarget])
 
   const mismatchDetail = useMemo(() => {
     if (!summary.positionSourceMismatch) {
@@ -297,11 +333,11 @@ export default function Positions() {
                 <div className="mt-2">The broker table above is fetched from Tradier in real time. This mirror below is fetched from the local <code className="rounded bg-slate-900 px-1 py-0.5 text-slate-200">positions</code> table. When those diverge, monitoring can lose track of managed-only rows until the DB mirror catches up.</div>
                 <div className={`mt-3 ${summary.positionSourceMismatch ? 'text-amber-300' : 'text-emerald-300'}`}>{mismatchDetail}</div>
               </div>
-              <DbStockPositionsTable positions={dbStockPositions} onSelect={setSelectedDbPosition} />
+              <DbStockPositionsTable positions={dbStockPositions} onSelect={(position) => setSelectedInspectTarget({ assetClass: 'stock', symbol: position.ticker, fallbackTitle: position.ticker })} />
             </SectionCard>
 
             <SectionCard title="Crypto positions" eyebrow="Inventory" icon={<Bitcoin className="h-4 w-4 text-cyan-300" />}>
-              <CryptoPositionsTable positions={cryptoPositions} />
+              <CryptoPositionsTable positions={cryptoPositions} onSelect={(position) => setSelectedInspectTarget({ assetClass: 'crypto', symbol: position.pair, fallbackTitle: position.pair })} />
             </SectionCard>
           </div>
 
@@ -342,7 +378,17 @@ export default function Positions() {
         </div>
       </div>
 
-      <DbPositionDrawer position={selectedDbPosition} onClose={() => setSelectedDbPosition(null)} />
+      <PositionInspectDrawer
+        inspect={selectedInspect}
+        loading={inspectLoading}
+        error={inspectError}
+        fallbackTitle={selectedInspectTarget?.fallbackTitle ?? null}
+        onClose={() => {
+          setSelectedInspectTarget(null)
+          setSelectedInspect(null)
+          setInspectError(null)
+        }}
+      />
     </>
   )
 }
@@ -436,7 +482,8 @@ function StockPositionsTable({ positions }: { positions: StockPosition[] }) {
             <th className="pb-3 pr-4">Current</th>
             <th className="pb-3 pr-4">Market value</th>
             <th className="pb-3 pr-4">P&amp;L</th>
-            <th className="pb-3">P&amp;L %</th>
+            <th className="pb-3 pr-4">P&amp;L %</th>
+            <th className="pb-3">Inspect</th>
           </tr>
         </thead>
         <tbody>
@@ -448,7 +495,16 @@ function StockPositionsTable({ positions }: { positions: StockPosition[] }) {
               <td className="py-3 pr-4">{formatMoney(position.currentPrice)}</td>
               <td className="py-3 pr-4">{formatMoney(position.marketValue)}</td>
               <td className={`py-3 pr-4 ${position.pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{formatMoney(position.pnl)}</td>
-              <td className={position.pnlPercent >= 0 ? 'py-3 text-emerald-300' : 'py-3 text-rose-300'}>{formatPercent(position.pnlPercent)}</td>
+              <td className={`${position.pnlPercent >= 0 ? 'py-3 pr-4 text-emerald-300' : 'py-3 pr-4 text-rose-300'}`}>{formatPercent(position.pnlPercent)}</td>
+              <td className="py-3">
+                <button
+                  type="button"
+                  onClick={() => onSelect(position)}
+                  className="rounded-full border border-slate-700 bg-slate-950/70 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-200 transition hover:border-cyan-600 hover:text-cyan-200"
+                >
+                  Inspect
+                </button>
+              </td>
             </tr>
           ))}
         </tbody>
@@ -511,28 +567,24 @@ function DbStockPositionsTable({ positions, onSelect }: { positions: DbStockPosi
   )
 }
 
-function DbPositionDrawer({ position, onClose }: { position: DbStockPosition | null; onClose: () => void }) {
-  if (!position) return null
+function PositionInspectDrawer({
+  inspect,
+  loading,
+  error,
+  fallbackTitle,
+  onClose,
+}: {
+  inspect: PositionInspectRecord | null
+  loading: boolean
+  error: string | null
+  fallbackTitle: string | null
+  onClose: () => void
+}) {
+  if (!inspect && !loading && !error && !fallbackTitle) return null
 
-  const detailRows: Array<[string, string]> = [
-    ['Ticker', position.ticker],
-    ['Account', position.accountId ?? '—'],
-    ['Shares', String(position.shares)],
-    ['Avg entry price', formatMaybeMoney(position.avgEntryPrice)],
-    ['Current price', formatMaybeMoney(position.currentPrice)],
-    ['Unrealized P&L', formatMaybeMoney(position.unrealizedPnl)],
-    ['Unrealized P&L %', formatMaybePercent(position.unrealizedPnlPct)],
-    ['Strategy', position.strategy ?? '—'],
-    ['Entry time', formatTimestamp(position.entryTime)],
-    ['Stop loss', formatMaybeMoney(position.stopLoss)],
-    ['Profit target', formatMaybeMoney(position.profitTarget)],
-    ['Peak price', formatMaybeMoney(position.peakPrice)],
-    ['Trailing stop', formatMaybeMoney(position.trailingStop)],
-    ['Open', position.isOpen ? 'True' : 'False'],
-    ['Execution ID', position.executionId ?? '—'],
-    ['Created at', formatTimestamp(position.createdAt)],
-    ['Updated at', formatTimestamp(position.updatedAt)],
-  ]
+  const detailRows = inspect
+    ? Object.entries(inspect.positionSnapshot ?? {}).map(([label, value]) => [humanizeKey(label), renderInspectValue(label, value)] as [string, string])
+    : []
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/80">
@@ -540,11 +592,11 @@ function DbPositionDrawer({ position, onClose }: { position: DbStockPosition | n
       <aside className="relative h-full w-full max-w-xl overflow-y-auto border-l border-slate-800 bg-slate-950 p-6 shadow-2xl shadow-black/60">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Positions table row</div>
-            <h2 className="mt-1 text-2xl font-semibold text-white">{position.ticker}</h2>
+            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Position inspect</div>
+            <h2 className="mt-1 text-2xl font-semibold text-white">{inspect?.displaySymbol ?? fallbackTitle ?? 'Inspect'}</h2>
             <div className="mt-3 flex flex-wrap gap-2">
-              <ToneBadge tone={position.isOpen ? 'good' : 'muted'}>{position.isOpen ? 'Open' : 'Closed'}</ToneBadge>
-              <ToneBadge tone="info">DB mirror</ToneBadge>
+              <ToneBadge tone="info">{inspect?.assetClass ?? 'loading'}</ToneBadge>
+              {inspect?.inspectSource ? <ToneBadge tone="muted">{inspect.inspectSource}</ToneBadge> : null}
             </div>
           </div>
           <button type="button" onClick={onClose} className="rounded-full border border-slate-700 p-2 text-slate-300 transition hover:border-cyan-600 hover:text-cyan-200">
@@ -552,22 +604,122 @@ function DbPositionDrawer({ position, onClose }: { position: DbStockPosition | n
           </button>
         </div>
 
-        <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            {detailRows.map(([label, value]) => (
-              <div key={label} className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-                <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
-                <div className="mt-2 text-sm text-slate-200">{value}</div>
-              </div>
-            ))}
-          </div>
-        </div>
+        {loading ? <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4 text-sm text-slate-300">Loading inspect payload…</div> : null}
+        {error ? <div className="mt-6 rounded-2xl border border-rose-900/70 bg-rose-950/30 p-4 text-sm text-rose-200">{error}</div> : null}
 
-        <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-          <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Entry reasoning</div>
-          <pre className="mt-3 overflow-x-auto whitespace-pre-wrap break-words rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-xs text-slate-300">{formatJson(position.entryReasoning ?? {})}</pre>
-        </div>
+        {inspect ? (
+          <>
+            <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Position snapshot</div>
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {detailRows.map(([label, value]) => (
+                  <div key={label} className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                    <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
+                    <div className="mt-2 text-sm text-slate-200">{value}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <InspectJsonCard title="Signal snapshot" value={inspect.signalSnapshot ?? {}} />
+            <InspectJsonCard title="Sizing math" value={inspect.sizing ?? {}} />
+
+            <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Timeframe alignment</div>
+              {inspect.timeframeAlignment?.note ? <p className="mt-3 text-sm leading-6 text-slate-400">{inspect.timeframeAlignment.note}</p> : null}
+              <div className="mt-4 overflow-x-auto">
+                <table className="w-full min-w-[420px] text-sm">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-left text-xs uppercase tracking-wide text-slate-500">
+                      <th className="pb-3 pr-4">Timeframe</th>
+                      <th className="pb-3 pr-4">Status</th>
+                      <th className="pb-3">Why</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(inspect.timeframeAlignment?.items ?? []).map((item) => (
+                      <tr key={item.timeframe} className="border-b border-slate-900/80 text-slate-300">
+                        <td className="py-3 pr-4 font-semibold text-white">{item.timeframe}</td>
+                        <td className="py-3 pr-4">{item.status}</td>
+                        <td className="py-3">{item.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <InspectJsonCard title="Exit plan" value={inspect.exitPlan ?? {}} />
+            <InspectJsonCard title="Latest evaluation" value={inspect.latestEvaluation ?? {}} />
+
+            <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Lifecycle timeline</div>
+              <div className="mt-4 space-y-3">
+                {(inspect.lifecycle ?? []).length === 0 ? (
+                  <div className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm text-slate-400">No lifecycle events were stored for this position yet.</div>
+                ) : (inspect.lifecycle ?? []).map((event, index) => (
+                  <div key={`${event.eventType}-${event.eventTime ?? index}`} className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <ToneBadge tone="info">{event.eventType}</ToneBadge>
+                      <ToneBadge tone="muted">{event.status}</ToneBadge>
+                      <span className="text-xs uppercase tracking-wide text-slate-500">{formatTimestamp(event.eventTime)}</span>
+                    </div>
+                    {event.message ? <p className="mt-3 text-sm text-slate-300">{event.message}</p> : null}
+                    <pre className="mt-3 overflow-x-auto whitespace-pre-wrap break-words rounded-2xl border border-slate-800 bg-slate-950/70 p-3 text-xs text-slate-400">{formatJson(event.payload ?? {})}</pre>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <InspectJsonCard title="Raw context" value={inspect.rawContext ?? {}} />
+          </>
+        ) : null}
       </aside>
+    </div>
+  )
+}
+
+
+
+async function getPositionInspect(assetClass: 'stock' | 'crypto', symbol: string): Promise<PositionInspectRecord> {
+  const params = new URLSearchParams({ asset_class: assetClass, symbol })
+  const response = await fetch(`/api/positions/inspect?${params.toString()}`)
+  if (!response.ok) {
+    const detail = await response.text()
+    throw new Error(detail || `Failed to fetch inspect payload: ${response.status}`)
+  }
+  return response.json()
+}
+
+function humanizeKey(value: string) {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/_/g, ' ')
+    .split(' ')
+    .map((part) => (part ? part[0].toUpperCase() + part.slice(1) : part))
+    .join(' ')
+}
+
+function renderInspectValue(label: string, value: unknown) {
+  if (value == null) return '—'
+  if (typeof value === 'number') {
+    if (label.toLowerCase().includes('pct')) return formatPercent(value)
+    if (label.toLowerCase().includes('price') || label.toLowerCase().includes('value') || label.toLowerCase().includes('pnl') || label.toLowerCase().includes('basis')) {
+      return formatMoney(value)
+    }
+    return String(value)
+  }
+  if (typeof value === 'boolean') return value ? 'True' : 'False'
+  if (typeof value === 'string' && (label.toLowerCase().includes('time') || label.toLowerCase().includes('atutc'))) return formatTimestamp(value)
+  if (typeof value === 'object') return formatJson(value)
+  return String(value)
+}
+
+function InspectJsonCard({ title, value }: { title: string; value: unknown }) {
+  return (
+    <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
+      <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{title}</div>
+      <pre className="mt-3 overflow-x-auto whitespace-pre-wrap break-words rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-xs text-slate-300">{formatJson(value ?? {})}</pre>
     </div>
   )
 }
@@ -580,7 +732,7 @@ function formatJson(value: unknown): string {
   }
 }
 
-function CryptoPositionsTable({ positions }: { positions: CryptoPosition[] }) {
+function CryptoPositionsTable({ positions, onSelect }: { positions: CryptoPosition[]; onSelect: (position: CryptoPosition) => void }) {
   if (positions.length === 0) {
     return <EmptyState message="No active crypto positions." />
   }
@@ -599,7 +751,8 @@ function CryptoPositionsTable({ positions }: { positions: CryptoPosition[] }) {
             <th className="pb-3 pr-4">Market value</th>
             <th className="pb-3 pr-4">Realized</th>
             <th className="pb-3 pr-4">P&amp;L</th>
-            <th className="pb-3">P&amp;L %</th>
+            <th className="pb-3 pr-4">P&amp;L %</th>
+            <th className="pb-3">Inspect</th>
           </tr>
         </thead>
         <tbody>
@@ -612,7 +765,16 @@ function CryptoPositionsTable({ positions }: { positions: CryptoPosition[] }) {
               <td className="py-3 pr-4">{formatMoney(position.marketValue)}</td>
               <td className={`py-3 pr-4 ${(position.realizedPnl ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{formatMoney(position.realizedPnl ?? 0)}</td>
               <td className={`py-3 pr-4 ${position.pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{formatMoney(position.pnl)}</td>
-              <td className={position.pnlPercent >= 0 ? 'py-3 text-emerald-300' : 'py-3 text-rose-300'}>{formatPercent(position.pnlPercent)}</td>
+              <td className={`${position.pnlPercent >= 0 ? 'py-3 pr-4 text-emerald-300' : 'py-3 pr-4 text-rose-300'}`}>{formatPercent(position.pnlPercent)}</td>
+              <td className="py-3">
+                <button
+                  type="button"
+                  onClick={() => onSelect(position)}
+                  className="rounded-full border border-slate-700 bg-slate-950/70 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-200 transition hover:border-cyan-600 hover:text-cyan-200"
+                >
+                  Inspect
+                </button>
+              </td>
             </tr>
           ))}
         </tbody>

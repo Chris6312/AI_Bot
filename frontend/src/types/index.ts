@@ -554,3 +554,39 @@ export const TOP_15_CRYPTO_PAIRS = [
   { display: 'ALGO/USD', ohlcv: 'ALGOUSD' },
   { display: 'XLM/USD', ohlcv: 'XLMUSD' },
 ] as const
+
+
+export interface PositionInspectTimelineEvent {
+  eventType: string
+  status: string
+  message: string | null
+  eventTime: string | null
+  payload: Record<string, unknown>
+}
+
+export interface PositionInspectTimeframeItem {
+  timeframe: string
+  status: string
+  reason: string
+}
+
+export interface PositionInspectRecord {
+  assetClass: 'stock' | 'crypto' | string
+  symbol: string
+  displaySymbol: string
+  inspectSource: string
+  positionSnapshot: Record<string, unknown>
+  signalSnapshot: Record<string, unknown>
+  sizing: Record<string, unknown>
+  timeframeAlignment: {
+    mode: string
+    configured: string[]
+    confirmed: string[]
+    items: PositionInspectTimeframeItem[]
+    note?: string | null
+  }
+  exitPlan: Record<string, unknown>
+  latestEvaluation?: Record<string, unknown> | null
+  lifecycle: PositionInspectTimelineEvent[]
+  rawContext: Record<string, unknown>
+}

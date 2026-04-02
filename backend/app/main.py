@@ -23,6 +23,7 @@ from app.models.position import Position
 from app.services.control_plane import get_control_plane_status, require_admin_token
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.kraken_service import crypto_ledger
+from app.services.position_inspect import PositionInspectNotFound, position_inspect_service
 from app.services.runtime_visibility import runtime_visibility_service
 from app.services.runtime_state import runtime_state
 from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
@@ -32,6 +33,10 @@ from app.services.tradier_client import tradier_client
 
 
 logging.basicConfig(level=logging.INFO)
+
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 ET = ZoneInfo('America/New_York')
@@ -300,6 +305,22 @@ async def get_stock_db_positions(db: Session = Depends(get_db)):
         }
         for row in rows
     ]
+
+
+@app.get('/api/positions/inspect')
+async def get_position_inspect(
+    asset_class: Literal['stock', 'crypto'] = Query(...),
+    symbol: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+):
+    try:
+        return position_inspect_service.get_inspect_payload(
+            db,
+            asset_class=asset_class,
+            symbol=symbol,
+        )
+    except PositionInspectNotFound as exc:
+        raise HTTPException(status_code=404, detail=exc.message) from exc
 
 
 @app.get('/api/stocks/history')
