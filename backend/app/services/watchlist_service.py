@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.models.account import Account
 from app.models.order_intent import OrderIntent
 from app.models.position import Position
 from app.models.trade import Trade
@@ -1022,6 +1023,22 @@ class WatchlistService:
             row.updated_at = observed_at
         return changed
 
+    def _resolve_existing_account_id(
+        self,
+        db: Session,
+        *,
+        candidate_account_id: Any,
+    ) -> str | None:
+        account_id = str(candidate_account_id or '').strip()
+        if not account_id:
+            return None
+        existing = (
+            db.query(Account.account_id)
+            .filter(Account.account_id == account_id)
+            .first()
+        )
+        return account_id if existing is not None else None
+
     def _resolve_stock_position_seed(
         self,
         db: Session,
@@ -1047,6 +1064,11 @@ class WatchlistService:
         entry_time = observed_at
         if latest_buy_intent is not None:
             entry_time = latest_buy_intent.last_fill_at or latest_buy_intent.first_fill_at or latest_buy_intent.submitted_at or latest_buy_intent.created_at or observed_at
+
+        seeded_account_id = latest_buy_intent.account_id if latest_buy_intent is not None else None
+        resolved_account_id = self._resolve_existing_account_id(db, candidate_account_id=seeded_account_id)
+        seed_account_missing = bool(seeded_account_id) and resolved_account_id is None
+
         strategy = str(watchlist_row.setup_template or '').strip() if watchlist_row is not None else ''
         if not strategy:
             strategy = 'WATCHLIST_ENTRY'
@@ -1074,8 +1096,12 @@ class WatchlistService:
             entry_reasoning['seedIntentId'] = latest_buy_intent.intent_id
             entry_reasoning['seedIntentStatus'] = latest_buy_intent.status
             entry_reasoning['seedExecutionSource'] = latest_buy_intent.execution_source
+        if seeded_account_id:
+            entry_reasoning['seedAccountId'] = seeded_account_id
+        if seed_account_missing:
+            entry_reasoning['seedAccountMissingFromAccounts'] = True
         return {
-            'accountId': latest_buy_intent.account_id if latest_buy_intent is not None else None,
+            'accountId': resolved_account_id,
             'shares': int(round(float(broker_position.get('shares') or 0.0))),
             'avgEntryPrice': avg_entry_price,
             'currentPrice': current_price,

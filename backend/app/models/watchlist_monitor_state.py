@@ -4,6 +4,10 @@ from sqlalchemy.sql import func
 from app.core.database import Base
 
 
+PENDING_EVALUATION = 'PENDING_EVALUATION'
+MONITOR_ONLY = 'MONITOR_ONLY'
+
+
 class WatchlistMonitorState(Base):
     __tablename__ = 'watchlist_monitor_state'
 

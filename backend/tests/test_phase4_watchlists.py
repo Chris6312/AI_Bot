@@ -3167,3 +3167,69 @@ def test_due_run_skips_watchlist_entry_when_open_position_exists(tmp_path, monke
         assert result['entryExecution']['skippedCount'] == 1
         assert db.query(OrderIntent).filter(OrderIntent.execution_source == 'WATCHLIST_MONITOR_ENTRY').count() == 0
         assert monitor_row.decision_context_json['entryExecution']['reason'] == 'OPEN_POSITION_EXISTS'
+
+
+def test_watchlist_exit_worker_handles_exit_snapshot_failure_without_crashing(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        monkeypatch.setattr(
+            'app.services.watchlist_exit_worker.watchlist_service.get_exit_readiness_snapshot',
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError('tradier timeout')),
+        )
+
+        status = watchlist_exit_worker.get_status(db)
+        result = watchlist_exit_worker.run_exit_sweep(db, execute=False, limit=10)
+
+        assert status['summary']['candidateExitCount'] == 0
+        assert result['summary']['candidateCount'] == 0
+        assert result['rows'] == []
+
+
+def test_broker_position_seed_omits_missing_account_fk(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        db.add(
+            OrderIntent(
+                intent_id='intent-seed-account',
+                account_id='VA83704948',
+                asset_class='stock',
+                symbol='AAPL',
+                side='BUY',
+                status='FILLED',
+                requested_quantity=5,
+                execution_source='WATCHLIST_MONITOR_ENTRY',
+            )
+        )
+        db.commit()
+
+        seed = watchlist_service._resolve_stock_position_seed(
+            db,
+            symbol='AAPL',
+            watchlist_row=(
+                db.query(WatchlistSymbol)
+                .filter(WatchlistSymbol.symbol == 'AAPL')
+                .order_by(WatchlistSymbol.id.desc())
+                .first()
+            ),
+            broker_position={
+                'symbol': 'AAPL',
+                'shares': 5,
+                'avgPrice': 100.0,
+                'currentPrice': 101.0,
+                'marketValue': 505.0,
+                'pnl': 5.0,
+                'pnlPercent': 1.0,
+            },
+            observed_at=datetime.now(UTC),
+        )
+
+        assert seed['accountId'] is None
+        assert seed['entryReasoning']['seedAccountId'] == 'VA83704948'
+        assert seed['entryReasoning']['seedAccountMissingFromAccounts'] is True

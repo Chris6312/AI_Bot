@@ -378,7 +378,11 @@ class WatchlistExitWorkerService:
         return snapshot
 
     def _get_due_rows(self, db: Session) -> list[dict[str, Any]]:
-        snapshot = watchlist_service.get_exit_readiness_snapshot(db, scope=SUPPORTED_SCOPE, expiring_within_hours=24)
+        try:
+            snapshot = watchlist_service.get_exit_readiness_snapshot(db, scope=SUPPORTED_SCOPE, expiring_within_hours=24)
+        except Exception as exc:
+            logger.warning('Watchlist exit worker could not build exit readiness snapshot: %s', exc)
+            return []
         rows = list(snapshot.get('rows', []))
         return [
             row

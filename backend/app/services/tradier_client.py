@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import requests
+from requests.exceptions import RequestException
 
 from app.core.config import settings
 
@@ -26,7 +27,7 @@ def _coalesce_numeric(payload: dict[str, Any], keys: list[str]) -> float:
 
 class TradierClient:
     def __init__(self) -> None:
-        self.timeout = 20
+        self.timeout = max(1.0, float(settings.TRADIER_REQUEST_TIMEOUT_SECONDS))
 
     def _credentials_for_mode(self, mode: str | None = None) -> dict[str, str]:
         selected_mode = (mode or "PAPER").upper()
@@ -46,6 +47,7 @@ class TradierClient:
         mode: str | None = None,
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         creds = self._credentials_for_mode(mode)
         selected_mode = (mode or "PAPER").upper()
@@ -65,7 +67,7 @@ class TradierClient:
             headers=headers,
             params=params,
             data=data,
-            timeout=self.timeout,
+            timeout=timeout if timeout is not None else self.timeout,
         )
         response.raise_for_status()
         return response.json() if response.text else {}
@@ -78,7 +80,13 @@ class TradierClient:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.get_account_sync, mode)
 
-    def get_quotes_sync(self, symbols: list[str], mode: str | None = None) -> dict[str, dict[str, Any]]:
+    def get_quotes_sync(
+        self,
+        symbols: list[str],
+        mode: str | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, dict[str, Any]]:
         unique_symbols = [str(symbol).upper() for symbol in dict.fromkeys(symbols) if symbol]
         if not unique_symbols:
             return {}
@@ -88,6 +96,7 @@ class TradierClient:
             "markets/quotes",
             mode=mode,
             params={"symbols": ",".join(unique_symbols)},
+            timeout=timeout,
         )
         raw_quotes = payload.get("quotes", {}).get("quote", [])
         if isinstance(raw_quotes, dict):
@@ -188,9 +197,9 @@ class TradierClient:
             "raw": payload or {},
         }
 
-    def get_positions_sync(self, mode: str | None = None) -> list[dict[str, Any]]:
+    def get_positions_sync(self, mode: str | None = None, *, timeout: float | None = None) -> list[dict[str, Any]]:
         creds = self._credentials_for_mode(mode)
-        payload = self._request_json("GET", f"accounts/{creds['account_id']}/positions", mode=mode)
+        payload = self._request_json("GET", f"accounts/{creds['account_id']}/positions", mode=mode, timeout=timeout)
         positions = payload.get("positions", {}).get("position", [])
         if isinstance(positions, dict):
             return [positions]
@@ -283,9 +292,27 @@ class TradierClient:
         if not self.is_ready(selected_mode):
             return []
 
-        raw_positions = self.get_positions_sync(selected_mode)
+        try:
+            raw_positions = self.get_positions_sync(
+                selected_mode,
+                timeout=max(1.0, float(settings.TRADIER_POSITIONS_TIMEOUT_SECONDS)),
+            )
+        except RequestException as exc:
+            logger.warning("Tradier positions snapshot failed for %s: %s", selected_mode, exc)
+            return []
+        except Exception as exc:
+            logger.warning("Tradier positions snapshot failed for %s: %s", selected_mode, exc)
+            return []
+
         symbols = [str(position.get("symbol", "")).upper() for position in raw_positions if position.get("symbol")]
-        quotes = self.get_quotes_sync(symbols, mode=selected_mode) if symbols else {}
+        try:
+            quotes = self.get_quotes_sync(symbols, mode=selected_mode) if symbols else {}
+        except RequestException as exc:
+            logger.warning("Tradier quote refresh failed during positions snapshot for %s: %s", selected_mode, exc)
+            quotes = {}
+        except Exception as exc:
+            logger.warning("Tradier quote refresh failed during positions snapshot for %s: %s", selected_mode, exc)
+            quotes = {}
 
         positions: list[dict[str, Any]] = []
         for raw_position in raw_positions:

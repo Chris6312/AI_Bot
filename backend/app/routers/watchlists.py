@@ -112,6 +112,7 @@ async def get_watchlist_exit_worker_status(
 
 
 @router.post('/run-exit-sweep')
+@router.post('/exit-worker/sweep')
 async def run_watchlist_exit_sweep(
     execute: bool = Query(default=False),
     limit: int = Query(default=25, ge=1, le=100),

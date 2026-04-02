@@ -14,7 +14,7 @@ from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.order_intent import OrderIntent
 from app.models.position import Position
-from app.models.watchlist_monitor_state import WatchlistMonitorState
+from app.models.watchlist_monitor_state import WatchlistMonitorState, MONITOR_ONLY
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.market_sessions import get_scope_session_status
@@ -633,7 +633,10 @@ class WatchlistMonitoringOrchestrator:
         reason = payload.get('reason')
         if reason is not None:
             monitor_state.latest_decision_reason = str(reason)
-        if action in {'ENTRY_FILLED', 'ENTRY_SUBMITTED', 'GATE_REJECTED', 'SUBMISSION_REJECTED'}:
+        if action == 'SKIPPED' and str(reason or '').strip() == 'OPEN_POSITION_EXISTS':
+            monitor_state.latest_decision_state = MONITOR_ONLY
+            monitor_state.latest_decision_reason = 'Open position exists; symbol is now managed under exit rules.'
+        elif action in {'ENTRY_FILLED', 'ENTRY_SUBMITTED', 'GATE_REJECTED', 'SUBMISSION_REJECTED'}:
             monitor_state.latest_decision_state = action
         monitor_state.last_decision_at_utc = recorded_at
         db.add(monitor_state)
