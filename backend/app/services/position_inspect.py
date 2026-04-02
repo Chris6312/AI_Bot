@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models.order_event import OrderEvent
@@ -12,7 +13,7 @@ from app.models.trade import Trade
 from app.models.watchlist_monitor_state import WatchlistMonitorState
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_upload import WatchlistUpload
-from app.services.kraken_service import crypto_ledger
+from app.services.kraken_service import crypto_ledger, kraken_service
 
 
 @dataclass
@@ -119,26 +120,29 @@ class PositionInspectService:
         if current_position is None:
             raise PositionInspectNotFound(f'No open crypto position found for {symbol}.')
 
-        watch_symbol = (
-            db.query(WatchlistSymbol)
-            .filter(WatchlistSymbol.scope == 'crypto_only', WatchlistSymbol.asset_class == 'crypto', WatchlistSymbol.symbol == symbol)
-            .order_by(WatchlistSymbol.created_at.desc(), WatchlistSymbol.id.desc())
-            .first()
-        )
-        monitor_state = (
-            db.query(WatchlistMonitorState)
-            .filter(WatchlistMonitorState.scope == 'crypto_only', WatchlistMonitorState.symbol == symbol)
-            .order_by(WatchlistMonitorState.updated_at.desc(), WatchlistMonitorState.id.desc())
-            .first()
-        )
-        intent = self._find_intent(db, asset_class='crypto', symbol=symbol)
+        aliases = self._crypto_symbol_aliases(symbol, current_position=current_position)
+        intent = self._find_crypto_intent(db, aliases)
+        watch_symbol = self._find_crypto_watch_symbol(db, aliases)
+        monitor_state = self._find_crypto_monitor_state(db, aliases, watch_symbol)
         upload = None
         if watch_symbol is not None:
             upload = db.query(WatchlistUpload).filter(WatchlistUpload.upload_id == watch_symbol.upload_id).first()
 
-        latest_eval = dict((monitor_state.decision_context_json or {}).get('latestEvaluation', {}) or {}) if monitor_state is not None else {}
+        intent_context = intent.context_json if intent is not None and isinstance(intent.context_json, dict) else {}
+        watchlist_context = dict(intent_context.get('watchlist') or {})
+        base_monitor_context = dict(monitor_state.decision_context_json or {}) if monitor_state is not None and isinstance(monitor_state.decision_context_json, dict) else {}
+        latest_eval = dict(base_monitor_context.get('latestEvaluation') or {})
         details = dict(latest_eval.get('details') or {})
-        configured_timeframes = list((watch_symbol.bot_timeframes if watch_symbol is not None else None) or (monitor_state.required_timeframes_json if monitor_state is not None else []) or [])
+        if not details and base_monitor_context:
+            details = dict(base_monitor_context.get('details') or {})
+
+        configured_timeframes = list(
+            (watch_symbol.bot_timeframes if watch_symbol is not None else None)
+            or (watchlist_context.get('botTimeframes') if isinstance(watchlist_context.get('botTimeframes'), list) else None)
+            or (monitor_state.required_timeframes_json if monitor_state is not None else None)
+            or (base_monitor_context.get('botTimeframes') if isinstance(base_monitor_context.get('botTimeframes'), list) else None)
+            or []
+        )
         monitoring_timeframe = self._infer_monitoring_timeframe(configured_timeframes)
         timeframe_items = []
         for timeframe in configured_timeframes:
@@ -151,18 +155,17 @@ class PositionInspectService:
 
         events = self._load_events(db, intent)
         signal_snapshot = {
-            'marketRegime': upload.market_regime if upload is not None else None,
-            'tradeDirection': watch_symbol.trade_direction if watch_symbol is not None else None,
-            'bias': watch_symbol.bias if watch_symbol is not None else None,
-            'setupTemplate': watch_symbol.setup_template if watch_symbol is not None else None,
-            'priorityRank': watch_symbol.priority_rank if watch_symbol is not None else None,
-            'tier': watch_symbol.tier if watch_symbol is not None else None,
-            'riskFlags': watch_symbol.risk_flags if watch_symbol is not None else [],
-            'latestDecisionState': monitor_state.latest_decision_state if monitor_state is not None else None,
-            'latestDecisionReason': monitor_state.latest_decision_reason if monitor_state is not None else None,
+            'marketRegime': upload.market_regime if upload is not None else watchlist_context.get('marketRegime'),
+            'tradeDirection': watch_symbol.trade_direction if watch_symbol is not None else watchlist_context.get('tradeDirection'),
+            'bias': watch_symbol.bias if watch_symbol is not None else watchlist_context.get('bias') or base_monitor_context.get('bias'),
+            'setupTemplate': watch_symbol.setup_template if watch_symbol is not None else watchlist_context.get('setupTemplate') or base_monitor_context.get('setupTemplate'),
+            'priorityRank': watch_symbol.priority_rank if watch_symbol is not None else watchlist_context.get('priorityRank'),
+            'tier': watch_symbol.tier if watch_symbol is not None else watchlist_context.get('tier') or base_monitor_context.get('tier'),
+            'riskFlags': watch_symbol.risk_flags if watch_symbol is not None else watchlist_context.get('riskFlags') or base_monitor_context.get('riskFlags') or [],
+            'latestDecisionState': monitor_state.latest_decision_state if monitor_state is not None else latest_eval.get('state'),
+            'latestDecisionReason': monitor_state.latest_decision_reason if monitor_state is not None else latest_eval.get('reason'),
             'details': details,
         }
-        intent_context = intent.context_json if intent is not None and isinstance(intent.context_json, dict) else {}
         sizing = {
             'accountId': intent.account_id if intent is not None else 'paper-crypto-ledger',
             'requestedQuantity': float(intent.requested_quantity or 0.0) if intent is not None else float(current_position.get('amount') or 0.0),
@@ -175,8 +178,8 @@ class PositionInspectService:
             'ohlcvPair': intent_context.get('ohlcvPair') or current_position.get('ohlcvPair'),
         }
         exit_plan = {
-            'template': watch_symbol.exit_template if watch_symbol is not None else None,
-            'maxHoldHours': watch_symbol.max_hold_hours if watch_symbol is not None else None,
+            'template': watch_symbol.exit_template if watch_symbol is not None else watchlist_context.get('exitTemplate') or base_monitor_context.get('exitTemplate'),
+            'maxHoldHours': watch_symbol.max_hold_hours if watch_symbol is not None else watchlist_context.get('maxHoldHours') or base_monitor_context.get('maxHoldHours'),
             'triggerLevel': self._maybe_float(details.get('triggerLevel')),
             'bounceFloor': self._maybe_float(details.get('bounceFloor')),
             'breakoutLevel': self._maybe_float(details.get('breakoutLevel')),
@@ -184,7 +187,7 @@ class PositionInspectService:
             'recentLow': self._maybe_float(details.get('recentLow')),
             'continuityOk': details.get('continuityOk'),
             'continuityGapSeconds': self._maybe_float(details.get('continuityGapSeconds')),
-            'marketDataAtUtc': latest_eval.get('marketDataAtUtc'),
+            'marketDataAtUtc': latest_eval.get('marketDataAtUtc') or base_monitor_context.get('marketDataAtUtc'),
         }
         return {
             'assetClass': 'crypto',
@@ -224,19 +227,21 @@ class PositionInspectService:
             'rawContext': {
                 'intentContext': intent_context,
                 'watchlist': {
-                    'uploadId': watch_symbol.upload_id if watch_symbol is not None else None,
-                    'scope': watch_symbol.scope if watch_symbol is not None else 'crypto_only',
+                    'uploadId': watch_symbol.upload_id if watch_symbol is not None else watchlist_context.get('uploadId'),
+                    'scope': watch_symbol.scope if watch_symbol is not None else watchlist_context.get('scope') or 'crypto_only',
+                    'symbolAliases': sorted(aliases),
                 },
-                'monitorContext': monitor_state.decision_context_json if monitor_state is not None else {},
+                'monitorContext': base_monitor_context,
             },
         }
 
     @staticmethod
     def _find_crypto_position(symbol: str) -> dict[str, Any] | None:
         normalized = str(symbol or '').strip().upper()
+        aliases = PositionInspectService._crypto_symbol_aliases(normalized)
         for row in crypto_ledger.get_positions():
             pair = str(row.get('pair') or '').strip().upper()
-            if pair == normalized:
+            if pair in aliases:
                 return row
         return None
 
@@ -259,6 +264,61 @@ class PositionInspectService:
         )
         preferred = query.filter(OrderIntent.side == 'BUY', OrderIntent.status.in_(['FILLED', 'PARTIALLY_FILLED'])).first()
         return preferred or query.first()
+
+    @staticmethod
+    def _find_crypto_intent(db: Session, aliases: set[str]) -> OrderIntent | None:
+        query = (
+            db.query(OrderIntent)
+            .filter(OrderIntent.asset_class == 'crypto', OrderIntent.symbol.in_(sorted(aliases)))
+            .order_by(
+                OrderIntent.last_fill_at.desc(),
+                OrderIntent.first_fill_at.desc(),
+                OrderIntent.submitted_at.desc(),
+                OrderIntent.created_at.desc(),
+                OrderIntent.id.desc(),
+            )
+        )
+        preferred = query.filter(OrderIntent.side == 'BUY', OrderIntent.status.in_(['FILLED', 'PARTIALLY_FILLED'])).first()
+        return preferred or query.first()
+
+    @staticmethod
+    def _find_crypto_watch_symbol(db: Session, aliases: set[str]) -> WatchlistSymbol | None:
+        base_candidates = sorted({alias for alias in aliases if '/' not in alias and not alias.endswith('USD') or alias == alias[:-3]})
+        # keep explicit symbol aliases first
+        all_candidates = sorted(aliases)
+        query = (
+            db.query(WatchlistSymbol)
+            .filter(
+                WatchlistSymbol.scope == 'crypto_only',
+                WatchlistSymbol.asset_class == 'crypto',
+                WatchlistSymbol.symbol.in_(all_candidates),
+            )
+            .order_by(WatchlistSymbol.updated_at.desc(), WatchlistSymbol.created_at.desc(), WatchlistSymbol.id.desc())
+        )
+        row = query.first()
+        if row is not None:
+            return row
+        if base_candidates:
+            return (
+                db.query(WatchlistSymbol)
+                .filter(
+                    WatchlistSymbol.scope == 'crypto_only',
+                    WatchlistSymbol.asset_class == 'crypto',
+                    WatchlistSymbol.symbol.in_(base_candidates),
+                )
+                .order_by(WatchlistSymbol.updated_at.desc(), WatchlistSymbol.created_at.desc(), WatchlistSymbol.id.desc())
+                .first()
+            )
+        return None
+
+    @staticmethod
+    def _find_crypto_monitor_state(db: Session, aliases: set[str], watch_symbol: WatchlistSymbol | None) -> WatchlistMonitorState | None:
+        query = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.scope == 'crypto_only')
+        filters = [WatchlistMonitorState.symbol.in_(sorted(aliases))]
+        if watch_symbol is not None:
+            filters.append(WatchlistMonitorState.watchlist_symbol_id == watch_symbol.id)
+        row = query.filter(or_(*filters)).order_by(WatchlistMonitorState.updated_at.desc(), WatchlistMonitorState.id.desc()).first()
+        return row
 
     @staticmethod
     def _load_events(db: Session, intent: OrderIntent | None) -> list[dict[str, Any]]:
@@ -349,6 +409,40 @@ class PositionInspectService:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _crypto_symbol_aliases(symbol: str, current_position: dict[str, Any] | None = None) -> set[str]:
+        aliases: set[str] = set()
+
+        def add(raw: Any) -> None:
+            text = str(raw or '').strip().upper()
+            if not text:
+                return
+            aliases.add(text)
+            compact = text.replace('/', '')
+            aliases.add(compact)
+            if '/' in text:
+                base, quote = text.split('/', 1)
+                aliases.add(base)
+                aliases.add(f'{base}{quote}')
+            elif text.endswith('USD') and len(text) > 3:
+                base = text[:-3]
+                aliases.add(base)
+                aliases.add(f'{base}/USD')
+
+        add(symbol)
+        if current_position is not None:
+            add(current_position.get('pair'))
+            add(current_position.get('ohlcvPair'))
+        resolved = kraken_service.resolve_pair(str(symbol or '').strip())
+        if resolved is not None:
+            add(resolved.display_pair)
+            add(resolved.rest_pair)
+            add(resolved.altname)
+            add(resolved.ws_pair)
+            add(resolved.pair_key)
+        aliases.discard('')
+        return aliases
 
 
 position_inspect_service = PositionInspectService()

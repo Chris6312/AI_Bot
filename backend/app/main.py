@@ -17,13 +17,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.routers import crypto, watchlists
-from app.core.database import get_db
+from app.core.database import SessionLocal, get_db
 from app.models.order_intent import OrderIntent
 from app.models.position import Position
 from app.services.control_plane import get_control_plane_status, require_admin_token
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.kraken_service import crypto_ledger
 from app.services.position_inspect import PositionInspectNotFound, position_inspect_service
+from app.services.position_reconciliation import position_reconciliation_service
 from app.services.runtime_visibility import runtime_visibility_service
 from app.services.runtime_state import runtime_state
 from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
@@ -53,10 +54,20 @@ async def lifespan(app: FastAPI):
     from app.core.config import settings
 
     logger.info('🔄 Priming Kraken AssetPairs cache for startup...')
+
+    def _run_startup_reconciliation() -> dict[str, object]:
+        db = SessionLocal()
+        try:
+            return position_reconciliation_service.reconcile_all(db)
+        finally:
+            db.close()
+
     try:
+        startup_reconciliation = await asyncio.to_thread(_run_startup_reconciliation)
         startup_refresh = await watchlist_monitoring_orchestrator.bootstrap_startup_state(
             refresh_crypto_monitor_state=bool(settings.WATCHLIST_MONITOR_ENABLED),
         )
+        logger.info('Startup position reconciliation complete: %s', startup_reconciliation)
         logger.info(
             'Startup crypto refresh complete: asset_pairs=%s evaluated=%s data_unavailable=%s waiting=%s entry_candidates=%s',
             startup_refresh['assetPairCount'],
