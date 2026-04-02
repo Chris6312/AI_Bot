@@ -22,7 +22,7 @@ from app.services.position_sizer import position_sizer
 from app.services.pre_trade_gate import pre_trade_gate
 from app.services.runtime_state import runtime_state
 from app.services.template_evaluator import ENTRY_CANDIDATE, template_evaluation_service
-from app.services.kraken_service import kraken_service
+from app.services.kraken_service import kraken_service, crypto_ledger
 from app.services.tradier_client import tradier_client
 from app.services.watchlist_service import ACTIVE, MANAGED_ONLY, PENDING_EVALUATION, WATCHLIST_SCOPE, watchlist_service
 
@@ -250,10 +250,9 @@ class WatchlistMonitoringOrchestrator:
                 scope_result['session'] = session_status.to_dict()
                 scope_result['sessionBlockedCount'] = 0
                 scope_result['dueCountBefore'] = due_before
-                if scope_value == 'stocks_only':
-                    entry_execution = self._execute_entry_candidates(db, evaluated_scope['rows'])
-                    scope_result['entryExecution'] = entry_execution
-                    scope_result['monitoringSnapshot'] = watchlist_service.get_monitoring_snapshot(db, scope=scope_value, include_inactive=False)
+                entry_execution = self._execute_entry_candidates(db, evaluated_scope['rows'])
+                scope_result['entryExecution'] = entry_execution
+                scope_result['monitoringSnapshot'] = watchlist_service.get_monitoring_snapshot(db, scope=scope_value, include_inactive=False)
                 scope_result['dueCountAfter'] = self._count_due_rows(db, scope=scope_value, observed_at=datetime.now(UTC))
                 result['summary']['scopesWithDueRows'] += 1
 
@@ -330,68 +329,107 @@ class WatchlistMonitoringOrchestrator:
             'skippedCount': 0,
             'rows': [],
         }
-        if not runtime.running:
-            for row in evaluated_rows:
-                if str(row.get('scope') or '') == 'stocks_only' and str(row.get('latestDecisionState') or '') == ENTRY_CANDIDATE:
-                    result['candidateCount'] += 1
-                    result['skippedCount'] += 1
-                    result['rows'].append({
-                        'symbol': str(row.get('symbol') or '').upper(),
-                        'action': 'SKIPPED',
-                        'reason': 'RUNTIME_STOPPED',
-                        'intentId': None,
-                        'submittedOrderId': None,
-                        'positionId': None,
-                        'tradeId': None,
-                    })
-            return result
-
-        candidate_symbols = [
-            str(row.get('symbol') or '').upper()
-            for row in evaluated_rows
-            if str(row.get('scope') or '') == 'stocks_only' and str(row.get('latestDecisionState') or '') == ENTRY_CANDIDATE
+        candidate_rows = [
+            row for row in evaluated_rows
+            if str(row.get('latestDecisionState') or '') == ENTRY_CANDIDATE
         ]
-        if not candidate_symbols:
+        if not candidate_rows:
             return result
 
-        query = (
-            db.query(WatchlistMonitorState, WatchlistSymbol)
-            .join(WatchlistSymbol, WatchlistSymbol.id == WatchlistMonitorState.watchlist_symbol_id)
-            .filter(
-                WatchlistMonitorState.scope == 'stocks_only',
-                WatchlistMonitorState.symbol.in_(candidate_symbols),
-            )
-            .order_by(WatchlistSymbol.priority_rank.asc(), WatchlistSymbol.id.asc())
-        )
+        if not runtime.running:
+            for row in candidate_rows:
+                result['candidateCount'] += 1
+                result['skippedCount'] += 1
+                result['rows'].append({
+                    'symbol': str(row.get('symbol') or '').upper(),
+                    'action': 'SKIPPED',
+                    'reason': 'RUNTIME_STOPPED',
+                    'intentId': None,
+                    'submittedOrderId': None,
+                    'positionId': None,
+                    'tradeId': None,
+                })
+            return result
+
+        stock_symbols = [
+            str(row.get('symbol') or '').upper()
+            for row in candidate_rows
+            if str(row.get('scope') or '') == 'stocks_only'
+        ]
+        crypto_symbols = [
+            str(row.get('symbol') or '').upper()
+            for row in candidate_rows
+            if str(row.get('scope') or '') == 'crypto_only'
+        ]
 
         account_cache: dict[str, Any] = {
             'loaded': False,
-            'error': None,
             'account': None,
-            'cashAvailable': None,
+            'cashAvailable': 0.0,
+            'error': None,
         }
 
-        for monitor_state, symbol_row in query.all():
-            result['candidateCount'] += 1
-            candidate = self._submit_stock_entry_candidate(
-                db,
-                monitor_state=monitor_state,
-                symbol_row=symbol_row,
-                mode=runtime.stock_mode,
-                account_cache=account_cache,
+        if stock_symbols:
+            query = (
+                db.query(WatchlistMonitorState, WatchlistSymbol)
+                .join(WatchlistSymbol, WatchlistSymbol.id == WatchlistMonitorState.watchlist_symbol_id)
+                .filter(
+                    WatchlistMonitorState.scope == 'stocks_only',
+                    WatchlistMonitorState.symbol.in_(stock_symbols),
+                )
+                .order_by(WatchlistSymbol.priority_rank.asc(), WatchlistSymbol.id.asc())
             )
-            result['rows'].append(candidate)
-            if candidate.get('intentId'):
-                result['intentCount'] += 1
-            action = str(candidate.get('action') or '')
-            if action in {'ENTRY_SUBMITTED', 'ENTRY_FILLED'}:
-                result['submittedCount'] += 1
-            if action == 'ENTRY_FILLED':
-                result['filledCount'] += 1
-            elif action in {'GATE_REJECTED', 'SUBMISSION_REJECTED'}:
-                result['rejectedCount'] += 1
-            elif action not in {'ENTRY_SUBMITTED'}:
-                result['skippedCount'] += 1
+            for monitor_state, symbol_row in query.all():
+                result['candidateCount'] += 1
+                candidate = self._submit_stock_entry_candidate(
+                    db,
+                    monitor_state=monitor_state,
+                    symbol_row=symbol_row,
+                    mode=runtime.stock_mode,
+                    account_cache=account_cache,
+                )
+                result['rows'].append(candidate)
+                if candidate.get('intentId'):
+                    result['intentCount'] += 1
+                action = str(candidate.get('action') or '')
+                if action in {'ENTRY_SUBMITTED', 'ENTRY_FILLED'}:
+                    result['submittedCount'] += 1
+                if action == 'ENTRY_FILLED':
+                    result['filledCount'] += 1
+                elif action in {'GATE_REJECTED', 'SUBMISSION_REJECTED'}:
+                    result['rejectedCount'] += 1
+                elif action == 'SKIPPED':
+                    result['skippedCount'] += 1
+
+        if crypto_symbols:
+            query = (
+                db.query(WatchlistMonitorState, WatchlistSymbol)
+                .join(WatchlistSymbol, WatchlistSymbol.id == WatchlistMonitorState.watchlist_symbol_id)
+                .filter(
+                    WatchlistMonitorState.scope == 'crypto_only',
+                    WatchlistMonitorState.symbol.in_(crypto_symbols),
+                )
+                .order_by(WatchlistSymbol.priority_rank.asc(), WatchlistSymbol.id.asc())
+            )
+            for monitor_state, symbol_row in query.all():
+                result['candidateCount'] += 1
+                candidate = self._submit_crypto_entry_candidate(
+                    db,
+                    monitor_state=monitor_state,
+                    symbol_row=symbol_row,
+                )
+                result['rows'].append(candidate)
+                if candidate.get('intentId'):
+                    result['intentCount'] += 1
+                action = str(candidate.get('action') or '')
+                if action in {'ENTRY_SUBMITTED', 'ENTRY_FILLED'}:
+                    result['submittedCount'] += 1
+                if action == 'ENTRY_FILLED':
+                    result['filledCount'] += 1
+                elif action in {'GATE_REJECTED', 'SUBMISSION_REJECTED'}:
+                    result['rejectedCount'] += 1
+                elif action == 'SKIPPED':
+                    result['skippedCount'] += 1
         return result
 
     def _submit_stock_entry_candidate(
@@ -615,6 +653,189 @@ class WatchlistMonitoringOrchestrator:
         db.commit()
         return payload
 
+    def _submit_crypto_entry_candidate(
+        self,
+        db: Session,
+        *,
+        monitor_state: WatchlistMonitorState,
+        symbol_row: WatchlistSymbol,
+    ) -> dict[str, Any]:
+        symbol = str(symbol_row.symbol or '').upper().strip()
+        quote_currency = str(symbol_row.quote_currency or 'USD').upper().strip()
+        pair = f'{symbol}/{quote_currency}'
+        resolved_pair = kraken_service.resolve_pair(pair)
+        payload: dict[str, Any] = {
+            'symbol': pair,
+            'uploadId': symbol_row.upload_id,
+            'priorityRank': symbol_row.priority_rank,
+            'setupTemplate': symbol_row.setup_template,
+            'exitTemplate': symbol_row.exit_template,
+            'action': None,
+            'reason': None,
+            'intentId': None,
+            'submittedOrderId': None,
+            'positionId': None,
+            'tradeId': None,
+        }
+
+        if resolved_pair is None:
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'PAIR_UNRESOLVED'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        if self._has_open_crypto_position(pair):
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'OPEN_POSITION_EXISTS'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        if self._has_active_entry_intent(db, pair, asset_class='crypto'):
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'ACTIVE_ENTRY_INTENT_EXISTS'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        latest_details = dict((monitor_state.decision_context_json or {}).get('latestEvaluation', {}).get('details', {}) or {})
+        current_price = self._safe_float(latest_details.get('currentPrice'))
+        if current_price <= 0:
+            ticker = kraken_service.get_ticker(resolved_pair.rest_pair)
+            current_price = self._safe_float((ticker or {}).get('c', [0.0])[0] if ticker else 0.0)
+        if current_price <= 0:
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'ENTRY_PRICE_UNAVAILABLE'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        available_balance = float(getattr(crypto_ledger, 'balance', 0.0) or 0.0)
+        if available_balance <= 0:
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'NO_CASH_AVAILABLE'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        positions = position_sizer.calculate_crypto_positions(
+            [{'pair': pair}],
+            available_balance,
+            prices={pair: current_price},
+        )
+        sized = next((row for row in positions if self._safe_float(row.get('amount')) > 0), None)
+        if sized is None:
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = 'POSITION_SIZER_RETURNED_ZERO'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        amount = self._safe_float(sized.get('amount'))
+        intent = execution_lifecycle.create_order_intent(
+            db,
+            account_id='paper-crypto-ledger',
+            asset_class='crypto',
+            symbol=pair,
+            side='BUY',
+            requested_quantity=amount,
+            requested_price=current_price,
+            execution_source=ENTRY_EXECUTION_SOURCE,
+            context={
+                'mode': 'PAPER',
+                'watchlist': {
+                    'uploadId': symbol_row.upload_id,
+                    'scope': symbol_row.scope,
+                    'priorityRank': symbol_row.priority_rank,
+                    'tier': symbol_row.tier,
+                    'bias': symbol_row.bias,
+                    'setupTemplate': symbol_row.setup_template,
+                    'exitTemplate': symbol_row.exit_template,
+                    'riskFlags': symbol_row.risk_flags or [],
+                    'botTimeframes': symbol_row.bot_timeframes or [],
+                },
+                'estimatedValue': sized.get('estimated_value'),
+                'positionPct': sized.get('position_pct'),
+                'ohlcvPair': resolved_pair.rest_pair,
+                'displayPair': resolved_pair.display_pair,
+            },
+        )
+        payload['intentId'] = intent.intent_id
+
+        trade = crypto_ledger.execute_trade(
+            pair,
+            resolved_pair.rest_pair,
+            'BUY',
+            amount,
+            current_price,
+        )
+        trade_status = str(trade.get('status') or '').upper()
+        trade_reason = str(trade.get('reason') or '') or None
+        trade_timestamp = trade.get('timestamp')
+        event_time = datetime.fromisoformat(str(trade_timestamp).replace('Z', '+00:00')) if trade_timestamp else datetime.now(UTC)
+
+        if trade_status != 'FILLED':
+            intent.status = 'REJECTED'
+            intent.rejection_reason = trade_reason or 'Crypto paper ledger rejected the watchlist entry.'
+            execution_lifecycle.record_event(
+                db,
+                intent,
+                event_type='ORDER_SUBMISSION_FAILED',
+                status='REJECTED',
+                message=f'Crypto watchlist entry failed for {pair}: {intent.rejection_reason}',
+                payload=trade,
+                event_time=event_time,
+            )
+            db.commit()
+            db.refresh(intent)
+            payload.update({
+                'action': 'SUBMISSION_REJECTED',
+                'reason': intent.rejection_reason,
+                'tradeId': trade.get('id'),
+            })
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        intent.status = 'FILLED'
+        intent.submitted_order_id = str(trade.get('id') or intent.submitted_order_id or '') or None
+        intent.submitted_at = event_time
+        intent.first_fill_at = event_time
+        intent.last_fill_at = event_time
+        intent.filled_quantity = amount
+        intent.avg_fill_price = current_price
+        intent.rejection_reason = None
+        execution_lifecycle.record_event(
+            db,
+            intent,
+            event_type='ORDER_SUBMITTED',
+            status='SUBMITTED',
+            message=f'Crypto paper ledger accepted order for {pair}',
+            payload=trade,
+            event_time=event_time,
+        )
+        execution_lifecycle.record_event(
+            db,
+            intent,
+            event_type='ORDER_STATUS_UPDATED',
+            status='FILLED',
+            message=f'Confirmed fill for {pair}: {amount} filled',
+            payload=trade,
+            event_time=event_time,
+        )
+        db.commit()
+        db.refresh(intent)
+        payload.update({
+            'action': 'ENTRY_FILLED',
+            'reason': None,
+            'submittedOrderId': intent.submitted_order_id,
+            'tradeId': trade.get('id'),
+        })
+        self._record_entry_execution(db, monitor_state, payload)
+        db.commit()
+        return payload
+
     def _record_entry_execution(self, db: Session, monitor_state: WatchlistMonitorState, payload: dict[str, Any]) -> None:
         recorded_at = datetime.now(UTC)
         context = dict(monitor_state.decision_context_json or {})
@@ -683,11 +904,11 @@ class WatchlistMonitoringOrchestrator:
         )
 
     @staticmethod
-    def _has_active_entry_intent(db: Session, symbol: str) -> bool:
+    def _has_active_entry_intent(db: Session, symbol: str, *, asset_class: str = 'stock') -> bool:
         return (
             db.query(OrderIntent)
             .filter(
-                OrderIntent.asset_class == 'stock',
+                OrderIntent.asset_class == asset_class,
                 OrderIntent.symbol == symbol,
                 OrderIntent.side == 'BUY',
                 OrderIntent.execution_source == ENTRY_EXECUTION_SOURCE,
@@ -696,6 +917,11 @@ class WatchlistMonitoringOrchestrator:
             .first()
             is not None
         )
+
+    @staticmethod
+    def _has_open_crypto_position(pair: str) -> bool:
+        positions = getattr(crypto_ledger, 'positions', {}) or {}
+        return str(pair or '').upper().strip() in {str(key).upper().strip() for key in positions.keys()}
 
     @staticmethod
     def _confirm_stock_order_sync(order_snapshot: dict[str, Any], *, mode: str) -> dict[str, Any]:

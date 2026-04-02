@@ -1025,7 +1025,13 @@ def test_template_evaluator_promotes_crypto_symbol_to_entry_candidate(tmp_path, 
         monkeypatch.setattr(
             kraken_service,
             'resolve_pair',
-            lambda pair: KrakenPairMetadata(display_pair='BTC/USD', rest_pair='XBTUSD', pair_key='XXBTZUSD', ws_pair='XBT/USD', altname='XBTUSD'),
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD',
+                rest_pair='XBTUSD',
+                pair_key='XBTUSD',
+                ws_pair='XBT/USD',
+                altname='XBTUSD',
+            ),
         )
         monkeypatch.setattr(
             kraken_service,
@@ -1038,6 +1044,17 @@ def test_template_evaluator_promotes_crypto_symbol_to_entry_candidate(tmp_path, 
                 'o': ['100.0', '100.0'],
                 '_fetched_at_utc': now.isoformat(),
             },
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.get_ohlc',
+            lambda pair, interval=15, limit=25: [
+                {'open': '68000.0', 'high': '69000.0', 'low': '67500.0', 'close': '68500.0', 'time': 1},
+                {'open': '68500.0', 'high': '69500.0', 'low': '68000.0', 'close': '69000.0', 'time': 2},
+                {'open': '69000.0', 'high': '70000.0', 'low': '68800.0', 'close': '69500.0', 'time': 3},
+                {'open': '69500.0', 'high': '70500.0', 'low': '69200.0', 'close': '69800.0', 'time': 4},
+                {'open': '69800.0', 'high': '71000.0', 'low': '69700.0', 'close': '70000.0', 'time': 5},
+                {'open': '70000.0', 'high': '71200.0', 'low': '69900.0', 'close': '70500.0', 'time': 6},
+            ],
         )
         candles = []
         base_ts = int((now - timedelta(minutes=75)).timestamp())
@@ -3233,3 +3250,91 @@ def test_broker_position_seed_omits_missing_account_fk(tmp_path) -> None:
         assert seed['accountId'] is None
         assert seed['entryReasoning']['seedAccountId'] == 'VA83704948'
         assert seed['entryReasoning']['seedAccountMissingFromAccounts'] is True
+
+
+def test_due_run_executes_crypto_watchlist_entry_into_paper_ledger(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'BTC').one()
+        monitor_row.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+        db.commit()
+
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(**{
+                'session_open': True,
+                'to_dict': lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': True,
+                    'reason': 'patched open session',
+                    'nextSessionStartUtc': None,
+                    'nextSessionStartEt': None,
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            }),
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.resolve_pair',
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD',
+                rest_pair='XBTUSD',
+                pair_key='XBTUSD',
+                ws_pair='XBT/USD',
+                altname='XBTUSD',
+            ),
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.get_ticker',
+            lambda pair: {
+                'c': ['70000.0', '1'],
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.get_ohlc',
+            lambda pair, interval=15, limit=25: [
+                {'timestamp': 1, 'open': 68000.0, 'high': 69000.0, 'low': 67500.0, 'close': 68500.0, 'vwap': 68500.0, 'volume': 10.0, 'count': 1},
+                {'timestamp': 2, 'open': 68500.0, 'high': 69500.0, 'low': 68000.0, 'close': 69000.0, 'vwap': 69000.0, 'volume': 11.0, 'count': 1},
+                {'timestamp': 3, 'open': 69000.0, 'high': 70000.0, 'low': 68800.0, 'close': 69500.0, 'vwap': 69500.0, 'volume': 12.0, 'count': 1},
+                {'timestamp': 4, 'open': 69500.0, 'high': 70500.0, 'low': 69200.0, 'close': 69800.0, 'vwap': 69800.0, 'volume': 13.0, 'count': 1},
+                {'timestamp': 5, 'open': 69800.0, 'high': 71000.0, 'low': 69700.0, 'close': 70000.0, 'vwap': 70000.0, 'volume': 14.0, 'count': 1},
+                {'timestamp': 6, 'open': 70000.0, 'high': 71200.0, 'low': 69900.0, 'close': 70500.0, 'vwap': 70500.0, 'volume': 15.0, 'count': 1},
+            ],
+        )
+        original_balance = crypto_ledger.balance
+        original_positions = dict(crypto_ledger.positions)
+        original_trades = list(crypto_ledger.trades)
+        try:
+            crypto_ledger.balance = type(original_balance)('100000')
+            crypto_ledger.positions = {}
+            crypto_ledger.trades = []
+
+            result = watchlist_monitoring_orchestrator.run_due_once(db, scope='crypto_only', limit_per_scope=10)
+
+            monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'BTC').one()
+
+            assert result['scope'] == 'crypto_only'
+            assert result['summary']['entryCandidateCount'] == 1
+            assert result['entryExecution']['candidateCount'] == 1
+            assert result['entryExecution']['submittedCount'] == 1
+            assert result['entryExecution']['filledCount'] == 1
+            assert result['entryExecution']['intentCount'] == 1
+            assert len(crypto_ledger.trades) == 1
+            assert crypto_ledger.trades[0]['pair'] == 'BTC/USD'
+            assert crypto_ledger.trades[0]['side'].upper() == 'BUY'
+            assert float(crypto_ledger.trades[0]['price']) > 0
+            assert monitor_row.decision_context_json['entryExecution']['action'] == 'ENTRY_FILLED'
+            assert monitor_row.decision_context_json['entryExecution']['tradeId'] == crypto_ledger.trades[0]['id']
+        finally:
+            crypto_ledger.balance = original_balance
+            crypto_ledger.positions = original_positions
+            crypto_ledger.trades = original_trades
