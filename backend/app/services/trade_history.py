@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Iterable
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
 from app.models.order_intent import OrderIntent
 from app.models.trade import Trade
+
+ET = ZoneInfo('America/New_York')
 
 
 @dataclass
@@ -50,7 +53,23 @@ class TradeHistoryService:
                     'PAPER': sum(1 for row in rows if row.get('mode') == 'PAPER'),
                     'LIVE': sum(1 for row in rows if row.get('mode') == 'LIVE'),
                 },
+                'dateRange': {
+                    'fromUtc': self._iso_or_none(active_filters.date_from),
+                    'toUtc': self._iso_or_none(active_filters.date_to),
+                    'fromEt': self._et_iso_or_none(active_filters.date_from),
+                    'toEt': self._et_iso_or_none(active_filters.date_to),
+                },
             },
+            'filters': {
+                'mode': active_filters.mode or 'ALL',
+                'assetClass': active_filters.asset_class or 'all',
+                'symbol': active_filters.symbol or '',
+                'dateFromUtc': self._iso_or_none(active_filters.date_from),
+                'dateToUtc': self._iso_or_none(active_filters.date_to),
+                'dateFromEt': self._et_iso_or_none(active_filters.date_from),
+                'dateToEt': self._et_iso_or_none(active_filters.date_to),
+            },
+            'generatedAtUtc': self._iso_or_none(datetime.now(UTC)),
         }
 
     def _build_stock_rows(self, db: Session, filters: TradeHistoryFilters) -> list[dict[str, Any]]:
@@ -64,6 +83,13 @@ class TradeHistoryService:
         for trade in trades:
             entry_reasoning = trade.entry_reasoning if isinstance(trade.entry_reasoning, dict) else {}
             mode = self._normalize_mode(entry_reasoning.get('mode') or trade.account_id)
+            buy_price = self._float_or_zero(trade.entry_price)
+            sell_price = self._float_or_zero(trade.exit_price)
+            quantity = float(trade.shares or 0.0)
+            buy_total = self._coalesce_float(trade.entry_cost, buy_price * quantity)
+            sell_total = self._coalesce_float(trade.exit_proceeds, sell_price * quantity)
+            sold_at = self._ensure_utc(trade.exit_time)
+            bought_at = self._ensure_utc(trade.entry_time)
             row = {
                 'id': f'stock-trade-{trade.id}',
                 'tradeId': trade.trade_id,
@@ -73,15 +99,18 @@ class TradeHistoryService:
                 'buyIntentId': entry_reasoning.get('intentId'),
                 'sellIntentId': None,
                 'source': entry_reasoning.get('executionSource') or 'STOCK_EXECUTION_LIFECYCLE',
-                'boughtAtUtc': self._iso_or_none(trade.entry_time),
-                'buyPrice': self._float_or_none(trade.entry_price),
-                'buyQuantity': float(trade.shares or 0.0),
-                'buyTotal': self._float_or_none(trade.entry_cost),
-                'soldAtUtc': self._iso_or_none(trade.exit_time),
-                'sellPrice': self._float_or_none(trade.exit_price),
-                'sellQuantity': float(trade.shares or 0.0),
-                'sellTotal': self._float_or_none(trade.exit_proceeds),
-                'unitDiff': round(float((trade.exit_price or 0.0) - (trade.entry_price or 0.0)), 8),
+                'boughtAtUtc': self._iso_or_none(bought_at),
+                'boughtAtEt': self._et_iso_or_none(bought_at),
+                'buyPrice': buy_price,
+                'buyQuantity': quantity,
+                'buyTotal': round(buy_total, 8),
+                'soldAtUtc': self._iso_or_none(sold_at),
+                'soldAtEt': self._et_iso_or_none(sold_at),
+                'sellPrice': sell_price,
+                'sellQuantity': quantity,
+                'sellTotal': round(sell_total, 8),
+                'priceDifference': round(sell_price - buy_price, 8),
+                'differenceAmount': round(sell_total - buy_total, 8),
                 'fees': 0.0,
                 'realizedPnl': round(float(trade.net_pnl if trade.net_pnl is not None else trade.gross_pnl or 0.0), 8),
                 'holdDurationMinutes': int(trade.duration_minutes or 0) if trade.duration_minutes is not None else None,
@@ -109,7 +138,7 @@ class TradeHistoryService:
             mode = self._normalize_mode(context.get('mode') or intent.account_id)
             fill_quantity = float(intent.filled_quantity or intent.requested_quantity or 0.0)
             fill_price = float(intent.avg_fill_price or intent.requested_price or 0.0)
-            fill_time = intent.last_fill_at or intent.first_fill_at or intent.submitted_at or intent.created_at
+            fill_time = self._ensure_utc(intent.last_fill_at or intent.first_fill_at or intent.submitted_at or intent.created_at)
             if fill_quantity <= 0 or fill_price <= 0 or fill_time is None:
                 continue
 
@@ -126,6 +155,7 @@ class TradeHistoryService:
                         'buyPrice': fill_price,
                         'buyTotal': round(fill_quantity * fill_price, 8),
                         'boughtAtUtc': self._iso_or_none(fill_time),
+                        'boughtAtEt': self._et_iso_or_none(fill_time),
                         'boughtAt': fill_time,
                     }
                 )
@@ -140,8 +170,8 @@ class TradeHistoryService:
                 lot = symbol_lots[0]
                 matched_quantity = min(float(lot['remainingQuantity']), remaining_sell)
                 buy_price = float(lot['buyPrice'])
-                sell_total = round(matched_quantity * fill_price, 8)
                 buy_total = round(matched_quantity * buy_price, 8)
+                sell_total = round(matched_quantity * fill_price, 8)
                 realized = round(sell_total - buy_total, 8)
                 duration_minutes = self._duration_minutes(lot.get('boughtAt'), fill_time)
                 row = {
@@ -154,14 +184,17 @@ class TradeHistoryService:
                     'sellIntentId': intent.intent_id,
                     'source': intent.execution_source,
                     'boughtAtUtc': lot['boughtAtUtc'],
+                    'boughtAtEt': lot['boughtAtEt'],
                     'buyPrice': buy_price,
                     'buyQuantity': round(matched_quantity, 12),
                     'buyTotal': buy_total,
                     'soldAtUtc': self._iso_or_none(fill_time),
+                    'soldAtEt': self._et_iso_or_none(fill_time),
                     'sellPrice': fill_price,
                     'sellQuantity': round(matched_quantity, 12),
                     'sellTotal': sell_total,
-                    'unitDiff': round(fill_price - buy_price, 8),
+                    'priceDifference': round(fill_price - buy_price, 8),
+                    'differenceAmount': realized,
                     'fees': 0.0,
                     'realizedPnl': realized,
                     'holdDurationMinutes': duration_minutes,
@@ -197,21 +230,38 @@ class TradeHistoryService:
         return 'PAPER'
 
     @staticmethod
-    def _iso_or_none(value: datetime | None) -> str | None:
+    def _ensure_utc(value: datetime | None) -> datetime | None:
         if value is None:
             return None
         if value.tzinfo is None:
-            value = value.replace(tzinfo=UTC)
-        return value.isoformat()
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    @classmethod
+    def _iso_or_none(cls, value: datetime | None) -> str | None:
+        normalized = cls._ensure_utc(value)
+        return normalized.isoformat() if normalized is not None else None
+
+    @classmethod
+    def _et_iso_or_none(cls, value: datetime | None) -> str | None:
+        normalized = cls._ensure_utc(value)
+        return normalized.astimezone(ET).isoformat() if normalized is not None else None
 
     @staticmethod
-    def _float_or_none(value: Any) -> float | None:
-        if value is None:
-            return None
+    def _float_or_zero(value: Any) -> float:
         try:
-            return float(value)
+            return float(value or 0.0)
         except (TypeError, ValueError):
-            return None
+            return 0.0
+
+    @staticmethod
+    def _coalesce_float(primary: Any, fallback: float) -> float:
+        try:
+            if primary is not None:
+                return float(primary)
+        except (TypeError, ValueError):
+            pass
+        return float(fallback)
 
     @staticmethod
     def _parse_iso(value: Any) -> datetime | None:

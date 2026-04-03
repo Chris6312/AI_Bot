@@ -98,17 +98,24 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
         assert payload['summary']['realizedPnl'] == 120.0
         assert payload['summary']['assetCounts']['stock'] == 1
         assert payload['summary']['assetCounts']['crypto'] == 1
+        assert payload['filters']['mode'] == 'ALL'
         symbols = sorted(row['symbol'] for row in payload['rows'])
         assert symbols == ['AAPL', 'SOL/USD']
         rows_by_symbol = {row['symbol']: row for row in payload['rows']}
         crypto_row = rows_by_symbol['SOL/USD']
         assert crypto_row['buyQuantity'] == 2.0
         assert crypto_row['realizedPnl'] == 20.0
+        assert crypto_row['differenceAmount'] == 20.0
         assert crypto_row['exitTrigger'] == 'profit_target'
+        assert crypto_row['boughtAtEt'].endswith('-04:00')
         stock_row = rows_by_symbol['AAPL']
         assert stock_row['buyTotal'] == 1000.0
         assert stock_row['sellTotal'] == 1100.0
+        assert stock_row['priceDifference'] == 10.0
+        assert stock_row['differenceAmount'] == 100.0
         assert stock_row['realizedPnl'] == 100.0
+        assert stock_row['soldAtEt'].endswith('-04:00')
+
 
 
 def test_trade_history_filters_by_asset_mode_symbol_and_date(tmp_path) -> None:
@@ -164,5 +171,7 @@ def test_trade_history_filters_by_asset_mode_symbol_and_date(tmp_path) -> None:
         assert response.status_code == 200
         payload = response.json()
         assert payload['summary']['totalCount'] == 1
+        assert payload['summary']['dateRange']['fromEt'].startswith('2026-04-02T00:00:00')
+        assert payload['summary']['dateRange']['toEt'].startswith('2026-04-02T23:59:59.999999')
         assert payload['rows'][0]['symbol'] == 'MSFT'
         assert payload['rows'][0]['mode'] == 'LIVE'

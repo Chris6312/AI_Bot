@@ -25,6 +25,7 @@ import type {
 
 type MonitoringCollection = Partial<Record<WatchlistScope, WatchlistMonitoringSnapshot>>
 type ExitReadinessCollection = Partial<Record<WatchlistScope, WatchlistExitReadinessSnapshot>>
+type OrchestrationCollection = Partial<Record<WatchlistScope, WatchlistOrchestrationStatus | null>>
 
 const scopeLabels: Record<WatchlistScope, string> = {
   stocks_only: 'Stocks',
@@ -41,9 +42,9 @@ export default function Monitoring() {
     refetchInterval: 10000,
   })
 
-  const { data: orchestration } = useQuery<WatchlistOrchestrationStatus>({
+  const { data: orchestration = {} } = useQuery<OrchestrationCollection>({
     queryKey: ['watchlists', 'orchestration'],
-    queryFn: () => api.getOrchestrationStatus(),
+    queryFn: () => api.getOrchestrationStatus() as Promise<OrchestrationCollection>,
     refetchInterval: 10000,
   })
 
@@ -59,6 +60,14 @@ export default function Monitoring() {
     refetchInterval: 10000,
   })
 
+  const orchestrationRows = Object.values(orchestration).filter(Boolean) as WatchlistOrchestrationStatus[]
+  const orchestrationEnabled = orchestrationRows.some((row) => Boolean(row.enabled))
+  const orchestrationPollSeconds = orchestrationRows[0]?.pollSeconds
+  const orchestrationLastStartedAtUtc = orchestrationRows.map((row) => row.lastStartedAtUtc).find(Boolean) ?? null
+  const orchestrationLastFinishedAtUtc = orchestrationRows.map((row) => row.lastFinishedAtUtc).find(Boolean) ?? null
+  const orchestrationLastError = orchestrationRows.map((row) => row.lastError).find(Boolean) ?? null
+  const orchestrationEligibleDue = (['stocks_only', 'crypto_only'] as WatchlistScope[]).reduce((sum, scope) => sum + (extractScopeSnapshot(orchestration[scope] ?? undefined, scope)?.eligibleDueCount ?? 0), 0)
+  const orchestrationBlockedDue = (['stocks_only', 'crypto_only'] as WatchlistScope[]).reduce((sum, scope) => sum + (extractScopeSnapshot(orchestration[scope] ?? undefined, scope)?.blockedDueCount ?? 0), 0)
   const totalHealthy = Object.values(monitoring).reduce((sum, scope) => sum + (scope?.summary.activeCount ?? 0), 0)
   const totalEntry = Object.values(monitoring).reduce((sum, scope) => sum + (scope?.summary.entryCandidateCount ?? 0), 0)
   const totalOpenPositions = Object.values(exitReadiness).reduce((sum, scope) => sum + (scope?.summary.openPositionCount ?? 0), 0)
@@ -77,7 +86,7 @@ export default function Monitoring() {
         description="Session-aware sweeps for stocks, 24/7 sweeps for crypto, and an exit worker that keeps expired or protective positions from drifting into the weeds."
         aside={
           <>
-            <StatusPill tone={Boolean(orchestration?.enabled) ? 'good' : 'warn'} label={orchestration?.enabled ? 'Monitor healthy' : 'Monitor warning'} />
+            <StatusPill tone={orchestrationEnabled ? 'good' : 'warn'} label={orchestrationEnabled ? 'Monitor healthy' : 'Monitor warning'} />
             <StatusPill tone={Boolean(exitWorker?.enabled) ? 'good' : 'warn'} label={exitWorker?.enabled ? 'Exit worker healthy' : 'Exit worker warning'} />
             <StatusPill tone={totalProtective > 0 ? 'warn' : 'muted'} label={totalProtective > 0 ? `${totalProtective} protective exits` : 'No protective exits'} />
             {symbolFilter ? <StatusPill tone="info" label={`Filtered: ${symbolFilter}`} /> : null}
@@ -96,14 +105,14 @@ export default function Monitoring() {
         <RuntimeCard
           title="Monitoring orchestrator"
           icon={<Activity className="h-4 w-4 text-cyan-300" />}
-          enabled={orchestration?.enabled}
-          pollSeconds={orchestration?.pollSeconds}
-          lastStartedAtUtc={orchestration?.lastStartedAtUtc ?? null}
-          lastFinishedAtUtc={orchestration?.lastFinishedAtUtc ?? null}
-          lastError={orchestration?.lastError ?? null}
+          enabled={orchestrationEnabled}
+          pollSeconds={orchestrationPollSeconds}
+          lastStartedAtUtc={orchestrationLastStartedAtUtc}
+          lastFinishedAtUtc={orchestrationLastFinishedAtUtc}
+          lastError={orchestrationLastError}
           extraRows={[
-            ['Eligible due', String(orchestration?.dueSnapshot && 'summary' in orchestration.dueSnapshot ? orchestration.dueSnapshot.summary.eligibleDueCount : 0)],
-            ['Blocked due', String(orchestration?.dueSnapshot && 'summary' in orchestration.dueSnapshot ? orchestration.dueSnapshot.summary.blockedDueCount : 0)],
+            ['Eligible due', String(orchestrationEligibleDue)],
+            ['Blocked due', String(orchestrationBlockedDue)],
           ]}
         />
 
@@ -143,7 +152,7 @@ export default function Monitoring() {
             scope={scope}
             monitoring={monitoring[scope]}
             exitReadiness={exitReadiness[scope]}
-            orchestration={extractScopeSnapshot(orchestration, scope)}
+            orchestration={extractScopeSnapshot(orchestration[scope] ?? undefined, scope)}
             selectedSymbol={scopeFilter === '' || scopeFilter === scope ? symbolFilter || null : null}
           />
         ))}
@@ -464,6 +473,12 @@ function buildExitFlags(row: WatchlistSymbolRecord) {
 
 function extractScopeSnapshot(orchestration: WatchlistOrchestrationStatus | undefined, scope: WatchlistScope) {
   const dueSnapshot = orchestration?.dueSnapshot
-  if (!dueSnapshot || !('scopes' in dueSnapshot)) return undefined
-  return dueSnapshot.scopes[scope]
+  if (!dueSnapshot) return undefined
+  if ('scopes' in dueSnapshot) {
+    return dueSnapshot.scopes[scope]
+  }
+  if ('scope' in dueSnapshot && dueSnapshot.scope === scope) {
+    return dueSnapshot
+  }
+  return undefined
 }

@@ -162,6 +162,68 @@ export interface OrderIntentRecord {
   context: Record<string, unknown>
   events: OrderEventRecord[]
 }
+
+export interface TradeHistoryRow {
+  id: string
+  tradeId?: string | null
+  assetClass: 'stock' | 'crypto' | string
+  mode: 'PAPER' | 'LIVE' | string
+  symbol: string
+  buyIntentId?: string | null
+  sellIntentId?: string | null
+  source: string
+  boughtAtUtc?: string | null
+  boughtAtEt?: string | null
+  buyPrice: number
+  buyQuantity: number
+  buyTotal: number
+  soldAtUtc?: string | null
+  soldAtEt?: string | null
+  sellPrice: number
+  sellQuantity: number
+  sellTotal: number
+  priceDifference: number
+  differenceAmount: number
+  fees: number
+  realizedPnl: number
+  holdDurationMinutes?: number | null
+  exitTrigger?: string | null
+}
+
+export interface TradeHistoryResponse {
+  rows: TradeHistoryRow[]
+  summary: {
+    totalCount: number
+    realizedPnl: number
+    winCount: number
+    lossCount: number
+    assetCounts: {
+      stock: number
+      crypto: number
+    }
+    modeCounts: {
+      PAPER: number
+      LIVE: number
+    }
+    dateRange: {
+      fromUtc?: string | null
+      toUtc?: string | null
+      fromEt?: string | null
+      toEt?: string | null
+    }
+  }
+  filters: {
+    mode: string
+    assetClass: string
+    symbol: string
+    dateFromUtc?: string | null
+    dateToUtc?: string | null
+    dateFromEt?: string | null
+    dateToEt?: string | null
+  }
+  generatedAtUtc?: string | null
+}
+
 export interface TradeHistoryEntry {
   id: string
   timestamp: string
@@ -592,44 +654,3 @@ export interface PositionInspectRecord {
 }
 
 
-export interface TradeHistoryRow {
-  id: string
-  tradeId?: string | null
-  assetClass: 'stock' | 'crypto' | string
-  mode: 'PAPER' | 'LIVE' | string
-  symbol: string
-  buyIntentId?: string | null
-  sellIntentId?: string | null
-  source?: string | null
-  boughtAtUtc?: string | null
-  buyPrice?: number | null
-  buyQuantity: number
-  buyTotal?: number | null
-  soldAtUtc?: string | null
-  sellPrice?: number | null
-  sellQuantity: number
-  sellTotal?: number | null
-  unitDiff?: number | null
-  fees?: number | null
-  realizedPnl?: number | null
-  holdDurationMinutes?: number | null
-  exitTrigger?: string | null
-}
-
-export interface TradeHistoryResponse {
-  rows: TradeHistoryRow[]
-  summary: {
-    totalCount: number
-    realizedPnl: number
-    winCount: number
-    lossCount: number
-    assetCounts: {
-      stock: number
-      crypto: number
-    }
-    modeCounts: {
-      PAPER: number
-      LIVE: number
-    }
-  }
-}
