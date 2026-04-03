@@ -249,11 +249,17 @@ class WatchlistExitWorkerService:
             self._runtime.poll_seconds,
             settings.WATCHLIST_EXIT_WORKER_BATCH_LIMIT,
         )
-        while True:
-            self._runtime.last_started_at_utc = datetime.now(UTC).isoformat()
+        def _run_once_blocking() -> dict[str, Any]:
             db = SessionLocal()
             try:
-                run_summary = self.run_once(db, limit=settings.WATCHLIST_EXIT_WORKER_BATCH_LIMIT)
+                return self.run_once(db, limit=settings.WATCHLIST_EXIT_WORKER_BATCH_LIMIT)
+            finally:
+                db.close()
+
+        while True:
+            self._runtime.last_started_at_utc = datetime.now(UTC).isoformat()
+            try:
+                run_summary = await asyncio.to_thread(_run_once_blocking)
                 if run_summary['summary']['submittedCount'] > 0 or run_summary['summary']['blockedCount'] > 0:
                     logger.info(
                         'Watchlist exit sweep complete: submitted=%s closed=%s blocked=%s expired=%s',
@@ -263,15 +269,12 @@ class WatchlistExitWorkerService:
                         run_summary['summary']['expiredPositionCount'],
                     )
             except asyncio.CancelledError:
-                db.close()
                 raise
             except Exception as exc:
                 logger.exception('Watchlist exit worker sweep failed: %s', exc)
                 self._runtime.last_error = str(exc)
                 self._runtime.consecutive_failures += 1
                 self._runtime.last_finished_at_utc = datetime.now(UTC).isoformat()
-            finally:
-                db.close()
             await asyncio.sleep(self._runtime.poll_seconds)
 
     def _submit_stock_exit(self, db: Session, candidate: dict[str, Any], *, mode: str) -> dict[str, Any]:
@@ -847,7 +850,7 @@ class WatchlistExitWorkerService:
         if not tradier_client.is_ready(mode):
             return 0
         try:
-            quantity = tradier_client.get_position_quantity_sync(
+            result = tradier_client.get_position_quantity_sync(
                 symbol,
                 mode=mode,
                 timeout=1.5,
@@ -855,13 +858,13 @@ class WatchlistExitWorkerService:
             )
         except TypeError:
             try:
-                quantity = tradier_client.get_position_quantity_sync(symbol, mode=mode)
+                result = tradier_client.get_position_quantity_sync(symbol, mode=mode)
             except Exception:
                 return 0
         except Exception:
             return 0
         try:
-            return int(quantity or 0)
+            return int(result or 0)
         except Exception:
             return 0
 
@@ -887,6 +890,16 @@ class WatchlistExitWorkerService:
                     statuses=sorted(ACTIVE_BROKER_EXIT_ORDER_STATUSES),
                     timeout=1.5,
                 )
+            except TypeError:
+                try:
+                    orders = tradier_client.get_orders_sync(
+                        mode=mode,
+                        symbol=symbol,
+                        side='SELL',
+                        statuses=sorted(ACTIVE_BROKER_EXIT_ORDER_STATUSES),
+                    )
+                except Exception:
+                    return []
             except Exception:
                 return []
         except Exception:
