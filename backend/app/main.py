@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, time, timedelta
-from typing import Literal
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -17,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.routers import crypto, watchlists
+from app.core.config import settings
 from app.core.database import SessionLocal, get_db
 from app.models.order_intent import OrderIntent
 from app.models.position import Position
@@ -43,15 +45,30 @@ logger = logging.getLogger(__name__)
 ET = ZoneInfo('America/New_York')
 
 
+def _is_test_runtime() -> bool:
+    raw_skip = str(os.getenv("APP_SKIP_BACKGROUND_TASKS", "")).strip().lower()
+    return (
+        os.getenv("PYTEST_CURRENT_TEST") is not None
+        or raw_skip in {"1", "true", "yes", "on"}
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Lifespan events for startup/shutdown
+    Lifespan events for startup/shutdown.
+
+    During pytest/TestClient runs, skip background startup services so tests do not
+    boot long-running workers or external integrations.
     """
-    discord_task = None
-    watchlist_monitor_task = None
-    watchlist_exit_task = None
-    from app.core.config import settings
+    discord_task: asyncio.Task | None = None
+    watchlist_monitor_task: asyncio.Task | None = None
+    watchlist_exit_task: asyncio.Task | None = None
+
+    if _is_test_runtime():
+        logger.info('Test runtime detected. Skipping background startup services.')
+        yield
+        return
 
     logger.info('🔄 Priming Kraken AssetPairs cache for startup...')
 
@@ -81,7 +98,9 @@ async def lifespan(app: FastAPI):
 
     if settings.WATCHLIST_MONITOR_ENABLED:
         logger.info('🛰️ Starting watchlist monitoring orchestrator...')
-        watchlist_monitor_task = asyncio.create_task(watchlist_monitoring_orchestrator.run_loop())
+        watchlist_monitor_task = asyncio.create_task(
+            watchlist_monitoring_orchestrator.run_loop()
+        )
     else:
         logger.info('Watchlist monitoring orchestrator startup skipped because it is disabled.')
 
@@ -102,7 +121,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.info('Discord bot startup skipped because DISCORD_BOT_TOKEN is not configured.')
 
-    yield  # Application is running
+    yield
 
     if watchlist_monitor_task is not None:
         logger.info('Shutting down watchlist monitoring orchestrator...')
@@ -111,6 +130,8 @@ async def lifespan(app: FastAPI):
             await watchlist_monitor_task
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            logger.warning('Watchlist monitoring orchestrator shutdown raised: %s', exc)
 
     if watchlist_exit_task is not None:
         logger.info('Shutting down watchlist exit worker orchestrator...')
@@ -119,6 +140,8 @@ async def lifespan(app: FastAPI):
             await watchlist_exit_task
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            logger.warning('Watchlist exit worker shutdown raised: %s', exc)
 
     if discord_task is not None:
         logger.info('Shutting down Discord bot...')
@@ -127,6 +150,8 @@ async def lifespan(app: FastAPI):
             await discord_task
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            logger.warning('Discord bot shutdown raised: %s', exc)
 
 
 app = FastAPI(
@@ -263,6 +288,73 @@ async def toggle_safety(request: ToggleRequest, _: bool = Depends(require_admin_
     }
 
 
+def _position_symbol_key(symbol: str | None) -> str:
+    return ''.join(ch for ch in str(symbol or '').upper() if ch.isalnum())
+
+
+def _serialize_unified_stock_position(*, broker_row: dict[str, Any] | None, db_row: Position | None) -> dict[str, Any]:
+    symbol = str((broker_row or {}).get('symbol') or (db_row.ticker if db_row else '') or '').upper()
+    broker_present = broker_row is not None
+    db_present = db_row is not None
+    source_status = 'aligned' if broker_present and db_present else 'broker_only' if broker_present else 'db_only'
+    quantity = float((broker_row or {}).get('shares') or (db_row.shares if db_row else 0) or 0)
+    avg_price = (broker_row or {}).get('avgPrice')
+    if avg_price is None and db_row is not None:
+        avg_price = float(db_row.avg_entry_price or 0.0) if db_row.avg_entry_price is not None else None
+    current_price = (broker_row or {}).get('currentPrice')
+    if current_price is None and db_row is not None:
+        current_price = float(db_row.current_price or 0.0) if db_row.current_price is not None else None
+    market_value = (broker_row or {}).get('marketValue')
+    if market_value is None:
+        base_price = current_price if current_price is not None else avg_price
+        market_value = float(quantity) * float(base_price or 0.0)
+    pnl = (broker_row or {}).get('pnl')
+    if pnl is None and db_row is not None:
+        pnl = float(db_row.unrealized_pnl or 0.0) if db_row.unrealized_pnl is not None else None
+    pnl_pct = (broker_row or {}).get('pnlPercent')
+    if pnl_pct is None and db_row is not None:
+        pnl_pct = float(db_row.unrealized_pnl_pct or 0.0) if db_row.unrealized_pnl_pct is not None else None
+
+    return {
+        'assetClass': 'stock',
+        'symbol': symbol,
+        'displaySymbol': symbol,
+        'quantity': float(quantity),
+        'quantityUnit': 'shares',
+        'avgPrice': float(avg_price or 0.0),
+        'currentPrice': float(current_price or 0.0),
+        'marketValue': float(market_value or 0.0),
+        'pnl': float(pnl or 0.0),
+        'pnlPercent': float(pnl_pct or 0.0),
+        'inspectSymbol': symbol,
+        'inspectAssetClass': 'stock',
+        'sourceStatus': source_status,
+        'sourceDetail': 'Broker + DB mirror' if source_status == 'aligned' else 'Broker only' if source_status == 'broker_only' else 'DB mirror only',
+        'entryTime': db_row.entry_time.isoformat() if db_row and db_row.entry_time else None,
+    }
+
+
+def _serialize_unified_crypto_position(row: dict[str, Any]) -> dict[str, Any]:
+    pair = str(row.get('pair') or '').upper()
+    return {
+        'assetClass': 'crypto',
+        'symbol': pair,
+        'displaySymbol': pair,
+        'quantity': float(row.get('amount') or 0.0),
+        'quantityUnit': 'units',
+        'avgPrice': float(row.get('avgPrice') or 0.0),
+        'currentPrice': float(row.get('currentPrice') or 0.0),
+        'marketValue': float(row.get('marketValue') or 0.0),
+        'pnl': float(row.get('pnl') or 0.0),
+        'pnlPercent': float(row.get('pnlPercent') or 0.0),
+        'inspectSymbol': pair,
+        'inspectAssetClass': 'crypto',
+        'sourceStatus': 'ledger',
+        'sourceDetail': 'Crypto paper ledger',
+        'entryTime': row.get('entryTimeUtc'),
+    }
+
+
 @app.get('/api/stocks/account')
 async def get_stock_account():
     mode = runtime_state.get().stock_mode
@@ -316,6 +408,59 @@ async def get_stock_db_positions(db: Session = Depends(get_db)):
         }
         for row in rows
     ]
+
+
+@app.get('/api/positions/unified')
+async def get_unified_positions(db: Session = Depends(get_db)):
+    mode = runtime_state.get().stock_mode
+    try:
+        broker_positions = tradier_client.get_positions_snapshot(mode)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Failed to fetch Tradier positions: {exc}') from exc
+
+    db_rows = (
+        db.query(Position)
+        .filter(Position.is_open.is_(True))
+        .order_by(
+            Position.entry_time.desc(),
+            Position.created_at.desc(),
+            Position.id.desc(),
+        )
+        .all()
+    )
+    db_positions_by_symbol: dict[str, Position] = {}
+    for row in db_rows:
+        key = _position_symbol_key(row.ticker)
+        if key and key not in db_positions_by_symbol:
+            db_positions_by_symbol[key] = row
+
+    broker_positions_by_symbol: dict[str, dict[str, Any]] = {}
+    for row in broker_positions:
+        key = _position_symbol_key(str(row.get('symbol') or ''))
+        if key and key not in broker_positions_by_symbol:
+            broker_positions_by_symbol[key] = row
+
+    stock_keys = set(db_positions_by_symbol.keys()) | set(broker_positions_by_symbol.keys())
+    stock_rows = [
+        _serialize_unified_stock_position(
+            broker_row=broker_positions_by_symbol.get(key),
+            db_row=db_positions_by_symbol.get(key),
+        )
+        for key in stock_keys
+    ]
+    crypto_rows = [_serialize_unified_crypto_position(row) for row in crypto_ledger.get_positions()]
+    rows = sorted(stock_rows + crypto_rows, key=lambda row: (-float(row.get('marketValue') or 0.0), str(row.get('displaySymbol') or '')))
+    stock_drift_count = sum(1 for row in stock_rows if row['sourceStatus'] != 'aligned')
+    return {
+        'rows': rows,
+        'summary': {
+            'totalCount': len(rows),
+            'stockCount': len(stock_rows),
+            'cryptoCount': len(crypto_rows),
+            'stockDriftCount': stock_drift_count,
+            'alignedStockCount': sum(1 for row in stock_rows if row['sourceStatus'] == 'aligned'),
+        },
+    }
 
 
 @app.get('/api/positions/inspect')
@@ -406,3 +551,4 @@ if __name__ == '__main__':
     import uvicorn
 
     uvicorn.run(app, host='0.0.0.0', port=8000)
+

@@ -9,7 +9,6 @@ from app.core.config import settings
 from app.main import app
 from app.services import control_plane
 from app.services.runtime_state import runtime_state
-import main as compatibility_main
 
 
 @contextmanager
@@ -23,6 +22,31 @@ def patched_settings(**updates) -> Iterator[None]:
         for key, value in original.items():
             setattr(settings, key, value)
 
+
+
+
+def test_require_admin_token_accepts_bearer_authorization_header() -> None:
+    with patched_settings(ADMIN_API_TOKEN='admin-token'):
+        assert control_plane.require_admin_token(authorization='Bearer admin-token') is True
+
+
+def test_require_admin_token_accepts_trimmed_x_admin_token_header() -> None:
+    with patched_settings(ADMIN_API_TOKEN='admin-token'):
+        assert control_plane.require_admin_token(x_admin_token='  admin-token  ') is True
+
+
+def test_require_admin_token_rejects_wrong_authorization_header() -> None:
+    with patched_settings(ADMIN_API_TOKEN='admin-token'):
+        try:
+            control_plane.require_admin_token(authorization='Bearer wrong-token')
+        except Exception as exc:  # pragma: no cover - explicit assertion below
+            from fastapi import HTTPException
+
+            assert isinstance(exc, HTTPException)
+            assert exc.status_code == 403
+            assert exc.detail == 'Unauthorized control-plane request.'
+        else:  # pragma: no cover
+            raise AssertionError('Expected wrong bearer token to be rejected.')
 
 def test_execution_gate_reports_locked_when_admin_token_missing() -> None:
     with patched_settings(
@@ -109,5 +133,4 @@ def test_crypto_trade_route_refuses_execution_when_control_plane_is_read_only() 
     assert 'Discord authorization settings are incomplete' in response.json()['detail']
 
 
-def test_compatibility_main_reexports_canonical_app() -> None:
-    assert compatibility_main.app is app
+

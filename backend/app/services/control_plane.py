@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import Header, HTTPException, status
 
@@ -198,15 +198,52 @@ def ensure_execution_armed() -> None:
     raise HTTPException(status_code=gate.status_code, detail=f'Execution blocked: {gate.reason}')
 
 
-def require_admin_token(x_admin_token: str | None = Header(default=None, alias='X-Admin-Token')) -> bool:
+def _normalize_admin_token(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode('utf-8', errors='ignore')
+    elif not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _extract_admin_token(*, x_admin_token: str | None, authorization: str | None) -> str | None:
+    direct_token = _normalize_admin_token(x_admin_token)
+    if direct_token is not None:
+        return direct_token
+
+    normalized_authorization = _normalize_admin_token(authorization)
+    if normalized_authorization is None:
+        return None
+
+    scheme, _, credentials = normalized_authorization.partition(' ')
+    if scheme.lower() == 'bearer':
+        return _normalize_admin_token(credentials)
+    return normalized_authorization
+
+
+def require_admin_token(
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+) -> bool:
     configured_token = settings.ADMIN_API_TOKEN.strip()
     if not configured_token:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail='Control plane is locked. Configure ADMIN_API_TOKEN before using state-changing routes.',
         )
-    if x_admin_token != configured_token:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Unauthorized control-plane request.')
+
+    provided_token = _extract_admin_token(
+        x_admin_token=x_admin_token,
+        authorization=authorization,
+    )
+    if provided_token != configured_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Unauthorized control-plane request.',
+        )
     return True
 
 

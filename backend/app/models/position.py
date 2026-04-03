@@ -20,10 +20,10 @@ class Position(Base):
     entry_time = Column(DateTime(timezone=True), nullable=False)
     entry_reasoning = Column(JSON)
     
-    stop_loss = Column(Float, nullable=False)
-    profit_target = Column(Float, nullable=False)
-    peak_price = Column(Float, nullable=False)
-    trailing_stop = Column(Float)
+    stop_loss = Column(Float, nullable=True)
+    profit_target = Column(Float, nullable=True)
+    peak_price = Column(Float, nullable=True)
+    trailing_stop = Column(Float, nullable=True)
     
     is_open = Column(Boolean, default=True, index=True)
     execution_id = Column(String(50))

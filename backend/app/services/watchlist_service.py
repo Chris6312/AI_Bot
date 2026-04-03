@@ -983,6 +983,7 @@ class WatchlistService:
         inserted = 0
         updated = 0
         closed = 0
+        repaired = 0
 
         for symbol, rows in rows_by_symbol.items():
             if symbol in broker_positions:
@@ -999,13 +1000,25 @@ class WatchlistService:
             rows = rows_by_symbol.get(symbol, [])
             synthetic_row = next((row for row in rows if self._is_broker_sync_position(row)), None)
             if synthetic_row is not None:
-                if self._apply_broker_snapshot_to_position_row(synthetic_row, broker_position, observed_at=observed_at):
+                if self._apply_broker_snapshot_to_position_row(
+                    synthetic_row,
+                    broker_position,
+                    observed_at=observed_at,
+                    reconciliation_source='broker_position_mirror',
+                ):
                     updated += 1
+                    repaired += 1
                 continue
 
             if rows:
-                if len(rows) == 1 and self._apply_broker_snapshot_to_position_row(rows[0], broker_position, observed_at=observed_at):
+                if len(rows) == 1 and self._apply_broker_snapshot_to_position_row(
+                    rows[0],
+                    broker_position,
+                    observed_at=observed_at,
+                    reconciliation_source='broker_position_mirror',
+                ):
                     updated += 1
+                    repaired += 1
                 continue
 
             watchlist_row = (
@@ -1023,6 +1036,21 @@ class WatchlistService:
             )
             entry_price = seed['avgEntryPrice']
             current_price = seed['currentPrice']
+            entry_reasoning = dict(seed['entryReasoning'] or {})
+            entry_reasoning['syncSource'] = 'broker_position_mirror'
+            entry_reasoning['syncedAtUtc'] = observed_at.isoformat()
+            entry_reasoning['reconciliation'] = {
+                'event': 'POSITION_RESTORED_FROM_BROKER',
+                'observedAtUtc': observed_at.isoformat(),
+                'symbol': symbol,
+                'brokerSnapshot': {
+                    'shares': seed['shares'],
+                    'avgPrice': seed['avgEntryPrice'],
+                    'currentPrice': current_price,
+                    'unrealizedPnl': seed['unrealizedPnl'],
+                    'unrealizedPnlPct': seed['unrealizedPnlPct'],
+                },
+            }
             new_row = Position(
                 account_id=seed['accountId'],
                 ticker=symbol,
@@ -1033,7 +1061,7 @@ class WatchlistService:
                 unrealized_pnl_pct=seed['unrealizedPnlPct'],
                 strategy=seed['strategy'],
                 entry_time=seed['entryTime'],
-                entry_reasoning=seed['entryReasoning'],
+                entry_reasoning=entry_reasoning,
                 stop_loss=seed['stopLoss'],
                 profit_target=seed['profitTarget'],
                 peak_price=max(float(current_price or 0.0), float(entry_price or 0.0)),
@@ -1043,12 +1071,18 @@ class WatchlistService:
             )
             db.add(new_row)
             inserted += 1
+            repaired += 1
 
         if inserted or updated or closed:
             db.commit()
         else:
             db.rollback()
-        return {'inserted': inserted, 'updated': updated, 'closed': closed}
+        return {
+            'inserted': inserted,
+            'updated': updated,
+            'closed': closed,
+            'repaired': repaired,
+        }
 
     def _apply_broker_snapshot_to_position_row(
         self,
@@ -1056,6 +1090,7 @@ class WatchlistService:
         broker_position: dict[str, Any],
         *,
         observed_at: datetime,
+        reconciliation_source: str | None = None,
     ) -> bool:
         changed = False
         broker_shares = int(round(float(broker_position.get('shares') or 0.0))) if broker_position.get('shares') is not None else 0
@@ -1080,6 +1115,26 @@ class WatchlistService:
         if reference_price > float(row.peak_price or 0.0):
             row.peak_price = reference_price
             changed = True
+
+        if reconciliation_source:
+            entry_reasoning = dict(row.entry_reasoning or {})
+            entry_reasoning['syncSource'] = reconciliation_source
+            entry_reasoning['syncedAtUtc'] = observed_at.isoformat()
+            entry_reasoning['reconciliation'] = {
+                'event': 'POSITION_RESTORED_FROM_BROKER',
+                'observedAtUtc': observed_at.isoformat(),
+                'brokerSnapshot': {
+                    'shares': broker_shares,
+                    'avgPrice': broker_avg,
+                    'currentPrice': broker_current,
+                    'unrealizedPnl': broker_pnl,
+                    'unrealizedPnlPct': broker_pnl_pct,
+                },
+            }
+            if row.entry_reasoning != entry_reasoning:
+                row.entry_reasoning = entry_reasoning
+                changed = True
+
         if changed:
             row.updated_at = observed_at
         return changed
@@ -1696,6 +1751,58 @@ class WatchlistService:
             if entry_time is not None:
                 hours_since_entry = round((observed_at - entry_time).total_seconds() / 3600.0, 2)
 
+            # Derive stop-loss, profit-target, and trailing-stop from avg entry
+            # price using the same config percentages applied to stocks.  Crypto
+            # entries do not write a DB Position row, so there is no persisted
+            # stop_loss field to read — we recompute from the fill price instead.
+            stop_loss: float | None = None
+            profit_target: float | None = None
+            trailing_stop: float | None = None
+            peak_price: float | None = None
+            if avg_entry_price is not None and avg_entry_price > 0:
+                stop_loss = round(avg_entry_price * (1.0 - float(settings.STOP_LOSS_PCT)), 8)
+                profit_target = round(avg_entry_price * (1.0 + float(settings.PROFIT_TARGET_PCT)), 8)
+                # Trailing stop ratchets to the highest observed price; use
+                # current_price as a best-effort peak since the ledger does not
+                # persist peak separately.
+                peak_price = max(avg_entry_price, float(current_price or 0.0))
+                trailing_stop = round(peak_price * (1.0 - float(settings.TRAILING_STOP_PCT)), 8)
+
+            stop_loss_breached = bool(
+                current_price is not None
+                and stop_loss is not None
+                and stop_loss > 0
+                and current_price <= stop_loss
+            )
+            trailing_stop_breached = bool(
+                current_price is not None
+                and trailing_stop is not None
+                and trailing_stop > 0
+                and current_price <= trailing_stop
+            )
+            protective_exit_reasons: list[str] = []
+            if stop_loss_breached:
+                protective_exit_reasons.append('STOP_LOSS_BREACH')
+            if trailing_stop_breached:
+                protective_exit_reasons.append('TRAILING_STOP_BREACH')
+
+            profit_target_reached = bool(
+                current_price is not None
+                and profit_target is not None
+                and profit_target > 0
+                and current_price >= profit_target
+            )
+            scale_out_ready = bool(
+                profit_target_reached
+                and exit_template in PROFIT_TARGET_SCALE_OUT_TEMPLATES
+            )
+            impulse_trail_armed = bool(
+                exit_template in IMPULSE_TRAIL_TEMPLATES
+                and profit_target_reached
+            )
+            impulse_reference_price = max(float(peak_price or 0.0), float(current_price or 0.0))
+            impulse_trailing_stop = self._calculate_impulse_trailing_stop(impulse_reference_price) if impulse_trail_armed else None
+
             follow_through_window_hours = self._resolve_follow_through_window_hours(max_hold_hours)
             follow_through_failed = bool(
                 exit_template in FOLLOW_THROUGH_EXIT_TEMPLATES
@@ -1706,6 +1813,8 @@ class WatchlistService:
                 and hours_since_entry is not None
                 and follow_through_window_hours is not None
                 and 1.0 <= hours_since_entry <= follow_through_window_hours
+                and not stop_loss_breached
+                and not trailing_stop_breached
             )
 
             (
@@ -1724,8 +1833,8 @@ class WatchlistService:
                 max_hold_hours=max_hold_hours,
                 avg_entry_price=avg_entry_price,
                 current_price=current_price,
-                stop_loss_breached=False,
-                trailing_stop_breached=False,
+                stop_loss_breached=stop_loss_breached,
+                trailing_stop_breached=trailing_stop_breached,
             )
 
             payload = {
@@ -1753,16 +1862,19 @@ class WatchlistService:
                 'timeStopExtensionHours': time_stop_extension_hours,
                 'timeStopExtendedUntilUtc': time_stop_extended_until.isoformat() if time_stop_extended_until else None,
                 'exitDeadlineSource': exit_deadline_source or ('unavailable_crypto_ledger' if entry_time is None else 'watchlist_max_hold'),
-                'protectiveExitPending': False,
-                'protectiveExitReasons': [],
-                'stopLossBreached': False,
-                'trailingStopBreached': False,
-                'profitTargetReached': False,
-                'scaleOutReady': False,
+                'stopLoss': stop_loss,
+                'profitTarget': profit_target,
+                'trailingStop': trailing_stop,
+                'peakPrice': peak_price,
+                'protectiveExitPending': bool(protective_exit_reasons),
+                'protectiveExitReasons': protective_exit_reasons,
+                'stopLossBreached': stop_loss_breached,
+                'trailingStopBreached': trailing_stop_breached,
+                'profitTargetReached': profit_target_reached,
+                'scaleOutReady': scale_out_ready,
                 'scaleOutAlreadyTaken': False,
-                'impulseTrailArmed': False,
-                'impulseTrailingStop': None,
-                'peakPrice': None,
+                'impulseTrailArmed': impulse_trail_armed,
+                'impulseTrailingStop': impulse_trailing_stop,
                 'observedAtUtc': observed_at.isoformat(),
             }
             for candidate in candidates:

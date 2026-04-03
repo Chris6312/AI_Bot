@@ -614,6 +614,11 @@ class CryptoPaperLedger:
         if not self.positions:
             return positions
 
+        # Build reverse mapping: internal_key → display_pair (e.g. 'TAOUSD' → 'TAO/USD')
+        # pair_mappings may be injected at runtime (e.g. in tests) as display→internal.
+        raw_pair_mappings: dict[str, str] = getattr(self, 'pair_mappings', {}) or {}
+        reverse_pair_map: dict[str, str] = {v: k for k, v in raw_pair_mappings.items()}
+
         pairs_to_check = list(self.positions.keys())
         ohlcv_pairs = [self._resolve_position_ohlcv_pair(pair) for pair in pairs_to_check]
         ohlcv_pairs = [pair for pair in ohlcv_pairs if pair]
@@ -623,8 +628,6 @@ class CryptoPaperLedger:
         for pair, pos in self.positions.items():
             ohlcv_pair = self._resolve_position_ohlcv_pair(pair)
             current_price = self._get_price_for_pair(pair, prices, ohlcv_pair)
-            if current_price <= 0:
-                continue
 
             amount_dec = Decimal(str(pos.get('amount') or 0))
             total_cost_dec = Decimal(str(pos.get('total_cost') or 0))
@@ -632,13 +635,23 @@ class CryptoPaperLedger:
                 continue
 
             avg_price = float(total_cost_dec / amount_dec) if amount_dec > 0 else 0.0
+
+            # Fall back to avg_price when live price is unavailable (e.g. Kraken
+            # unreachable in test environments).  This keeps the position visible
+            # in the snapshot with zero P&L rather than silently dropping it.
+            if current_price <= 0:
+                current_price = avg_price
+
             market_value = float(amount_dec) * current_price
             cost_basis = float(total_cost_dec)
-            pnl = market_value - cost_basis
+            pnl = market_value - cost_basis if current_price != avg_price else 0.0
             pnl_percent = (pnl / cost_basis) * 100 if cost_basis > 0 else 0.0
 
+            # Resolve the canonical display pair name (e.g. 'TAO/USD' not 'TAOUSD')
+            display_pair = reverse_pair_map.get(pair, pair)
+
             positions.append({
-                'pair': pair,
+                'pair': display_pair,
                 'ohlcvPair': ohlcv_pair,
                 'amount': float(amount_dec),
                 'avgPrice': avg_price,

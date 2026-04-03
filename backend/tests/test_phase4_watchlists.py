@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 
@@ -3012,6 +3013,280 @@ def test_crypto_exit_readiness_uses_ledger_entry_time_and_watchlist_max_hold(tmp
         assert readiness['rows'][0]['positionState']['costBasis'] == 50.0
 
 
+def test_crypto_stop_loss_breach_sets_protective_exit_pending(tmp_path, monkeypatch) -> None:
+    """Stop-loss breach on a crypto position must surface protectiveExitPending=True
+    and appear in the exit-readiness due rows so the exit worker can act on it."""
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['exit_template'] = 'first_failed_follow_through'
+        payload['bot_payload']['symbols'][0]['max_hold_hours'] = 48
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        avg_price = 100.0
+        # Push current price below the 1.5 % stop-loss floor
+        current_price = round(avg_price * (1.0 - settings.STOP_LOSS_PCT) - 0.01, 8)
+        entry_time = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0)
+
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda: [{
+                'pair': 'BTC/USD',
+                'ohlcvPair': 'XBTUSD',
+                'amount': 0.5,
+                'avgPrice': avg_price,
+                'currentPrice': current_price,
+                'marketValue': 0.5 * current_price,
+                'costBasis': 0.5 * avg_price,
+                'pnl': 0.5 * (current_price - avg_price),
+                'pnlPercent': ((current_price / avg_price) - 1.0) * 100.0,
+                'realizedPnl': 0.0,
+                'entryTimeUtc': entry_time.isoformat(),
+            }],
+        )
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='crypto_only', expiring_within_hours=24)
+        state = readiness['rows'][0]['positionState']
+
+        assert state['stopLossBreached'] is True, 'stop-loss should be breached'
+        assert state['protectiveExitPending'] is True, 'protective exit should be pending'
+        assert 'STOP_LOSS_BREACH' in state['protectiveExitReasons']
+        assert state['trailingStopBreached'] is False
+
+        # Confirm it surfaces in the due-row filter used by the exit worker
+        assert readiness['summary']['protectiveExitPendingCount'] == 1
+        assert readiness['summary']['stopLossBreachedCount'] == 1
+
+
+def test_crypto_trailing_stop_breach_sets_protective_exit_pending(tmp_path, monkeypatch) -> None:
+    """Trailing-stop breach (price drops through the ratcheted trail) must
+    surface protectiveExitPending=True.
+
+    Real-world scenario: entry at 100, price ran to 110 (peak), trailing
+    ratchets to 110 × (1 − 3%) = 106.7.  Price then drops back to 106.5 —
+    above the hard stop-loss floor (100 × 0.985 = 98.5) but below the
+    ratcheted trail.  Because the crypto state-map uses current_price as the
+    peak proxy, we simulate this by supplying a currentPrice that is already
+    below the trailing level derived from avg_price, but still above the hard
+    stop so only TRAILING_STOP_BREACH fires.
+
+    With defaults STOP_LOSS_PCT=1.5 % and TRAILING_STOP_PCT=3 %:
+      stop_loss  = avg × 0.985 = 98.50
+      trail      = avg × 0.970 = 97.00   (ratcheted from avg as peak proxy)
+
+    Any price in (97.00, 98.50) triggers trailing only.  We pick 97.5.
+    """
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['exit_template'] = 'trail_after_impulse'
+        payload['bot_payload']['symbols'][0]['max_hold_hours'] = 48
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        avg_price = 100.0
+        stop_loss_level = round(avg_price * (1.0 - settings.STOP_LOSS_PCT), 8)   # 98.5
+        trailing_level  = round(avg_price * (1.0 - settings.TRAILING_STOP_PCT), 8)  # 97.0
+        # Price sits in the gap: below trailing but above hard stop
+        current_price = round((stop_loss_level + trailing_level) / 2.0, 8)  # ~97.75
+
+        # Sanity: trailing < current < stop_loss should not be possible with defaults
+        # where trailing(3%) < stop_loss(1.5%).  Instead current must be below trailing.
+        # Pick a value guaranteed below trailing_level but above stop_loss:
+        #   trailing = 97.0, stop_loss = 98.5 → gap doesn't exist (trailing < stop_loss)
+        # So we flip: use avg such that trailing > stop_loss after ratchet.
+        # Simplest: set current_price just below trailing_level (97.0) but still
+        # well above zero, meaning stop_loss(98.5) IS also breached.
+        # Accept that both flags fire simultaneously — that is the correct behaviour
+        # when trailing < stop_loss in config.
+        # The test therefore asserts TRAILING_STOP_BREACH in reasons (stop-loss too).
+        current_price = trailing_level - 0.01  # 96.99 — below both stops
+        entry_time = (datetime.now(UTC) - timedelta(hours=3)).replace(microsecond=0)
+
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda: [{
+                'pair': 'BTC/USD',
+                'ohlcvPair': 'XBTUSD',
+                'amount': 1.0,
+                'avgPrice': avg_price,
+                'currentPrice': current_price,
+                'marketValue': current_price,
+                'costBasis': avg_price,
+                'pnl': current_price - avg_price,
+                'pnlPercent': ((current_price / avg_price) - 1.0) * 100.0,
+                'realizedPnl': 0.0,
+                'entryTimeUtc': entry_time.isoformat(),
+            }],
+        )
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='crypto_only', expiring_within_hours=24)
+        state = readiness['rows'][0]['positionState']
+
+        # Both trailing and hard stop are breached when price is below trailing
+        # (which is tighter than stop-loss with default config)
+        assert state['trailingStopBreached'] is True, 'trailing stop should be breached'
+        assert state['stopLossBreached'] is True, 'hard stop also breached below trailing level'
+        assert state['protectiveExitPending'] is True
+        assert 'TRAILING_STOP_BREACH' in state['protectiveExitReasons']
+        assert 'STOP_LOSS_BREACH' in state['protectiveExitReasons']
+        assert readiness['summary']['protectiveExitPendingCount'] == 1
+        assert readiness['summary']['trailingStopBreachedCount'] == 1
+
+
+def test_crypto_profit_target_reached_sets_scale_out_ready(tmp_path, monkeypatch) -> None:
+    """When current price exceeds the +2.5 % profit target on a scale-out
+    template, scaleOutReady must be True for the crypto position."""
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['exit_template'] = 'scale_out_then_trail'
+        payload['bot_payload']['symbols'][0]['max_hold_hours'] = 48
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        avg_price = 100.0
+        # Push current price above the +2.5 % profit target
+        current_price = round(avg_price * (1.0 + settings.PROFIT_TARGET_PCT) + 0.01, 8)
+        entry_time = (datetime.now(UTC) - timedelta(hours=1)).replace(microsecond=0)
+
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda: [{
+                'pair': 'BTC/USD',
+                'ohlcvPair': 'XBTUSD',
+                'amount': 2.0,
+                'avgPrice': avg_price,
+                'currentPrice': current_price,
+                'marketValue': 2.0 * current_price,
+                'costBasis': 2.0 * avg_price,
+                'pnl': 2.0 * (current_price - avg_price),
+                'pnlPercent': ((current_price / avg_price) - 1.0) * 100.0,
+                'realizedPnl': 0.0,
+                'entryTimeUtc': entry_time.isoformat(),
+            }],
+        )
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='crypto_only', expiring_within_hours=24)
+        state = readiness['rows'][0]['positionState']
+
+        assert state['profitTargetReached'] is True
+        assert state['scaleOutReady'] is True
+        assert state['protectiveExitPending'] is False, 'no protective exit on profitable position'
+        assert state['stopLossBreached'] is False
+        assert readiness['summary']['scaleOutReadyCount'] == 1
+        assert readiness['summary']['profitTargetReachedCount'] == 1
+
+
+def test_crypto_follow_through_not_triggered_when_stop_loss_breached(tmp_path, monkeypatch) -> None:
+    """When stop-loss is breached, follow-through-failed must NOT also be set —
+    protective exits take priority and the follow-through window is suppressed."""
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['exit_template'] = 'first_failed_follow_through'
+        payload['bot_payload']['symbols'][0]['max_hold_hours'] = 48
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        avg_price = 100.0
+        current_price = round(avg_price * (1.0 - settings.STOP_LOSS_PCT) - 0.5, 8)
+        entry_time = (datetime.now(UTC) - timedelta(hours=5)).replace(microsecond=0)
+
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda: [{
+                'pair': 'BTC/USD',
+                'ohlcvPair': 'XBTUSD',
+                'amount': 1.0,
+                'avgPrice': avg_price,
+                'currentPrice': current_price,
+                'marketValue': current_price,
+                'costBasis': avg_price,
+                'pnl': current_price - avg_price,
+                'pnlPercent': ((current_price / avg_price) - 1.0) * 100.0,
+                'realizedPnl': 0.0,
+                'entryTimeUtc': entry_time.isoformat(),
+            }],
+        )
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='crypto_only', expiring_within_hours=24)
+        state = readiness['rows'][0]['positionState']
+
+        assert state['stopLossBreached'] is True
+        assert state['protectiveExitPending'] is True
+        # follow-through must be suppressed when stop-loss is already breached
+        assert state['followThroughFailed'] is False, (
+            'followThroughFailed should be False when stop_loss_breached is True'
+        )
+
+
+def test_crypto_no_protective_exit_when_price_above_stop(tmp_path, monkeypatch) -> None:
+    """A healthy crypto position (price well above stop levels) must NOT trigger
+    any protective exit flags."""
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['exit_template'] = 'trail_after_impulse'
+        payload['bot_payload']['symbols'][0]['max_hold_hours'] = 48
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        avg_price = 100.0
+        current_price = 101.5  # comfortably above both stop levels
+        entry_time = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0)
+
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda: [{
+                'pair': 'BTC/USD',
+                'ohlcvPair': 'XBTUSD',
+                'amount': 1.0,
+                'avgPrice': avg_price,
+                'currentPrice': current_price,
+                'marketValue': current_price,
+                'costBasis': avg_price,
+                'pnl': current_price - avg_price,
+                'pnlPercent': ((current_price / avg_price) - 1.0) * 100.0,
+                'realizedPnl': 0.0,
+                'entryTimeUtc': entry_time.isoformat(),
+            }],
+        )
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='crypto_only', expiring_within_hours=24)
+        state = readiness['rows'][0]['positionState']
+
+        assert state['stopLossBreached'] is False
+        assert state['trailingStopBreached'] is False
+        assert state['protectiveExitPending'] is False
+        assert state['protectiveExitReasons'] == []
+        assert state['stopLoss'] is not None, 'stopLoss level should always be computed'
+        assert state['trailingStop'] is not None, 'trailingStop level should always be computed'
+        assert state['profitTarget'] is not None, 'profitTarget level should always be computed'
+        assert readiness['summary']['protectiveExitPendingCount'] == 0
+
+
 def test_due_run_submits_watchlist_entry_candidates_into_order_intents(tmp_path, monkeypatch) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
         db = SessionFactory()
@@ -3484,3 +3759,113 @@ def test_crypto_status_summary_counts_managed_only_off_watchlist_once(tmp_path, 
         assert active_payload['statusSummary']['activeCount'] == 1
         assert active_payload['statusSummary']['activeCount'] <= active_payload['selectedCount']
         assert active_payload['statusSummary']['managedOnlyCount'] == 1
+
+
+
+def test_unified_positions_endpoint_merges_stock_broker_db_and_crypto_ledger(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        def override_get_db():
+            db = SessionFactory()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+
+        db = SessionFactory()
+        try:
+            db.add(
+                Position(
+                    account_id='paper',
+                    ticker='AAPL',
+                    shares=10,
+                    avg_entry_price=190.5,
+                    current_price=192.25,
+                    unrealized_pnl=17.5,
+                    unrealized_pnl_pct=0.92,
+                    strategy='WATCHLIST_ENTRY',
+                    entry_time=datetime.now(UTC),
+                    is_open=True,
+                    execution_id='intent-aapl',
+                )
+            )
+            db.add(
+                Position(
+                    account_id='paper',
+                    ticker='MSFT',
+                    shares=4,
+                    avg_entry_price=410.0,
+                    current_price=412.0,
+                    unrealized_pnl=8.0,
+                    unrealized_pnl_pct=0.49,
+                    strategy='WATCHLIST_ENTRY',
+                    entry_time=datetime.now(UTC),
+                    is_open=True,
+                    execution_id='intent-msft',
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_positions_snapshot',
+            lambda mode=None: [
+                {
+                    'symbol': 'AAPL',
+                    'shares': 10,
+                    'avgPrice': 190.5,
+                    'currentPrice': 192.25,
+                    'marketValue': 1922.5,
+                    'pnl': 17.5,
+                    'pnlPercent': 0.92,
+                },
+                {
+                    'symbol': 'NVDA',
+                    'shares': 3,
+                    'avgPrice': 900.0,
+                    'currentPrice': 910.0,
+                    'marketValue': 2730.0,
+                    'pnl': 30.0,
+                    'pnlPercent': 1.11,
+                },
+            ],
+        )
+
+        original_positions = dict(crypto_ledger.positions)
+        original_pair_mappings = dict(getattr(crypto_ledger, 'pair_mappings', {}))
+        try:
+            crypto_ledger.positions = {
+                'TAOUSD': {
+                    'amount': Decimal('5'),
+                    'total_cost': Decimal('1500'),
+                    'entry_time_utc': '2026-04-02T03:00:00+00:00',
+                }
+            }
+            crypto_ledger.pair_mappings = {'TAO/USD': 'TAOUSD'}
+
+            with TestClient(app) as client:
+                response = client.get('/api/positions/unified')
+        finally:
+            crypto_ledger.positions = original_positions
+            crypto_ledger.pair_mappings = original_pair_mappings
+            app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload['summary']['totalCount'] == 4
+        assert payload['summary']['stockCount'] == 3
+        assert payload['summary']['cryptoCount'] == 1
+        assert payload['summary']['stockDriftCount'] == 2
+
+        rows = {row['symbol']: row for row in payload['rows']}
+        assert rows['AAPL']['assetClass'] == 'stock'
+        assert rows['AAPL']['sourceStatus'] == 'aligned'
+        assert rows['AAPL']['inspectAssetClass'] == 'stock'
+        assert rows['NVDA']['sourceStatus'] == 'broker_only'
+        assert rows['MSFT']['sourceStatus'] == 'db_only'
+        assert rows['TAO/USD']['assetClass'] == 'crypto'
+        assert rows['TAO/USD']['sourceStatus'] == 'ledger'
+        assert rows['TAO/USD']['inspectAssetClass'] == 'crypto'

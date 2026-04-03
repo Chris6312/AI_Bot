@@ -246,7 +246,24 @@ class WatchlistExitWorkerService:
             await asyncio.sleep(self._runtime.poll_seconds)
 
     def _submit_stock_exit(self, db: Session, candidate: dict[str, Any], *, mode: str) -> dict[str, Any]:
-        position = db.query(Position).filter(Position.id == candidate['positionId']).first()
+        position_id = candidate.get('positionId')
+        symbol = str(candidate.get('symbol') or '').upper().strip()
+
+        if position_id is not None:
+            position = db.query(Position).filter(Position.id == position_id).first()
+        else:
+            # Broker-sync positions have positionId=None; fall back to open DB row
+            # matching the symbol so protective exits can still be submitted.
+            position = (
+                db.query(Position)
+                .filter(
+                    Position.ticker == symbol,
+                    Position.is_open.is_(True),
+                )
+                .order_by(Position.id.desc())
+                .first()
+            )
+
         if position is None or not position.is_open or int(position.shares or 0) <= 0:
             candidate['action'] = 'SKIPPED'
             candidate['reason'] = 'POSITION_NOT_OPEN'

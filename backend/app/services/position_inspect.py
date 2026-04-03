@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.order_event import OrderEvent
 from app.models.order_intent import OrderIntent
 from app.models.position import Position
@@ -32,6 +33,31 @@ class PositionInspectService:
         if normalized_asset == 'crypto':
             return self._build_crypto_payload(db, normalized_symbol)
         raise PositionInspectNotFound(f'Unsupported asset class: {asset_class}')
+        
+    def _create_reconciliation_event(
+        session,
+        *,
+        symbol: str,
+        asset_class: str,
+        broker_qty: float,
+        broker_avg_price: float,
+        synced_at,
+    ):
+        from app.models.audit_event import AuditEvent
+
+        event = AuditEvent(
+            event_type="POSITION_RESTORED_FROM_BROKER",
+            asset_class=asset_class,
+            symbol=symbol,
+            details={
+                "source": "reconciliation_worker",
+                "broker_qty": broker_qty,
+                "broker_avg_price": broker_avg_price,
+                "synced_at": synced_at.isoformat(),
+            },
+        )
+
+        session.add(event)
 
     def _build_stock_payload(self, db: Session, symbol: str) -> dict[str, Any]:
         position = (
@@ -188,6 +214,18 @@ class PositionInspectService:
             'continuityOk': details.get('continuityOk'),
             'continuityGapSeconds': self._maybe_float(details.get('continuityGapSeconds')),
             'marketDataAtUtc': latest_eval.get('marketDataAtUtc') or base_monitor_context.get('marketDataAtUtc'),
+            'stopLoss': self._maybe_float(current_position.get('stopLoss') or (
+                round(float(current_position['avgPrice']) * (1.0 - float(settings.STOP_LOSS_PCT)), 8)
+                if current_position.get('avgPrice') else None
+            )),
+            'profitTarget': self._maybe_float(current_position.get('profitTarget') or (
+                round(float(current_position['avgPrice']) * (1.0 + float(settings.PROFIT_TARGET_PCT)), 8)
+                if current_position.get('avgPrice') else None
+            )),
+            'trailingStop': self._maybe_float(current_position.get('trailingStop') or (
+                round(float(current_position['avgPrice']) * (1.0 - float(settings.TRAILING_STOP_PCT)), 8)
+                if current_position.get('avgPrice') else None
+            )),
         }
         return {
             'assetClass': 'crypto',

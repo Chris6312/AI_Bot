@@ -99,7 +99,11 @@ class TradingBot(commands.Bot):
 
         message_channel_id = getattr(getattr(message, 'channel', None), 'id', None)
         runtime_channel_id = self.trading_channel_id
-        if authorization.reason != 'Trading channel is not configured.':
+        fallback_reasons = {
+            'Trading channel is not configured.',
+            'Message came from a non-trading channel.',
+        }
+        if authorization.reason not in fallback_reasons:
             return authorization
         if not runtime_channel_id or message_channel_id != runtime_channel_id:
             return authorization
