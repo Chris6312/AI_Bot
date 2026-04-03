@@ -844,23 +844,55 @@ class WatchlistExitWorkerService:
 
     @staticmethod
     def _safe_broker_quantity(symbol: str, mode: str) -> int:
+        if not tradier_client.is_ready(mode):
+            return 0
         try:
-            return int(tradier_client.get_position_quantity_sync(symbol, mode=mode) or 0)
+            quantity = tradier_client.get_position_quantity_sync(
+                symbol,
+                mode=mode,
+                timeout=1.5,
+                use_cache=True,
+            )
+        except TypeError:
+            try:
+                quantity = tradier_client.get_position_quantity_sync(symbol, mode=mode)
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+        try:
+            return int(quantity or 0)
         except Exception:
             return 0
 
     @staticmethod
     def _safe_broker_sell_orders(symbol: str, mode: str) -> list[dict[str, Any]]:
+        if not tradier_client.is_ready(mode):
+            return []
         try:
-            return list(
-                tradier_client.get_orders_sync(
+            orders = tradier_client.get_orders_sync(
+                mode=mode,
+                symbol=symbol,
+                side='SELL',
+                statuses=sorted(ACTIVE_BROKER_EXIT_ORDER_STATUSES),
+                timeout=1.5,
+                use_cache=True,
+            )
+        except TypeError:
+            try:
+                orders = tradier_client.get_orders_sync(
                     mode=mode,
                     symbol=symbol,
                     side='SELL',
                     statuses=sorted(ACTIVE_BROKER_EXIT_ORDER_STATUSES),
+                    timeout=1.5,
                 )
-                or []
-            )
+            except Exception:
+                return []
+        except Exception:
+            return []
+        try:
+            return list(orders or [])
         except Exception:
             return []
 

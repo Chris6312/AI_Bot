@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 import type { WatchlistScope } from '@/types'
 
 export type Tone = 'good' | 'warn' | 'danger' | 'info' | 'muted'
-export type CanonicalStatus = 'healthy' | 'warning' | 'blocked' | 'stale' | 'managed-only' | 'unmanaged' | 'idle'
+export type CanonicalStatus = 'healthy' | 'warning' | 'blocked' | 'stale' | 'managed-only' | 'unmanaged' | 'idle' | 'pending' | 'waiting'
 
 
 export interface ScopeSessionLike {

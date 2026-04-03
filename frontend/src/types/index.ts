@@ -590,3 +590,46 @@ export interface PositionInspectRecord {
   lifecycle: PositionInspectTimelineEvent[]
   rawContext: Record<string, unknown>
 }
+
+
+export interface TradeHistoryRow {
+  id: string
+  tradeId?: string | null
+  assetClass: 'stock' | 'crypto' | string
+  mode: 'PAPER' | 'LIVE' | string
+  symbol: string
+  buyIntentId?: string | null
+  sellIntentId?: string | null
+  source?: string | null
+  boughtAtUtc?: string | null
+  buyPrice?: number | null
+  buyQuantity: number
+  buyTotal?: number | null
+  soldAtUtc?: string | null
+  sellPrice?: number | null
+  sellQuantity: number
+  sellTotal?: number | null
+  unitDiff?: number | null
+  fees?: number | null
+  realizedPnl?: number | null
+  holdDurationMinutes?: number | null
+  exitTrigger?: string | null
+}
+
+export interface TradeHistoryResponse {
+  rows: TradeHistoryRow[]
+  summary: {
+    totalCount: number
+    realizedPnl: number
+    winCount: number
+    lossCount: number
+    assetCounts: {
+      stock: number
+      crypto: number
+    }
+    modeCounts: {
+      PAPER: number
+      LIVE: number
+    }
+  }
+}

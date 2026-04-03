@@ -5,6 +5,7 @@ import AuditTrail from './pages/AuditTrail'
 import Dashboard from './pages/Dashboard'
 import Monitoring from './pages/Monitoring'
 import Positions from './pages/Positions'
+import TradeHistory from './pages/TradeHistory'
 import Settings from './pages/Settings'
 import Watchlists from './pages/Watchlists'
 
@@ -20,6 +21,7 @@ function App() {
               <Route path="/watchlists" element={<Watchlists />} />
               <Route path="/monitoring" element={<Monitoring />} />
               <Route path="/positions" element={<Positions />} />
+              <Route path="/trade-history" element={<TradeHistory />} />
               <Route path="/audit" element={<AuditTrail />} />
               <Route path="/runtime" element={<Settings />} />
 

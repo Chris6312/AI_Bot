@@ -3,6 +3,7 @@ import {
   Activity,
   ClipboardList,
   FileSearch,
+  History,
   LayoutDashboard,
   PanelRightClose,
   Shield,
@@ -20,6 +21,7 @@ const navItems: NavItem[] = [
   { to: '/watchlists', label: 'Watchlists', icon: ClipboardList, section: 'operator' },
   { to: '/monitoring', label: 'Monitoring', icon: Activity, section: 'operator' },
   { to: '/positions', label: 'Positions', icon: PanelRightClose, section: 'operator' },
+  { to: '/trade-history', label: 'Trade History', icon: History, section: 'operator' },
   { to: '/audit', label: 'Audit Trail', icon: FileSearch, section: 'control' },
   { to: '/runtime', label: 'Runtime & Risk', icon: Shield, section: 'control' },
 ]

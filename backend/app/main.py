@@ -33,6 +33,7 @@ from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
 from app.services.watchlist_service import watchlist_service
 from app.services.watchlist_exit_worker import watchlist_exit_worker
 from app.services.tradier_client import tradier_client
+from app.services.trade_history import TradeHistoryFilters, trade_history_service
 
 
 logging.basicConfig(level=logging.INFO)
@@ -500,6 +501,44 @@ async def get_ai_decisions(
     db: Session = Depends(get_db),
 ):
     return watchlist_service.get_ai_decision_feed(db, limit=limit)
+
+
+
+
+@app.get('/api/trade-history')
+async def get_trade_history(
+    mode: Literal['PAPER', 'LIVE', 'ALL'] = Query('ALL'),
+    asset_class: Literal['stock', 'crypto', 'all'] = Query('all'),
+    symbol: str | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    def _parse_date(value: str | None, *, end_of_day: bool) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f'Invalid date: {value}') from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ET)
+        else:
+            parsed = parsed.astimezone(ET)
+        if end_of_day:
+            parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+        else:
+            parsed = parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+        return parsed.astimezone(ZoneInfo('UTC'))
+
+    filters = TradeHistoryFilters(
+        mode=None if mode == 'ALL' else mode,
+        asset_class=None if asset_class == 'all' else asset_class,
+        symbol=symbol,
+        date_from=_parse_date(date_from, end_of_day=False),
+        date_to=_parse_date(date_to, end_of_day=True),
+    )
+    return trade_history_service.get_closed_trade_history(db, filters=filters)
 
 
 @app.get('/api/market-status')

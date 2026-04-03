@@ -587,17 +587,20 @@ class WatchlistService:
                 WatchlistSymbol.priority_rank.asc(),
                 WatchlistSymbol.id.asc(),
             ).all()
+            active_upload = self._get_latest_upload_row(db, scope=scope_value, active_only=True)
             effective_broker_enrichment = broker_enrichment or scope_value == 'stocks_only'
-            position_state_map = self._build_position_state_map(db, scope=scope_value, observed_at=observed_at, broker_enrichment=effective_broker_enrichment)
-            rows = [
-                self._serialize_monitor_row(
-                    symbol_row,
-                    monitor_row,
-                    position_state=position_state_map.get(str(symbol_row.symbol or '').upper()),
-                    broker_enrichment=broker_enrichment,
-                )
-                for monitor_row, symbol_row in pairs
-            ]
+            position_state_map = self._build_position_state_map(
+                db,
+                scope=scope_value,
+                observed_at=observed_at,
+                broker_enrichment=effective_broker_enrichment,
+            )
+            rows = self._build_deduped_monitoring_rows(
+                pairs,
+                position_state_map=position_state_map,
+                broker_enrichment=broker_enrichment,
+                active_upload_id=active_upload.upload_id if active_upload else None,
+            )
             next_eval = min(
                 (row['monitoring']['nextEvaluationAtUtc'] for row in rows if row.get('monitoring') and row['monitoring']['nextEvaluationAtUtc']),
                 default=None,
@@ -606,7 +609,6 @@ class WatchlistService:
                 (row['monitoring']['lastEvaluatedAtUtc'] for row in rows if row.get('monitoring') and row['monitoring']['lastEvaluatedAtUtc']),
                 default=None,
             )
-            active_upload = self._get_latest_upload_row(db, scope=scope_value, active_only=True)
             result[scope_value] = {
                 'scope': scope_value,
                 'capturedAtUtc': observed_at.isoformat(),
@@ -905,16 +907,97 @@ class WatchlistService:
         observed_at: datetime,
     ) -> None:
         open_symbols = self._get_open_symbols(db, scope)
-        candidate_rows = db.query(WatchlistSymbol).filter(WatchlistSymbol.scope == scope).all()
+        candidate_rows = (
+            db.query(WatchlistSymbol)
+            .filter(WatchlistSymbol.scope == scope)
+            .order_by(WatchlistSymbol.id.desc())
+            .all()
+        )
+        managed_only_assigned: set[str] = set()
         for row in candidate_rows:
             symbol = str(row.symbol or '').upper()
             if symbol in next_symbols:
                 row.monitoring_status = INACTIVE
-            elif symbol in open_symbols:
+            elif symbol in open_symbols and symbol not in managed_only_assigned:
                 row.monitoring_status = MANAGED_ONLY
+                managed_only_assigned.add(symbol)
             else:
                 row.monitoring_status = INACTIVE
             self._upsert_monitor_state(db, row, observed_at=observed_at)
+
+    def _build_deduped_monitoring_rows(
+        self,
+        pairs: list[tuple[WatchlistMonitorState, WatchlistSymbol]],
+        *,
+        position_state_map: dict[str, dict[str, Any]],
+        broker_enrichment: bool,
+        active_upload_id: str | None,
+    ) -> list[dict[str, Any]]:
+        selected: dict[str, tuple[WatchlistMonitorState, WatchlistSymbol]] = {}
+        for monitor_row, symbol_row in pairs:
+            symbol_key = str(symbol_row.symbol or '').upper()
+            if not symbol_key:
+                continue
+            current = selected.get(symbol_key)
+            if current is None or self._prefer_monitor_pair(
+                candidate=(monitor_row, symbol_row),
+                current=current,
+                active_upload_id=active_upload_id,
+            ):
+                selected[symbol_key] = (monitor_row, symbol_row)
+
+        ordered_pairs = sorted(
+            selected.values(),
+            key=lambda item: (
+                self._monitor_status_sort_key(item[0].monitoring_status),
+                item[1].priority_rank if item[1].priority_rank is not None else 999999,
+                -(item[1].id or 0),
+            ),
+        )
+        return [
+            self._serialize_monitor_row(
+                symbol_row,
+                monitor_row,
+                position_state=position_state_map.get(str(symbol_row.symbol or '').upper()),
+                broker_enrichment=broker_enrichment,
+            )
+            for monitor_row, symbol_row in ordered_pairs
+        ]
+
+    @staticmethod
+    def _monitor_status_sort_key(status: str | None) -> int:
+        order = {ACTIVE: 0, MANAGED_ONLY: 1, INACTIVE: 2}
+        return order.get(str(status or '').upper(), 99)
+
+    def _prefer_monitor_pair(
+        self,
+        *,
+        candidate: tuple[WatchlistMonitorState, WatchlistSymbol],
+        current: tuple[WatchlistMonitorState, WatchlistSymbol],
+        active_upload_id: str | None,
+    ) -> bool:
+        candidate_monitor, candidate_symbol = candidate
+        current_monitor, current_symbol = current
+        candidate_active = bool(active_upload_id and candidate_symbol.upload_id == active_upload_id)
+        current_active = bool(active_upload_id and current_symbol.upload_id == active_upload_id)
+        if candidate_active != current_active:
+            return candidate_active
+
+        candidate_status = self._monitor_status_sort_key(candidate_monitor.monitoring_status)
+        current_status = self._monitor_status_sort_key(current_monitor.monitoring_status)
+        if candidate_status != current_status:
+            return candidate_status < current_status
+
+        candidate_eval = candidate_monitor.last_evaluated_at_utc or candidate_monitor.last_decision_at_utc
+        current_eval = current_monitor.last_evaluated_at_utc or current_monitor.last_decision_at_utc
+        if candidate_eval and current_eval and candidate_eval != current_eval:
+            return candidate_eval > current_eval
+        if candidate_eval and not current_eval:
+            return True
+        if current_eval and not candidate_eval:
+            return False
+
+        return (candidate_symbol.id or 0) > (current_symbol.id or 0)
 
     def _get_latest_upload_row(
         self,

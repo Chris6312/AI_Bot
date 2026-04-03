@@ -291,11 +291,18 @@ class WatchlistMonitoringOrchestrator:
             self._runtime.poll_seconds,
             settings.WATCHLIST_MONITOR_BATCH_LIMIT,
         )
-        while True:
-            self._runtime.last_started_at_utc = datetime.now(UTC).isoformat()
+
+        def _execute_due_run_blocking() -> dict[str, Any]:
             db = SessionLocal()
             try:
-                run_summary = self.run_due_once(db, limit_per_scope=settings.WATCHLIST_MONITOR_BATCH_LIMIT)
+                return self.run_due_once(db, limit_per_scope=settings.WATCHLIST_MONITOR_BATCH_LIMIT)
+            finally:
+                db.close()
+
+        while True:
+            self._runtime.last_started_at_utc = datetime.now(UTC).isoformat()
+            try:
+                run_summary = await asyncio.to_thread(_execute_due_run_blocking)
                 self._runtime.last_run_summary = run_summary
                 self._runtime.last_error = None
                 self._runtime.consecutive_failures = 0
@@ -308,15 +315,12 @@ class WatchlistMonitoringOrchestrator:
                         run_summary['summary']['totalDueAfter'],
                     )
             except asyncio.CancelledError:
-                db.close()
                 raise
             except Exception as exc:
                 logger.exception('Watchlist monitoring orchestrator sweep failed: %s', exc)
                 self._runtime.last_error = str(exc)
                 self._runtime.consecutive_failures += 1
                 self._runtime.last_finished_at_utc = datetime.now(UTC).isoformat()
-            finally:
-                db.close()
             await asyncio.sleep(self._runtime.poll_seconds)
 
     def _execute_entry_candidates(self, db: Session, evaluated_rows: list[dict[str, Any]]) -> dict[str, Any]:

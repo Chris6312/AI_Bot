@@ -4283,3 +4283,151 @@ def test_crypto_exit_sets_cooldown_and_blocks_immediate_reentry(tmp_path, monkey
             crypto_ledger.balance = original_balance
             crypto_ledger.positions = original_positions
             crypto_ledger.trades = original_trades
+
+
+def test_monitoring_snapshot_dedupes_duplicate_managed_only_rows(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        now = datetime(2026, 4, 3, 18, 0, tzinfo=UTC)
+
+        upload_old = WatchlistUpload(
+            upload_id='upload_old',
+            scan_id='scan_old',
+            schema_version='bot_watchlist_v3',
+            provider='chatgpt_kraken_app',
+            scope='crypto_only',
+            source='discord',
+            source_user_id='user-1',
+            source_channel_id='channel-1',
+            source_message_id='message-1',
+            payload_hash='hash-old',
+            generated_at_utc=now - timedelta(hours=2),
+            received_at_utc=now - timedelta(hours=2),
+            watchlist_expires_at_utc=now + timedelta(hours=22),
+            validation_status='ACCEPTED',
+            market_regime='mixed',
+            selected_count=1,
+            is_active=False,
+            validation_result_json={},
+            raw_payload_json={},
+            bot_payload_json={},
+        )
+        upload_new = WatchlistUpload(
+            upload_id='upload_new',
+            scan_id='scan_new',
+            schema_version='bot_watchlist_v3',
+            provider='chatgpt_kraken_app',
+            scope='crypto_only',
+            source='discord',
+            source_user_id='user-1',
+            source_channel_id='channel-1',
+            source_message_id='message-2',
+            payload_hash='hash-new',
+            generated_at_utc=now - timedelta(hours=1),
+            received_at_utc=now - timedelta(hours=1),
+            watchlist_expires_at_utc=now + timedelta(hours=23),
+            validation_status='ACCEPTED',
+            market_regime='mixed',
+            selected_count=1,
+            is_active=True,
+            validation_result_json={},
+            raw_payload_json={},
+            bot_payload_json={},
+        )
+        db.add_all([upload_old, upload_new])
+        db.flush()
+
+        old_symbol = WatchlistSymbol(
+            upload_id='upload_old',
+            scope='crypto_only',
+            symbol='BTC',
+            quote_currency='USD',
+            asset_class='crypto',
+            enabled=True,
+            trade_direction='long',
+            priority_rank=1,
+            tier='tier_1',
+            bias='bullish',
+            setup_template='trend_continuation',
+            bot_timeframes=['15m', '1h'],
+            exit_template='trail_after_impulse',
+            max_hold_hours=72,
+            risk_flags=[],
+            monitoring_status=MANAGED_ONLY,
+        )
+        new_symbol = WatchlistSymbol(
+            upload_id='upload_new',
+            scope='crypto_only',
+            symbol='BTC',
+            quote_currency='USD',
+            asset_class='crypto',
+            enabled=True,
+            trade_direction='long',
+            priority_rank=1,
+            tier='tier_1',
+            bias='bullish',
+            setup_template='trend_continuation',
+            bot_timeframes=['15m', '1h'],
+            exit_template='trail_after_impulse',
+            max_hold_hours=72,
+            risk_flags=[],
+            monitoring_status=MANAGED_ONLY,
+        )
+        db.add_all([old_symbol, new_symbol])
+        db.flush()
+
+        db.add_all(
+            [
+                WatchlistMonitorState(
+                    watchlist_symbol_id=old_symbol.id,
+                    upload_id='upload_old',
+                    scope='crypto_only',
+                    symbol='BTC',
+                    monitoring_status=MANAGED_ONLY,
+                    latest_decision_state='MONITOR_ONLY',
+                    latest_decision_reason='OPEN_POSITION_EXISTS',
+                    decision_context_json={},
+                    required_timeframes_json=['15m', '1h'],
+                    evaluation_interval_seconds=300,
+                    last_decision_at_utc=now - timedelta(hours=2),
+                    last_evaluated_at_utc=now - timedelta(hours=2),
+                    next_evaluation_at_utc=now + timedelta(minutes=5),
+                    last_market_data_at_utc=now - timedelta(minutes=1),
+                ),
+                WatchlistMonitorState(
+                    watchlist_symbol_id=new_symbol.id,
+                    upload_id='upload_new',
+                    scope='crypto_only',
+                    symbol='BTC',
+                    monitoring_status=MANAGED_ONLY,
+                    latest_decision_state='MONITOR_ONLY',
+                    latest_decision_reason='OPEN_POSITION_EXISTS',
+                    decision_context_json={},
+                    required_timeframes_json=['15m', '1h'],
+                    evaluation_interval_seconds=300,
+                    last_decision_at_utc=now - timedelta(hours=1),
+                    last_evaluated_at_utc=now - timedelta(hours=1),
+                    next_evaluation_at_utc=now + timedelta(minutes=5),
+                    last_market_data_at_utc=now - timedelta(minutes=1),
+                ),
+            ]
+        )
+        db.commit()
+
+        snapshot = watchlist_service.get_monitoring_snapshot(db, scope='crypto_only')
+        rows = snapshot['rows']
+        assert len(rows) == 1
+        assert rows[0]['symbol'] == 'BTC'
+        assert rows[0]['uploadId'] == 'upload_new'
+        assert rows[0]['monitoringStatus'] == MANAGED_ONLY
+
+
+def test_monitoring_snapshot_without_active_upload_returns_empty_rows(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        snapshot = watchlist_service.get_monitoring_snapshot(db, scope='stocks_only', include_inactive=False)
+
+        assert snapshot['scope'] == 'stocks_only'
+        assert snapshot['activeUploadId'] is None
+        assert snapshot['summary']['total'] == 0
+        assert snapshot['rows'] == []
