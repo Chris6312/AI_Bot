@@ -19,7 +19,7 @@ from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
 from app.services.kraken_service import crypto_ledger
-from app.services.market_sessions import calculate_next_scope_evaluation_at
+from app.services.market_sessions import calculate_next_scope_evaluation_at, get_scope_session_status
 from app.services.runtime_state import runtime_state
 from app.services.tradier_client import tradier_client
 
@@ -568,6 +568,7 @@ class WatchlistService:
         *,
         scope: WATCHLIST_SCOPE | None = None,
         include_inactive: bool = False,
+        broker_enrichment: bool = False,
     ) -> Any:
         observed_at = datetime.now(UTC)
         scopes: list[WATCHLIST_SCOPE] = [scope] if scope is not None else ['stocks_only', 'crypto_only']
@@ -586,12 +587,14 @@ class WatchlistService:
                 WatchlistSymbol.priority_rank.asc(),
                 WatchlistSymbol.id.asc(),
             ).all()
-            position_state_map = self._build_position_state_map(db, scope=scope_value, observed_at=observed_at)
+            effective_broker_enrichment = broker_enrichment or scope_value == 'stocks_only'
+            position_state_map = self._build_position_state_map(db, scope=scope_value, observed_at=observed_at, broker_enrichment=effective_broker_enrichment)
             rows = [
                 self._serialize_monitor_row(
                     symbol_row,
                     monitor_row,
                     position_state=position_state_map.get(str(symbol_row.symbol or '').upper()),
+                    broker_enrichment=broker_enrichment,
                 )
                 for monitor_row, symbol_row in pairs
             ]
@@ -670,8 +673,9 @@ class WatchlistService:
         *,
         scope: WATCHLIST_SCOPE | None = None,
         expiring_within_hours: int = 24,
+        broker_enrichment: bool = False,
     ) -> Any:
-        monitoring_snapshot = self.get_monitoring_snapshot(db, scope=scope, include_inactive=False)
+        monitoring_snapshot = self.get_monitoring_snapshot(db, scope=scope, include_inactive=False, broker_enrichment=broker_enrichment)
         scopes: dict[str, Any] = monitoring_snapshot if scope is None else {scope: monitoring_snapshot}
         result: dict[str, Any] = {}
         for scope_value, snapshot in scopes.items():
@@ -724,15 +728,28 @@ class WatchlistService:
         return result[scope] if scope is not None else result
 
     def get_managed_only_rows(self, db: Session, *, scope: WATCHLIST_SCOPE) -> list[WatchlistSymbol]:
-        return (
+        rows = (
             db.query(WatchlistSymbol)
             .filter(
                 WatchlistSymbol.scope == scope,
                 WatchlistSymbol.monitoring_status == MANAGED_ONLY,
             )
-            .order_by(WatchlistSymbol.priority_rank.asc(), WatchlistSymbol.id.asc())
+            .order_by(WatchlistSymbol.priority_rank.asc(), WatchlistSymbol.id.desc())
             .all()
         )
+        deduped: list[WatchlistSymbol] = []
+        seen: set[str] = set()
+        for row in rows:
+            key = self._normalize_scope_symbol(
+                scope=scope,
+                symbol=row.symbol,
+                quote_currency=getattr(row, 'quote_currency', None),
+            )
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+        return deduped
 
     @staticmethod
     def _normalize_scope_symbol(*, scope: WATCHLIST_SCOPE, symbol: str | None, quote_currency: str | None = None) -> str:
@@ -938,7 +955,10 @@ class WatchlistService:
     def _get_open_stock_broker_positions(self) -> dict[str, dict[str, Any]]:
         try:
             mode = runtime_state.get().stock_mode
-            positions = tradier_client.get_positions_snapshot(mode)
+            try:
+                positions = tradier_client.get_positions_snapshot(mode, include_quotes=False)
+            except TypeError:
+                positions = tradier_client.get_positions_snapshot(mode)
         except Exception:
             return {}
 
@@ -1370,8 +1390,40 @@ class WatchlistService:
         monitor_state: WatchlistMonitorState | None,
         *,
         position_state: dict[str, Any] | None = None,
+        broker_enrichment: bool = False,
     ) -> dict[str, Any]:
         symbol_payload = self._serialize_symbol_row(row, monitor_state=monitor_state)
+        position_state = position_state or {}
+        monitoring_payload = symbol_payload.get('monitoring') or {}
+        if position_state.get('hasOpenPosition'):
+            protective_reasons = list(position_state.get('protectiveExitReasons') or [])
+            if position_state.get('protectiveExitPending'):
+                symbol_payload['monitoringStatus'] = 'EXIT_PENDING'
+                monitoring_payload['latestDecisionState'] = 'EXIT_PENDING'
+                monitoring_payload['latestDecisionReason'] = ', '.join(protective_reasons) if protective_reasons else 'Protective exit threshold breached for the open position.'
+            elif position_state.get('positionExpired'):
+                symbol_payload['monitoringStatus'] = 'EXIT_PENDING'
+                monitoring_payload['latestDecisionState'] = 'EXIT_PENDING'
+                monitoring_payload['latestDecisionReason'] = 'Open position exceeded max hold duration and is pending exit management.'
+            elif position_state.get('scaleOutReady'):
+                symbol_payload['monitoringStatus'] = 'EXIT_PENDING'
+                monitoring_payload['latestDecisionState'] = 'EXIT_PENDING'
+                monitoring_payload['latestDecisionReason'] = 'Profit target reached and the position is ready for scale-out management.'
+            elif position_state.get('followThroughFailed'):
+                symbol_payload['monitoringStatus'] = 'EXIT_PENDING'
+                monitoring_payload['latestDecisionState'] = 'EXIT_PENDING'
+                monitoring_payload['latestDecisionReason'] = 'First failed follow-through exit condition triggered for the open position.'
+        derived_monitoring_status = self._derive_runtime_monitoring_status(row, position_state) if broker_enrichment else None
+        if derived_monitoring_status is not None:
+            symbol_payload['monitoringStatus'] = derived_monitoring_status
+            if derived_monitoring_status == 'EXIT_PENDING':
+                monitoring_payload['latestDecisionState'] = 'EXIT_PENDING'
+                monitoring_payload['latestDecisionReason'] = 'Broker already has an open stock exit order for this symbol.'
+            elif derived_monitoring_status == 'WAITING_FOR_MARKET_OPEN':
+                monitoring_payload['latestDecisionState'] = 'WAITING_FOR_MARKET_OPEN'
+                monitoring_payload['latestDecisionReason'] = 'Stock exit is queued, but the market session is currently closed.'
+        if monitoring_payload:
+            symbol_payload['monitoring'] = monitoring_payload
         symbol_payload['managedOnly'] = row.monitoring_status == MANAGED_ONLY
         symbol_payload['positionState'] = position_state or {
             'hasOpenPosition': False,
@@ -1406,14 +1458,16 @@ class WatchlistService:
         *,
         scope: WATCHLIST_SCOPE,
         observed_at: datetime,
+        broker_enrichment: bool = False,
     ) -> dict[str, dict[str, Any]]:
         if scope == 'stocks_only':
-            return self._build_stock_position_state_map(db, observed_at=observed_at)
+            return self._build_stock_position_state_map(db, observed_at=observed_at, broker_enrichment=broker_enrichment)
         return self._build_crypto_position_state_map(db, observed_at=observed_at)
 
-    def _build_stock_position_state_map(self, db: Session, *, observed_at: datetime) -> dict[str, dict[str, Any]]:
-        broker_positions = self._get_open_stock_broker_positions()
-        self._sync_stock_position_mirror_from_broker(db, observed_at=observed_at, broker_positions=broker_positions)
+    def _build_stock_position_state_map(self, db: Session, *, observed_at: datetime, broker_enrichment: bool = False) -> dict[str, dict[str, Any]]:
+        broker_positions = self._get_open_stock_broker_positions() if broker_enrichment else {}
+        if broker_enrichment:
+            self._sync_stock_position_mirror_from_broker(db, observed_at=observed_at, broker_positions=broker_positions)
         state_map: dict[str, dict[str, Any]] = {}
         positions = (
             db.query(Position)
@@ -1703,6 +1757,38 @@ class WatchlistService:
             return None
         return round(reference_price * (1.0 - (float(settings.TRAILING_STOP_PCT) * IMPULSE_TRAIL_STOP_FACTOR)), 4)
 
+    @staticmethod
+    def _resolve_crypto_exit_level(position: dict[str, Any], key: str, fallback: float | None) -> float | None:
+        aliases = {
+            key,
+            str(key or '').strip(),
+            str(key or '').strip().lower(),
+            str(key or '').strip().upper(),
+        }
+        if key == 'stopLoss':
+            aliases.update({'stop_loss', 'stoploss', 'StopLoss'})
+        elif key == 'profitTarget':
+            aliases.update({'profit_target', 'profittarget', 'ProfitTarget'})
+        elif key == 'trailingStop':
+            aliases.update({'trailing_stop', 'trailingstop', 'TrailingStop'})
+        elif key == 'peakPrice':
+            aliases.update({'peak_price', 'peakprice', 'PeakPrice'})
+
+        value = None
+        for alias in aliases:
+            if alias in position and position.get(alias) is not None:
+                value = position.get(alias)
+                break
+        if value is None:
+            return fallback
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        if parsed <= 0:
+            return fallback
+        return parsed
+
     def _build_crypto_position_state_map(self, db: Session, *, observed_at: datetime) -> dict[str, dict[str, Any]]:
         state_map: dict[str, dict[str, Any]] = {}
         try:
@@ -1751,22 +1837,26 @@ class WatchlistService:
             if entry_time is not None:
                 hours_since_entry = round((observed_at - entry_time).total_seconds() / 3600.0, 2)
 
-            # Derive stop-loss, profit-target, and trailing-stop from avg entry
-            # price using the same config percentages applied to stocks.  Crypto
-            # entries do not write a DB Position row, so there is no persisted
-            # stop_loss field to read — we recompute from the fill price instead.
-            stop_loss: float | None = None
-            profit_target: float | None = None
-            trailing_stop: float | None = None
-            peak_price: float | None = None
+            # Prefer explicit stop-loss / target / trailing levels already stored
+            # on the crypto ledger position. Fall back to config-derived levels
+            # from avg entry when the ledger does not provide them.
+            explicit_peak_price = self._resolve_crypto_exit_level(position, 'peakPrice', None)
+            explicit_stop_loss = self._resolve_crypto_exit_level(position, 'stopLoss', None)
+            explicit_profit_target = self._resolve_crypto_exit_level(position, 'profitTarget', None)
+            explicit_trailing_stop = self._resolve_crypto_exit_level(position, 'trailingStop', None)
+            stop_loss: float | None = explicit_stop_loss
+            profit_target: float | None = explicit_profit_target
+            trailing_stop: float | None = explicit_trailing_stop
+            peak_price: float | None = explicit_peak_price
             if avg_entry_price is not None and avg_entry_price > 0:
-                stop_loss = round(avg_entry_price * (1.0 - float(settings.STOP_LOSS_PCT)), 8)
-                profit_target = round(avg_entry_price * (1.0 + float(settings.PROFIT_TARGET_PCT)), 8)
-                # Trailing stop ratchets to the highest observed price; use
-                # current_price as a best-effort peak since the ledger does not
-                # persist peak separately.
-                peak_price = max(avg_entry_price, float(current_price or 0.0))
-                trailing_stop = round(peak_price * (1.0 - float(settings.TRAILING_STOP_PCT)), 8)
+                derived_stop_loss = round(avg_entry_price * (1.0 - float(settings.STOP_LOSS_PCT)), 8)
+                derived_profit_target = round(avg_entry_price * (1.0 + float(settings.PROFIT_TARGET_PCT)), 8)
+                derived_peak_price = max(avg_entry_price, float(current_price or 0.0))
+                derived_trailing_stop = round(derived_peak_price * (1.0 - float(settings.TRAILING_STOP_PCT)), 8)
+                peak_price = peak_price if peak_price is not None else derived_peak_price
+                stop_loss = stop_loss if stop_loss is not None else derived_stop_loss
+                profit_target = profit_target if profit_target is not None else derived_profit_target
+                trailing_stop = trailing_stop if trailing_stop is not None else derived_trailing_stop
 
             stop_loss_breached = bool(
                 current_price is not None
@@ -1880,6 +1970,29 @@ class WatchlistService:
             for candidate in candidates:
                 state_map.setdefault(candidate, payload)
         return state_map
+
+    def _derive_runtime_monitoring_status(self, row: WatchlistSymbol, position_state: dict[str, Any]) -> str | None:
+        if row.scope != 'stocks_only' or not position_state.get('hasOpenPosition'):
+            return None
+        symbol = str(row.symbol or '').upper().strip()
+        mode = runtime_state.get().stock_mode
+        try:
+            open_orders = tradier_client.get_orders_sync(
+                mode=mode,
+                symbol=symbol,
+                side='SELL',
+                statuses=['OPEN', 'PENDING', 'SUBMITTED', 'ACCEPTED', 'PARTIALLY_FILLED', 'NEW'],
+                timeout=max(1.0, float(settings.TRADIER_POSITIONS_TIMEOUT_SECONDS)),
+            )
+        except Exception:
+            open_orders = []
+        if open_orders:
+            return 'EXIT_PENDING'
+        if position_state.get('protectiveExitPending') or position_state.get('positionExpired') or position_state.get('scaleOutReady') or position_state.get('followThroughFailed'):
+            session = get_scope_session_status(row.scope, datetime.now(UTC))
+            if not bool(getattr(session, 'session_open', False)):
+                return 'WAITING_FOR_MARKET_OPEN'
+        return None
 
     @staticmethod
     def _serialize_symbol_row(row: WatchlistSymbol, monitor_state: WatchlistMonitorState | None = None) -> dict[str, Any]:

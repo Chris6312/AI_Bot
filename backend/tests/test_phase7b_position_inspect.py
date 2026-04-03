@@ -371,3 +371,129 @@ def test_crypto_position_inspect_uses_symbol_aliases_and_intent_watchlist_fallba
         assert payload['exitPlan']['template'] == 'scale_out_then_trail'
         assert payload['exitPlan']['maxHoldHours'] == 72
         assert payload['latestEvaluation']['state'] == 'ENTRY_CANDIDATE'
+
+
+def test_crypto_position_inspect_surfaces_protective_exit_pending_when_stop_loss_breached(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        upload = WatchlistUpload(
+            upload_id='upl-crypto-stop-1',
+            scan_id='scan-crypto-stop-1',
+            schema_version='bot_watchlist_v3',
+            provider='claude_tradier_mcp',
+            scope='crypto_only',
+            source='test',
+            payload_hash='hash-stop-1',
+            generated_at_utc=datetime(2026, 4, 3, 16, 0, tzinfo=UTC),
+            received_at_utc=datetime(2026, 4, 3, 16, 1, tzinfo=UTC),
+            watchlist_expires_at_utc=datetime(2026, 4, 4, 16, 0, tzinfo=UTC),
+            validation_status='ACCEPTED',
+            market_regime='mixed',
+            selected_count=1,
+            is_active=True,
+            validation_result_json={},
+            raw_payload_json={},
+            bot_payload_json={},
+        )
+        db.add(upload)
+        db.flush()
+
+        row = WatchlistSymbol(
+            upload_id=upload.upload_id,
+            scope='crypto_only',
+            symbol='2Z',
+            quote_currency='USD',
+            asset_class='crypto',
+            enabled=True,
+            trade_direction='long',
+            priority_rank=1,
+            tier='tier_1',
+            bias='bullish',
+            setup_template='trend_continuation',
+            bot_timeframes=['15m', '1h', '4h'],
+            exit_template='first_failed_follow_through',
+            max_hold_hours=48,
+            risk_flags=['high_beta'],
+            monitoring_status='ACTIVE',
+        )
+        db.add(row)
+        db.flush()
+
+        monitor_state = WatchlistMonitorState(
+            watchlist_symbol_id=row.id,
+            upload_id=upload.upload_id,
+            scope='crypto_only',
+            symbol='2Z',
+            monitoring_status='ACTIVE',
+            latest_decision_state='WAITING_FOR_SETUP',
+            latest_decision_reason='Trend continuation thresholds are not met.',
+            decision_context_json={
+                'latestEvaluation': {
+                    'state': 'WAITING_FOR_SETUP',
+                    'reason': 'Trend continuation thresholds are not met.',
+                    'evaluatedAtUtc': '2026-04-03T16:05:55+00:00',
+                    'marketDataAtUtc': '2026-04-03T16:05:56+00:00',
+                    'details': {
+                        'currentPrice': 0.07592,
+                        'recentHigh': 0.07592,
+                        'recentLow': 0.07576,
+                        'continuityOk': True,
+                    },
+                }
+            },
+            required_timeframes_json=['15m', '1h', '4h'],
+            evaluation_interval_seconds=300,
+            last_decision_at_utc=datetime(2026, 4, 3, 16, 5, tzinfo=UTC),
+            last_evaluated_at_utc=datetime(2026, 4, 3, 16, 5, tzinfo=UTC),
+            next_evaluation_at_utc=datetime(2026, 4, 3, 16, 10, tzinfo=UTC),
+            last_market_data_at_utc=datetime(2026, 4, 3, 16, 5, 56, tzinfo=UTC),
+        )
+        db.add(monitor_state)
+        db.commit()
+
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda: [
+                {
+                    'pair': '2Z/USD',
+                    'ohlcvPair': '2ZUSD',
+                    'amount': 1000.0,
+                    'avgPrice': 0.0778,
+                    'currentPrice': 0.07592,
+                    'marketValue': 75.92,
+                    'costBasis': 77.8,
+                    'pnl': -1.88,
+                    'pnlPercent': -2.41645,
+                    'entryTimeUtc': '2026-04-03T14:05:00+00:00',
+                    'realizedPnl': 0.0,
+                    'stopLoss': 0.076633,
+                    'profitTarget': 0.079745,
+                    'trailingStop': 0.075466,
+                }
+            ],
+        )
+
+        def override_get_db():
+            local_db = SessionFactory()
+            try:
+                yield local_db
+            finally:
+                local_db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        try:
+            client = TestClient(app)
+            response = client.get('/api/positions/inspect', params={'asset_class': 'crypto', 'symbol': '2Z/USD'})
+        finally:
+            app.dependency_overrides.clear()
+            db.close()
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload['exitPlan']['stopLoss'] == 0.076633
+        assert payload['positionSnapshot']['currentPrice'] == 0.07592
+        assert payload['signalSnapshot']['latestDecisionState'] == 'EXIT_PENDING'
+        assert 'STOP_LOSS_BREACH' in payload['signalSnapshot']['latestDecisionReason']
+        assert payload['latestEvaluation']['state'] == 'EXIT_PENDING'
+        assert 'STOP_LOSS_BREACH' in payload['latestEvaluation']['reason']

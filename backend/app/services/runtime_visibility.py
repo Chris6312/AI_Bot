@@ -237,11 +237,16 @@ class RuntimeVisibilityService:
         finally:
             db.close()
 
-        scope_truth = {
-            scope: dict((snapshot or {}).get('scopeTruth') or {})
-            for scope, snapshot in (monitoring_snapshot or {}).items()
-            if isinstance(snapshot, dict)
-        }
+        scope_truth: dict[str, dict[str, Any]] = {}
+        for scope, snapshot in (monitoring_snapshot or {}).items():
+            if not isinstance(snapshot, dict):
+                continue
+            truth_payload = snapshot.get('scopeTruth') if isinstance(snapshot.get('scopeTruth'), dict) else snapshot
+            normalized_truth = {
+                'state': str((truth_payload or {}).get('state') or 'READY'),
+                'reason': str((truth_payload or {}).get('reason') or ''),
+            }
+            scope_truth[str(scope)] = normalized_truth
         scope_issues = [
             f"{scope}: {truth.get('reason')}"
             for scope, truth in scope_truth.items()

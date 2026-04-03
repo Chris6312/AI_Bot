@@ -319,11 +319,15 @@ function MonitoringTable({ scope, rows, selectedSymbol }: { scope: WatchlistScop
                     <div>
                       <div className="font-medium text-slate-200">Open</div>
                       <div className="text-xs text-slate-500">
-                        {row.positionState.positionExpired
-                          ? 'Expired'
-                          : row.positionState.hoursUntilExpiry != null
-                            ? `${row.positionState.hoursUntilExpiry.toFixed(1)}h left`
-                            : 'Watching'}
+                        {row.monitoringStatus === 'EXIT_PENDING'
+                          ? 'Broker exit working'
+                          : row.monitoringStatus === 'WAITING_FOR_MARKET_OPEN'
+                            ? 'Exit queued for next session'
+                            : row.positionState.positionExpired
+                              ? 'Expired'
+                              : row.positionState.hoursUntilExpiry != null
+                                ? `${row.positionState.hoursUntilExpiry.toFixed(1)}h left`
+                                : 'Watching'}
                       </div>
                     </div>
                   ) : (

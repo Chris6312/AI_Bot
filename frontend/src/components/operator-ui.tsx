@@ -165,6 +165,14 @@ export function getStatusMeta(raw?: string | null): {
     return { canonical: 'blocked', canonicalLabel: 'Blocked', rawLabel: startCase(raw), tone: 'danger' }
   }
 
+  if (normalized.includes('EXIT_PENDING')) {
+    return { canonical: 'pending', canonicalLabel: 'Pending Exit', rawLabel: startCase(raw), tone: 'warn' }
+  }
+
+  if (normalized.includes('WAITING_FOR_MARKET_OPEN')) {
+    return { canonical: 'waiting', canonicalLabel: 'Waiting', rawLabel: startCase(raw), tone: 'warn' }
+  }
+
   if (
     normalized.includes('PAUSED') ||
     normalized.includes('DEGRADED') ||
@@ -204,6 +212,8 @@ const BADGE_TOOLTIP_MAP: Record<string, string> = {
   'blocked': 'Rows due now but blocked by session, data freshness, or control state.',
   '0 protective': 'Open positions currently waiting on protective exit handling.',
   '0 expiring soon': 'Positions nearing their time-stop deadline.',
+  'exit pending': 'A broker sell order is already working for this symbol, so the bot should not submit another exit.',
+  'waiting for market open': 'The stock exit signal is active, but the market is closed so no new sell should be sent yet.',
 }
 
 export function getBadgeTooltip(label?: string | null): string | null {

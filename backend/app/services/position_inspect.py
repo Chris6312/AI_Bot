@@ -15,6 +15,8 @@ from app.models.watchlist_monitor_state import WatchlistMonitorState
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_upload import WatchlistUpload
 from app.services.kraken_service import crypto_ledger, kraken_service
+from app.services.runtime_state import runtime_state
+from app.services.tradier_client import tradier_client
 
 
 @dataclass
@@ -84,11 +86,13 @@ class PositionInspectService:
             )
 
         events = self._load_events(db, intent)
+        broker_exit_orders = self._load_broker_exit_orders(symbol)
         signal_snapshot = {
             'strategy': position.strategy,
             'executionSource': entry_reasoning.get('executionSource') or (intent.execution_source if intent is not None else None),
             'entryReasoning': entry_reasoning,
-            'status': intent.status if intent is not None else None,
+            'status': 'EXIT_PENDING' if broker_exit_orders else (intent.status if intent is not None else None),
+            'brokerExitPending': bool(broker_exit_orders),
         }
         sizing = {
             'accountId': position.account_id,
@@ -132,14 +136,33 @@ class PositionInspectService:
                 'note': 'Legacy stock positions preserve entry reasoning and lifecycle events, but they do not yet store per-timeframe confirmation flags in a normalized shape.',
             },
             'exitPlan': exit_plan,
-            'latestEvaluation': None,
+            'latestEvaluation': {
+                'state': 'EXIT_PENDING' if broker_exit_orders else None,
+                'reason': 'Broker already has an open stock exit order for this symbol.' if broker_exit_orders else None,
+            },
             'lifecycle': events,
             'rawContext': {
                 'entryReasoning': entry_reasoning,
                 'intentContext': intent.context_json if intent is not None else {},
                 'tradeEntryReasoning': trade.entry_reasoning if trade is not None else {},
+                'brokerExitOrders': broker_exit_orders,
             },
         }
+
+    def _load_broker_exit_orders(self, symbol: str) -> list[dict[str, Any]]:
+        mode = getattr(runtime_state.get(), 'stock_mode', 'PAPER')
+        try:
+            return list(
+                tradier_client.get_orders_sync(
+                    mode=mode,
+                    symbol=symbol,
+                    side='SELL',
+                    statuses=['OPEN', 'PENDING', 'SUBMITTED', 'ACCEPTED', 'PARTIALLY_FILLED', 'NEW'],
+                )
+                or []
+            )
+        except Exception:
+            return []
 
     def _build_crypto_payload(self, db: Session, symbol: str) -> dict[str, Any]:
         current_position = self._find_crypto_position(symbol)
@@ -227,6 +250,24 @@ class PositionInspectService:
                 if current_position.get('avgPrice') else None
             )),
         }
+
+        current_price = self._maybe_float(current_position.get('currentPrice'))
+        stop_loss = exit_plan['stopLoss']
+        trailing_stop = exit_plan['trailingStop']
+        protective_reasons: list[str] = []
+        if current_price is not None and stop_loss is not None and current_price <= stop_loss:
+            protective_reasons.append('STOP_LOSS_BREACH')
+        if current_price is not None and trailing_stop is not None and current_price <= trailing_stop:
+            protective_reasons.append('TRAILING_STOP_BREACH')
+        if protective_reasons:
+            protective_reason_text = ', '.join(protective_reasons)
+            signal_snapshot['latestDecisionState'] = 'EXIT_PENDING'
+            signal_snapshot['latestDecisionReason'] = protective_reason_text
+            latest_eval = dict(latest_eval or {})
+            latest_eval['state'] = 'EXIT_PENDING'
+            latest_eval['reason'] = protective_reason_text
+            latest_eval.setdefault('details', {})
+            latest_eval['details'] = {**dict(latest_eval.get('details') or {}), 'protectiveExitReasons': protective_reasons}
         return {
             'assetClass': 'crypto',
             'symbol': symbol,

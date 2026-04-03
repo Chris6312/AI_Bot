@@ -106,6 +106,7 @@ export default function Positions() {
   const [selectedInspect, setSelectedInspect] = useState<PositionInspectRecord | null>(null)
   const [inspectLoading, setInspectLoading] = useState(false)
   const [inspectError, setInspectError] = useState<string | null>(null)
+  const [positionFilter, setPositionFilter] = useState<'all' | 'stock' | 'crypto'>('all')
 
   const { data: unifiedPositions } = useQuery<UnifiedPositionsResponse>({
     queryKey: ['unifiedPositions'],
@@ -175,6 +176,12 @@ export default function Positions() {
       alignedStockCount: unifiedPositions?.summary.alignedStockCount ?? stockRows.filter((row) => row.sourceStatus === 'aligned').length,
     }
   }, [cryptoExitReadiness?.summary.expiringWithinWindowCount, cryptoExitReadiness?.summary.protectiveExitPendingCount, cryptoLedger, stockAccount, stockExitReadiness?.summary.expiringWithinWindowCount, stockExitReadiness?.summary.protectiveExitPendingCount, unifiedPositions])
+
+  const filteredPositions = useMemo(() => {
+    const rows = unifiedPositions?.rows ?? []
+    if (positionFilter === 'all') return rows
+    return rows.filter((row) => row.assetClass === positionFilter)
+  }, [positionFilter, unifiedPositions])
 
   const actionRows = useMemo(() => {
     const rows: ActionRow[] = []
@@ -295,7 +302,9 @@ export default function Positions() {
                 <div className="mt-2">Stocks and crypto now share one operational inventory view. Stock rows still show reconciliation health from broker versus DB mirror, but drift is surfaced as a badge instead of a second competing table.</div>
               </div>
               <UnifiedPositionsTable
-                positions={unifiedPositions?.rows ?? []}
+                positions={filteredPositions}
+                positionFilter={positionFilter}
+                onFilterChange={setPositionFilter}
                 onSelect={(position) => setSelectedInspectTarget({
                   assetClass: position.inspectAssetClass,
                   symbol: position.inspectSymbol,
@@ -430,20 +439,35 @@ function buildActionRow(scope: 'Stocks' | 'Crypto', row: WatchlistSymbolRecord):
 
 function UnifiedPositionsTable({
   positions,
+  positionFilter,
+  onFilterChange,
   onSelect,
 }: {
   positions: UnifiedPositionRow[]
+  positionFilter: 'all' | 'stock' | 'crypto'
+  onFilterChange: (value: 'all' | 'stock' | 'crypto') => void
   onSelect: (position: UnifiedPositionRow) => void
 }) {
-  if (positions.length === 0) {
-    return <EmptyState message="No active positions are open right now." />
-  }
-
   const sorted = [...positions].sort((a, b) => b.marketValue - a.marketValue)
 
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full min-w-[1120px] text-sm">
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        {([['all', 'All'], ['stock', 'Stocks'], ['crypto', 'Crypto']] as const).map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            onClick={() => onFilterChange(value)}
+            className={`rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wide transition ${positionFilter === value ? 'border-cyan-500 bg-cyan-500/15 text-cyan-200' : 'border-slate-700 bg-slate-950/60 text-slate-300 hover:border-cyan-700 hover:text-cyan-200'}`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      {sorted.length === 0 ? <EmptyState message="No active positions match the selected filter." /> : null}
+      {sorted.length > 0 ? (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[1120px] text-sm">
         <thead>
           <tr className="border-b border-slate-800 text-left text-xs uppercase tracking-wide text-slate-500">
             <th className="pb-3 pr-4">Asset</th>
@@ -492,7 +516,9 @@ function UnifiedPositionsTable({
             </tr>
           ))}
         </tbody>
-      </table>
+          </table>
+        </div>
+      ) : null}
     </div>
   )
 }

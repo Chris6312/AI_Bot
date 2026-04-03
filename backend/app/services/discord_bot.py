@@ -133,18 +133,18 @@ class TradingBot(commands.Bot):
         if not self._message_might_contain_structured_payload(message):
             return
 
-        authorization = self._authorize_discord_message(message)
-        if not authorization.authorized:
-            logger.warning('Rejected Discord message before parsing: %s', authorization.reason)
-            await message.add_reaction('⛔')
-            await message.reply(f'Unauthorized decision message: {authorization.reason}')
-            return
-
         envelope = await self._extract_structured_payload(message)
         if envelope.payload is None:
             if envelope.error:
                 await message.add_reaction('❌')
                 await message.reply(envelope.error)
+            return
+
+        authorization = self._authorize_discord_message(message)
+        if not authorization.authorized:
+            logger.warning('Rejected Discord message before parsing: %s', authorization.reason)
+            await message.add_reaction('⛔')
+            await message.reply(f'Unauthorized decision message: {authorization.reason}')
             return
 
         try:

@@ -1,7 +1,9 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, JSON
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, JSON, select
+from sqlalchemy.orm import column_property
 from sqlalchemy.sql import func
 
 from app.core.database import Base
+from app.models.order_intent import OrderIntent
 
 
 class OrderEvent(Base):
@@ -15,3 +17,10 @@ class OrderEvent(Base):
     payload_json = Column(JSON)
     event_time = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    order_intent_id = column_property(
+        select(OrderIntent.id)
+        .where(OrderIntent.intent_id == intent_id)
+        .correlate_except(OrderIntent)
+        .scalar_subquery()
+    )

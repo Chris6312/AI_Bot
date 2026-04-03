@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,9 +26,26 @@ def _coalesce_numeric(payload: dict[str, Any], keys: list[str]) -> float:
     return 0.0
 
 
+def _normalize_to_list(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        return [payload]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
 class TradierClient:
     def __init__(self) -> None:
         self.timeout = max(1.0, float(settings.TRADIER_REQUEST_TIMEOUT_SECONDS))
+        self._cache_ttl_seconds = 15.0
+        self._orders_cache_ttl_seconds = 10.0
+        self._positions_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._positions_snapshot_cache: dict[tuple[str, bool], tuple[float, list[dict[str, Any]]]] = {}
+        self._orders_cache: dict[tuple[str, str, str, tuple[str, ...]], tuple[float, list[dict[str, Any]]]] = {}
+
+
+    @staticmethod
+    def _cache_is_fresh(captured_at: float, ttl_seconds: float) -> bool:
+        return (time.monotonic() - captured_at) <= ttl_seconds
 
     def _credentials_for_mode(self, mode: str | None = None) -> dict[str, str]:
         selected_mode = (mode or "PAPER").upper()
@@ -197,24 +215,41 @@ class TradierClient:
             "raw": payload or {},
         }
 
-    def get_positions_sync(self, mode: str | None = None, *, timeout: float | None = None) -> list[dict[str, Any]]:
+    def get_positions_sync(self, mode: str | None = None, *, timeout: float | None = None, use_cache: bool = True) -> list[dict[str, Any]]:
+        selected_mode = (mode or "PAPER").upper()
+        cache_key = selected_mode
+        cached = self._positions_cache.get(cache_key)
+        if use_cache and cached and self._cache_is_fresh(cached[0], self._cache_ttl_seconds):
+            return [dict(item) for item in cached[1]]
+
         creds = self._credentials_for_mode(mode)
         payload = self._request_json("GET", f"accounts/{creds['account_id']}/positions", mode=mode, timeout=timeout)
         positions = payload.get("positions", {}).get("position", [])
         if isinstance(positions, dict):
-            return [positions]
-        return positions if isinstance(positions, list) else []
+            normalized = [positions]
+        else:
+            normalized = positions if isinstance(positions, list) else []
+        self._positions_cache[cache_key] = (time.monotonic(), [dict(item) for item in normalized if isinstance(item, dict)])
+        return [dict(item) for item in normalized if isinstance(item, dict)]
 
     async def get_positions_async(self, mode: str | None = None) -> list[dict[str, Any]]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.get_positions_sync, mode)
 
-    def get_position_quantity_sync(self, symbol: str, mode: str | None = None) -> int:
+    def get_position_quantity_sync(self, symbol: str, mode: str | None = None, *, timeout: float | None = None, use_cache: bool = True) -> int:
         target = str(symbol or "").upper()
         if not target:
             return 0
 
-        for position in self.get_positions_sync(mode):
+        try:
+            positions = self.get_positions_sync(mode, timeout=timeout, use_cache=use_cache)
+        except TypeError:
+            # Some tests monkeypatch get_positions_sync with a lambda that only
+            # accepts the legacy mode argument. Fall back gracefully so those
+            # call sites continue to work.
+            positions = self.get_positions_sync(mode)
+
+        for position in positions:
             if str(position.get("symbol", "")).upper() != target:
                 continue
             quantity = abs(_coalesce_numeric(position, ["quantity", "qty", "shares", "share_quantity"]))
@@ -224,6 +259,79 @@ class TradierClient:
     async def get_position_quantity_async(self, symbol: str, mode: str | None = None) -> int:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.get_position_quantity_sync, symbol, mode)
+
+    def get_orders_sync(
+        self,
+        mode: str | None = None,
+        *,
+        symbol: str | None = None,
+        side: str | None = None,
+        statuses: list[str] | None = None,
+        timeout: float | None = None,
+        use_cache: bool = True,
+    ) -> list[dict[str, Any]]:
+        selected_mode = (mode or "PAPER").upper()
+        target_symbol = str(symbol or '').upper().strip()
+        target_side = str(side or '').upper().strip()
+        normalized_statuses = tuple(sorted({str(item).upper().strip() for item in (statuses or []) if str(item).strip()}))
+        cache_key = (selected_mode, target_symbol, target_side, normalized_statuses)
+        cached = self._orders_cache.get(cache_key)
+        if use_cache and cached and self._cache_is_fresh(cached[0], self._orders_cache_ttl_seconds):
+            return [dict(item) for item in cached[1]]
+
+        creds = self._credentials_for_mode(mode)
+        payload = self._request_json(
+            "GET",
+            f"accounts/{creds['account_id']}/orders",
+            mode=mode,
+            timeout=timeout,
+        )
+        raw_orders = payload.get("orders", {}).get("order", [])
+        orders = self.normalize_orders_response(raw_orders)
+
+        filtered: list[dict[str, Any]] = []
+        for order in orders:
+            if target_symbol and order.get('symbol') != target_symbol:
+                continue
+            if target_side and order.get('side') != target_side:
+                continue
+            if normalized_statuses and str(order.get('status') or '').upper() not in normalized_statuses:
+                continue
+            filtered.append(order)
+        self._orders_cache[cache_key] = (time.monotonic(), [dict(item) for item in filtered])
+        return [dict(item) for item in filtered]
+
+    async def get_orders_async(
+        self,
+        mode: str | None = None,
+        *,
+        symbol: str | None = None,
+        side: str | None = None,
+        statuses: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self.get_orders_sync(mode, symbol=symbol, side=side, statuses=statuses))
+
+    def normalize_orders_response(self, payload: Any) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for order in _normalize_to_list(payload):
+            status = str(order.get('status') or 'UNKNOWN').upper()
+            requested_quantity = _coalesce_numeric(order, ['quantity', 'qty'])
+            filled_quantity = _coalesce_numeric(order, ['exec_quantity', 'filled_quantity', 'filled_qty'])
+            remaining_quantity = max(requested_quantity - filled_quantity, 0.0)
+            normalized.append({
+                'id': str(order.get('id') or '') or None,
+                'symbol': str(order.get('symbol') or '').upper().strip(),
+                'side': str(order.get('side') or '').upper().strip(),
+                'status': status,
+                'requested_quantity': requested_quantity,
+                'filled_quantity': filled_quantity,
+                'remaining_quantity': remaining_quantity,
+                'avg_fill_price': _coalesce_numeric(order, ['avg_fill_price', 'avg_execution_price', 'avg_price', 'last_fill_price']),
+                'is_open': status not in {'FILLED', 'REJECTED', 'CANCELED', 'CANCELLED', 'ERROR', 'FAILED', 'EXPIRED'},
+                'raw': dict(order),
+            })
+        return normalized
 
     def get_account_snapshot(self, mode: str | None = None) -> dict[str, Any]:
         selected_mode = (mode or "PAPER").upper()
@@ -287,32 +395,44 @@ class TradierClient:
             "raw": balances,
         }
 
-    def get_positions_snapshot(self, mode: str | None = None) -> list[dict[str, Any]]:
+    def get_positions_snapshot(self, mode: str | None = None, *, include_quotes: bool = True, use_cache: bool = True) -> list[dict[str, Any]]:
         selected_mode = (mode or "PAPER").upper()
         if not self.is_ready(selected_mode):
             return []
+
+        cache_key = (selected_mode, bool(include_quotes))
+        cached = self._positions_snapshot_cache.get(cache_key)
+        if use_cache and cached and self._cache_is_fresh(cached[0], self._cache_ttl_seconds):
+            return [dict(item) for item in cached[1]]
 
         try:
             raw_positions = self.get_positions_sync(
                 selected_mode,
                 timeout=max(1.0, float(settings.TRADIER_POSITIONS_TIMEOUT_SECONDS)),
+                use_cache=use_cache,
             )
         except RequestException as exc:
             logger.warning("Tradier positions snapshot failed for %s: %s", selected_mode, exc)
+            if cached:
+                return [dict(item) for item in cached[1]]
             return []
         except Exception as exc:
             logger.warning("Tradier positions snapshot failed for %s: %s", selected_mode, exc)
+            if cached:
+                return [dict(item) for item in cached[1]]
             return []
 
         symbols = [str(position.get("symbol", "")).upper() for position in raw_positions if position.get("symbol")]
-        try:
-            quotes = self.get_quotes_sync(symbols, mode=selected_mode) if symbols else {}
-        except RequestException as exc:
-            logger.warning("Tradier quote refresh failed during positions snapshot for %s: %s", selected_mode, exc)
-            quotes = {}
-        except Exception as exc:
-            logger.warning("Tradier quote refresh failed during positions snapshot for %s: %s", selected_mode, exc)
-            quotes = {}
+        quotes: dict[str, dict[str, Any]] = {}
+        if include_quotes and symbols:
+            try:
+                quotes = self.get_quotes_sync(symbols, mode=selected_mode, timeout=max(1.0, float(settings.TRADIER_POSITIONS_TIMEOUT_SECONDS)))
+            except RequestException as exc:
+                logger.warning("Tradier quote refresh failed during positions snapshot for %s: %s", selected_mode, exc)
+                quotes = {}
+            except Exception as exc:
+                logger.warning("Tradier quote refresh failed during positions snapshot for %s: %s", selected_mode, exc)
+                quotes = {}
 
         positions: list[dict[str, Any]] = []
         for raw_position in raw_positions:
@@ -356,7 +476,8 @@ class TradierClient:
                 }
             )
 
-        return positions
+        self._positions_snapshot_cache[cache_key] = (time.monotonic(), [dict(item) for item in positions])
+        return [dict(item) for item in positions]
 
 
 tradier_client = TradierClient()

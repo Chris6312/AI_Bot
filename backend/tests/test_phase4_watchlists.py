@@ -15,6 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core.config import settings
 from app.core.database import Base, get_db
 from app.main import app
+from app.models.order_event import OrderEvent
 from app.models.order_intent import OrderIntent
 from app.models.position import Position
 from app.models.trade import Trade
@@ -3869,3 +3870,315 @@ def test_unified_positions_endpoint_merges_stock_broker_db_and_crypto_ledger(tmp
         assert rows['TAO/USD']['assetClass'] == 'crypto'
         assert rows['TAO/USD']['sourceStatus'] == 'ledger'
         assert rows['TAO/USD']['inspectAssetClass'] == 'crypto'
+
+
+def test_watchlist_exit_worker_skips_duplicate_exit_when_broker_sell_pending(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=80)
+        position = Position(
+            account_id='paper',
+            ticker='AAPL',
+            shares=289,
+            avg_entry_price=100.0,
+            current_price=110.0,
+            strategy='AI_SCREENING',
+            entry_time=entry_time,
+            entry_reasoning={'intentId': 'intent-entry'},
+            is_open=True,
+            execution_id='intent-entry',
+        )
+        db.add(position)
+        db.commit()
+
+        monkeypatch.setattr(runtime_state, 'get', lambda: SimpleNamespace(running=True, stock_mode='PAPER'))
+        monkeypatch.setattr(
+            'app.services.watchlist_exit_worker.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(
+                session_open=True,
+                to_dict=lambda: {'scope': scope, 'observedAtUtc': observed_at.isoformat(), 'sessionOpen': True},
+            ),
+        )
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+        monkeypatch.setattr(tradier_client, 'get_position_quantity_sync', lambda symbol, mode=None: 289)
+        monkeypatch.setattr(
+            tradier_client,
+            'get_orders_sync',
+            lambda mode=None, symbol=None, side=None, statuses=None, timeout=None: [
+                {
+                    'id': 'ord-pending-1',
+                    'symbol': 'AAPL',
+                    'side': 'SELL',
+                    'status': 'PENDING',
+                    'requested_quantity': 144,
+                    'filled_quantity': 0,
+                    'remaining_quantity': 144,
+                }
+            ],
+        )
+        called = {'count': 0}
+
+        def _never_submit(*args, **kwargs):
+            called['count'] += 1
+            raise AssertionError('place_order_sync should not be called when broker exit is already pending')
+
+        monkeypatch.setattr(tradier_client, 'place_order_sync', _never_submit)
+
+        result = watchlist_exit_worker.run_exit_sweep(db, execute=True, limit=10)
+
+        assert called['count'] == 0
+        assert result['summary']['alreadyInProgressCount'] == 1
+        assert result['rows'][0]['action'] == 'EXIT_ALREADY_IN_PROGRESS'
+        assert result['rows'][0]['reason'] == 'BROKER_EXIT_PENDING'
+        assert result['rows'][0]['monitoringStatus'] == 'EXIT_PENDING'
+        assert result['rows'][0]['brokerReservedQuantity'] == 144
+        assert result['rows'][0]['brokerAvailableQuantity'] == 145
+
+
+
+def test_watchlist_exit_worker_blocks_new_stock_exit_when_market_closed(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=80)
+        position = Position(
+            account_id='paper',
+            ticker='AAPL',
+            shares=10,
+            avg_entry_price=100.0,
+            current_price=110.0,
+            strategy='AI_SCREENING',
+            entry_time=entry_time,
+            entry_reasoning={'intentId': 'intent-entry'},
+            is_open=True,
+            execution_id='intent-entry',
+        )
+        db.add(position)
+        db.commit()
+
+        monkeypatch.setattr(runtime_state, 'get', lambda: SimpleNamespace(running=True, stock_mode='PAPER'))
+        monkeypatch.setattr(
+            'app.services.watchlist_exit_worker.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(
+                session_open=False,
+                to_dict=lambda: {'scope': scope, 'observedAtUtc': observed_at.isoformat(), 'sessionOpen': False},
+            ),
+        )
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+        monkeypatch.setattr(tradier_client, 'get_position_quantity_sync', lambda symbol, mode=None: 10)
+        monkeypatch.setattr(tradier_client, 'get_orders_sync', lambda mode=None, symbol=None, side=None, statuses=None, timeout=None: [])
+        monkeypatch.setattr(tradier_client, 'place_order_sync', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('should not submit when market is closed')))
+
+        result = watchlist_exit_worker.run_exit_sweep(db, execute=True, limit=10)
+
+        assert result['summary']['blockedCount'] == 1
+        assert result['rows'][0]['action'] == 'BLOCKED'
+        assert result['rows'][0]['reason'] == 'STOCK_SESSION_CLOSED'
+        assert result['rows'][0]['monitoringStatus'] == 'WAITING_FOR_MARKET_OPEN'
+
+
+
+def test_watchlist_exit_worker_uses_broker_available_quantity_not_db_fallback(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=80)
+        position = Position(
+            account_id='paper',
+            ticker='AAPL',
+            shares=289,
+            avg_entry_price=100.0,
+            current_price=110.0,
+            strategy='AI_SCREENING',
+            entry_time=entry_time,
+            entry_reasoning={'intentId': 'intent-entry'},
+            is_open=True,
+            execution_id='intent-entry',
+        )
+        db.add(position)
+        db.commit()
+
+        monkeypatch.setattr(runtime_state, 'get', lambda: SimpleNamespace(running=True, stock_mode='PAPER'))
+        monkeypatch.setattr(
+            'app.services.watchlist_exit_worker.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(
+                session_open=True,
+                to_dict=lambda: {'scope': scope, 'observedAtUtc': observed_at.isoformat(), 'sessionOpen': True},
+            ),
+        )
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+        monkeypatch.setattr(tradier_client, 'get_position_quantity_sync', lambda symbol, mode=None: 289)
+        monkeypatch.setattr(
+            tradier_client,
+            'get_orders_sync',
+            lambda mode=None, symbol=None, side=None, statuses=None, timeout=None: [
+                {
+                    'id': 'ord-pending-1',
+                    'symbol': 'AAPL',
+                    'side': 'SELL',
+                    'status': 'PENDING',
+                    'requested_quantity': 288,
+                    'filled_quantity': 0,
+                    'remaining_quantity': 288,
+                }
+            ],
+        )
+        monkeypatch.setattr(tradier_client, 'place_order_sync', lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('should not submit when broker available quantity is fully reserved by pending exits')))
+
+        result = watchlist_exit_worker.run_exit_sweep(db, execute=True, limit=10)
+
+        assert result['rows'][0]['action'] == 'EXIT_ALREADY_IN_PROGRESS'
+        assert result['rows'][0]['brokerQuantity'] == 289
+        assert result['rows'][0]['brokerReservedQuantity'] == 288
+        assert result['rows'][0]['brokerAvailableQuantity'] == 1
+        assert result['rows'][0]['requestedQuantity'] == 1 or 'requestedQuantity' not in result['rows'][0]
+
+
+
+def test_watchlist_exit_worker_reconciles_open_orders_after_oversell_rejection(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+        entry_time = datetime.now(UTC) - timedelta(hours=80)
+        position = Position(
+            account_id='paper',
+            ticker='AAPL',
+            shares=289,
+            avg_entry_price=100.0,
+            current_price=110.0,
+            strategy='AI_SCREENING',
+            entry_time=entry_time,
+            entry_reasoning={'intentId': 'intent-entry'},
+            is_open=True,
+            execution_id='intent-entry',
+        )
+        db.add(position)
+        db.flush()
+        db.add(
+            Trade(
+                trade_id='trade-exit-reconcile',
+                account_id='paper',
+                ticker='AAPL',
+                direction='LONG',
+                strategy='AI_SCREENING',
+                entry_time=entry_time,
+                entry_price=100.0,
+                shares=289,
+                entry_cost=28900.0,
+                entry_reasoning={'intentId': 'intent-entry'},
+                execution_id='intent-entry',
+                entry_order_id='entry-order',
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(runtime_state, 'get', lambda: SimpleNamespace(running=True, stock_mode='PAPER'))
+        monkeypatch.setattr(
+            'app.services.watchlist_exit_worker.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(
+                session_open=True,
+                to_dict=lambda: {'scope': scope, 'observedAtUtc': observed_at.isoformat(), 'sessionOpen': True},
+            ),
+        )
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+        monkeypatch.setattr(tradier_client, 'get_position_quantity_sync', lambda symbol, mode=None: 289)
+        call_state = {'orders_call': 0}
+
+        def _get_orders(mode=None, symbol=None, side=None, statuses=None, timeout=None):
+            call_state['orders_call'] += 1
+            if call_state['orders_call'] == 1:
+                return []
+            return [
+                {
+                    'id': 'ord-pending-after-reject',
+                    'symbol': 'AAPL',
+                    'side': 'SELL',
+                    'status': 'PENDING',
+                    'requested_quantity': 289,
+                    'filled_quantity': 0,
+                    'remaining_quantity': 289,
+                }
+            ]
+
+        monkeypatch.setattr(tradier_client, 'get_orders_sync', _get_orders)
+        monkeypatch.setattr(tradier_client, 'place_order_sync', lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError('Sell order is for more shares than your current long position')))
+
+        result = watchlist_exit_worker.run_exit_sweep(db, execute=True, limit=10)
+        intent = db.query(OrderIntent).filter(OrderIntent.execution_source == 'WATCHLIST_EXIT_WORKER').one()
+        event = db.query(OrderEvent).filter(OrderEvent.order_intent_id == intent.id).order_by(OrderEvent.id.desc()).first()
+
+        assert result['rows'][0]['action'] == 'EXIT_ALREADY_IN_PROGRESS'
+        assert result['rows'][0]['reason'] == 'BROKER_EXIT_PENDING_AFTER_REJECTION'
+        assert result['rows'][0]['monitoringStatus'] == 'EXIT_PENDING'
+        assert isinstance(result['rows'][0]['reconciliation'], dict)
+        assert result['rows'][0]['reconciliation']['pendingOrders'][0]['id'] == 'ord-pending-after-reject'
+        assert event is not None
+        assert isinstance(event.payload_json, dict)
+        assert event.payload_json['brokerState']['pendingOrders'][0]['id'] == 'ord-pending-after-reject'
+
+
+def test_crypto_explicit_ledger_stop_loss_overrides_config_and_sets_protective_exit_pending(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['exit_template'] = 'first_failed_follow_through'
+        payload['bot_payload']['symbols'][0]['max_hold_hours'] = 48
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        avg_price = 100.0
+        explicit_stop_loss = 105.0
+        current_price = 104.5
+        entry_time = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0)
+
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda: [{
+                'pair': 'BTC/USD',
+                'ohlcvPair': 'XBTUSD',
+                'amount': 0.5,
+                'avgPrice': avg_price,
+                'currentPrice': current_price,
+                'marketValue': 0.5 * current_price,
+                'costBasis': 0.5 * avg_price,
+                'pnl': 0.5 * (current_price - avg_price),
+                'pnlPercent': ((current_price / avg_price) - 1.0) * 100.0,
+                'realizedPnl': 0.0,
+                'entryTimeUtc': entry_time.isoformat(),
+                'stopLoss': explicit_stop_loss,
+            }],
+        )
+
+        readiness = watchlist_service.get_exit_readiness_snapshot(db, scope='crypto_only', expiring_within_hours=24)
+        state = readiness['rows'][0]['positionState']
+
+        assert state['stopLoss'] == explicit_stop_loss
+        assert state['currentPrice'] == current_price
+        assert state['stopLossBreached'] is True
+        assert state['protectiveExitPending'] is True
+        assert 'STOP_LOSS_BREACH' in state['protectiveExitReasons']
