@@ -227,7 +227,8 @@ class PreTradeGateService:
                     'price': validation.get('price'),
                 }
             ],
-            'vix': (decision_context or {}).get('vix', 0),
+            'vix': (decision_context or {}).get('vix'),
+            'enforce_vix': bool(selected_mode == 'LIVE'),
             'require_market_hours': bool(selected_mode == 'LIVE'),
             'marketSessionOpen': session_open_hint,
         }
@@ -435,7 +436,7 @@ class PreTradeGateService:
                     'price': validation.get('price'),
                 }
             ],
-            'vix': (decision_context or {}).get('vix', 0),
+            'vix': (decision_context or {}).get('vix'),
         }
         safety_result = await self.safety.validate(
             safety_payload,

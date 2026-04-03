@@ -26,6 +26,9 @@ from app.models.watchlist_upload import WatchlistUpload
 from app.services.control_plane import discord_decision_guard
 from app.services.kraken_service import CryptoPaperLedger, KrakenPairMetadata, crypto_ledger, kraken_service
 from app.services.market_sessions import calculate_next_scope_evaluation_at, get_scope_session_status
+from app.services.trade_validator import trade_validator
+from app.services.position_sizer import position_sizer
+from app.services.pre_trade_gate import pre_trade_gate
 from app.services.tradier_client import tradier_client
 from app.services.runtime_state import runtime_state
 from app.services.template_evaluator import (
@@ -3402,9 +3405,15 @@ def test_due_run_skips_watchlist_entry_when_open_position_exists(tmp_path, monke
 
         monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
         monitor_row.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+        expected_account_id = str(
+            tradier_client._credentials_for_mode(runtime_state.get().stock_mode).get('account_id')
+            or runtime_state.get().stock_mode
+            or 'TRADIER'
+        ).strip()
+
         db.add(
             Position(
-                account_id='paper-watchlist',
+                account_id=expected_account_id,
                 ticker='AAPL',
                 shares=10,
                 avg_entry_price=100.0,
@@ -4431,3 +4440,380 @@ def test_monitoring_snapshot_without_active_upload_returns_empty_rows(tmp_path) 
         assert snapshot['activeUploadId'] is None
         assert snapshot['summary']['total'] == 0
         assert snapshot['rows'] == []
+
+
+def test_entry_position_guard_is_scoped_to_account_id(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        db.add(
+            Position(
+                account_id='live-account',
+                ticker='AAPL',
+                shares=1,
+                avg_entry_price=100.0,
+                current_price=101.0,
+                strategy='TEST',
+                entry_time=datetime.now(UTC),
+                is_open=True,
+            )
+        )
+        db.commit()
+
+        assert watchlist_monitoring_orchestrator._has_open_position(db, 'AAPL', account_id='live-account') is True
+        assert watchlist_monitoring_orchestrator._has_open_position(db, 'AAPL', account_id='paper-account') is False
+
+
+
+def test_active_entry_intent_guard_is_scoped_to_account_id_and_mode(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        db.add_all(
+            [
+                OrderIntent(
+                    intent_id='intent_live_aapl',
+                    account_id='live-account',
+                    asset_class='stock',
+                    symbol='AAPL',
+                    side='BUY',
+                    requested_quantity=1,
+                    requested_price=100.0,
+                    filled_quantity=0.0,
+                    status='SUBMISSION_PENDING',
+                    execution_source='WATCHLIST_MONITOR_ENTRY',
+                    context_json={'mode': 'LIVE'},
+                ),
+                OrderIntent(
+                    intent_id='intent_paper_aapl',
+                    account_id='paper-account',
+                    asset_class='stock',
+                    symbol='AAPL',
+                    side='BUY',
+                    requested_quantity=1,
+                    requested_price=100.0,
+                    filled_quantity=0.0,
+                    status='SUBMITTED',
+                    execution_source='WATCHLIST_MONITOR_ENTRY',
+                    context_json={'mode': 'PAPER'},
+                ),
+            ]
+        )
+        db.commit()
+
+        assert watchlist_monitoring_orchestrator._has_active_entry_intent(
+            db,
+            'AAPL',
+            asset_class='stock',
+            account_id='paper-account',
+            mode='PAPER',
+        ) is True
+        assert watchlist_monitoring_orchestrator._has_active_entry_intent(
+            db,
+            'AAPL',
+            asset_class='stock',
+            account_id='live-account',
+            mode='LIVE',
+        ) is True
+        assert watchlist_monitoring_orchestrator._has_active_entry_intent(
+            db,
+            'AAPL',
+            asset_class='stock',
+            account_id='paper-account',
+            mode='LIVE',
+        ) is False
+
+
+
+def test_stock_entry_timeout_marks_submission_pending_and_blocks_reentry(tmp_path, monkeypatch) -> None:
+    from requests.exceptions import RequestException
+
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monitor_state = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+        symbol_row = db.query(WatchlistSymbol).filter(WatchlistSymbol.symbol == 'AAPL').one()
+        monitor_state.decision_context_json = {
+            'latestEvaluation': {
+                'details': {
+                    'currentPrice': 100.0,
+                }
+            }
+        }
+        monitor_state.latest_decision_state = ENTRY_CANDIDATE
+        db.commit()
+
+        monkeypatch.setattr(tradier_client, 'get_account_snapshot', lambda mode=None: {'accountId': 'paper-account', 'cash': 10000.0})
+        monkeypatch.setattr(
+            position_sizer,
+            'calculate_stock_positions',
+            lambda symbols, cash_available, prices=None: [
+                {
+                    'ticker': 'AAPL',
+                    'shares': 2,
+                    'estimated_value': 200.0,
+                    'position_pct': 0.02,
+                }
+            ],
+        )
+        monkeypatch.setattr(
+            pre_trade_gate,
+            'evaluate_stock_order_sync',
+            lambda **kwargs: SimpleNamespace(allowed=True, rejection_reason=None, to_dict=lambda: {'allowed': True}),
+        )
+        monkeypatch.setattr(tradier_client, 'place_order_sync', lambda *args, **kwargs: (_ for _ in ()).throw(RequestException('network timeout')))
+
+        result = watchlist_monitoring_orchestrator._submit_stock_entry_candidate(
+            db,
+            monitor_state=monitor_state,
+            symbol_row=symbol_row,
+            mode='PAPER',
+            account_cache={},
+        )
+
+        db.refresh(monitor_state)
+        intent = db.query(OrderIntent).filter(OrderIntent.symbol == 'AAPL').one()
+        event = db.query(OrderEvent).filter(OrderEvent.intent_id == intent.intent_id, OrderEvent.event_type == 'ORDER_SUBMISSION_UNCERTAIN').one()
+
+        assert result['action'] == 'SUBMISSION_PENDING'
+        assert result['reason'] == 'BROKER_SUBMIT_ACK_UNCERTAIN'
+        assert intent.status == 'SUBMISSION_PENDING'
+        assert event.status == 'SUBMISSION_PENDING'
+        assert watchlist_monitoring_orchestrator._has_active_entry_intent(
+            db,
+            'AAPL',
+            asset_class='stock',
+            account_id='paper-account',
+            mode='PAPER',
+        ) is True
+        assert monitor_state.latest_decision_state == 'SUBMISSION_PENDING'
+        assert monitor_state.decision_context_json['entryExecution']['action'] == 'SUBMISSION_PENDING'
+
+
+def test_stock_session_status_recognizes_good_friday_closure() -> None:
+    observed_at = datetime(2026, 4, 3, 15, 0, tzinfo=UTC)
+    status = get_scope_session_status('stocks_only', observed_at)
+
+    assert status.session_open is False
+    assert 'Good Friday' in status.reason
+
+
+def test_stock_session_status_recognizes_black_friday_early_close() -> None:
+    observed_at = datetime(2026, 11, 27, 18, 30, tzinfo=UTC)
+    status = get_scope_session_status('stocks_only', observed_at)
+
+    assert status.session_open is False
+    assert 'early close' in status.reason.lower()
+    assert status.session_close_et is not None
+    assert status.session_close_et.hour == 13
+    assert status.session_close_et.minute == 0
+
+
+def test_trade_validator_blocks_live_stock_trade_on_market_holiday(monkeypatch) -> None:
+    holiday_now = datetime(2026, 4, 3, 15, 0, tzinfo=UTC)
+
+    class FrozenDateTime:
+        @staticmethod
+        def now(tz=None):
+            if tz is None:
+                return holiday_now.replace(tzinfo=None)
+            return holiday_now.astimezone(tz)
+
+    monkeypatch.setattr('app.services.trade_validator.datetime', FrozenDateTime)
+
+    called = {'quote': False}
+
+    def _quote(*args, **kwargs):
+        called['quote'] = True
+        return {'last': 100.0, 'volume': 1_000_000, 'bid': 99.5, 'ask': 100.5}
+
+    monkeypatch.setattr(tradier_client, 'get_quote_sync', _quote)
+
+    result = trade_validator.validate_stock_trade_with_quote('AAPL', 1, mode='LIVE')
+
+    assert result['valid'] is False
+    assert 'Good Friday' in result['reason']
+    assert called['quote'] is False
+
+
+def test_crypto_paper_ledger_positions_use_snapshot_when_state_mutates_mid_read(monkeypatch) -> None:
+    ledger = CryptoPaperLedger(starting_balance=1000.0)
+    ledger.positions = {
+        'BTC/USD': {'amount': Decimal('1'), 'total_cost': Decimal('100')},
+    }
+    ledger.trades = [
+        {
+            'id': 'paper_1',
+            'timestamp': datetime.now(UTC).isoformat(),
+            'pair': 'BTC/USD',
+            'side': 'BUY',
+            'amount': 1.0,
+            'price': 100.0,
+            'total': 100.0,
+        }
+    ]
+
+    monkeypatch.setattr(ledger.kraken, 'get_prices', lambda pairs: {'BTC/USD': 110.0, 'ETH/USD': 55.0})
+    monkeypatch.setattr(ledger.kraken, 'resolve_pair', lambda pair: None)
+    monkeypatch.setattr(ledger.kraken, 'get_ohlcv_pair', lambda pair: pair.replace('/', ''))
+
+    original_resolver = ledger._resolve_position_ohlcv_pair
+    mutated = {'done': False}
+
+    def _mutating_resolver(pair: str):
+        if not mutated['done']:
+            mutated['done'] = True
+            ledger.positions['ETH/USD'] = {'amount': Decimal('2'), 'total_cost': Decimal('80')}
+        return original_resolver(pair)
+
+    monkeypatch.setattr(ledger, '_resolve_position_ohlcv_pair', _mutating_resolver)
+
+    positions = ledger.get_positions()
+
+    assert len(positions) == 1
+    assert positions[0]['pair'] == 'BTC/USD'
+    assert ledger.positions['ETH/USD']['amount'] == Decimal('2')
+
+
+
+def test_due_run_reserves_cash_between_stock_candidates(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = payload['bot_payload']['symbols'][:2]
+        payload['ui_payload']['summary']['selected_count'] = 2
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL', 'MSFT']
+        payload['ui_payload']['symbol_context'] = {
+            'AAPL': payload['ui_payload']['symbol_context']['AAPL'],
+            'MSFT': payload['ui_payload']['symbol_context']['MSFT'],
+        }
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        rows = (
+            db.query(WatchlistMonitorState, WatchlistSymbol)
+            .join(WatchlistSymbol, WatchlistSymbol.id == WatchlistMonitorState.watchlist_symbol_id)
+            .filter(WatchlistMonitorState.scope == 'stocks_only')
+            .order_by(WatchlistSymbol.priority_rank.asc(), WatchlistSymbol.id.asc())
+            .all()
+        )
+
+        for monitor_state, _symbol_row in rows:
+            monitor_state.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+            monitor_state.latest_decision_state = ENTRY_CANDIDATE
+            monitor_state.decision_context_json = {
+                'latestEvaluation': {
+                    'details': {
+                        'currentPrice': 100.0,
+                    }
+                }
+            }
+        db.commit()
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_account_snapshot',
+            lambda mode=None: {
+                'mode': (mode or 'PAPER').upper(),
+                'connected': True,
+                'accountId': 'paper-watchlist',
+                'cash': 150.0,
+                'buyingPower': 150.0,
+                'portfolioValue': 150.0,
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 100.0,
+                'prevclose': 100.0,
+                'open': 100.0,
+                'volume': 2_500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+
+        size_inputs: list[float] = []
+
+        def fake_calculate_stock_positions(candidates, account_equity, prices=None):
+            size_inputs.append(float(account_equity))
+            ticker = candidates[0]['ticker']
+            if account_equity >= 100.0:
+                return [{
+                    'ticker': ticker,
+                    'shares': 1,
+                    'estimated_value': 100.0,
+                    'position_pct': 0.5,
+                    'source': 'calculated',
+                }]
+            return []
+
+        monkeypatch.setattr(position_sizer, 'calculate_stock_positions', fake_calculate_stock_positions)
+        monkeypatch.setattr(
+            pre_trade_gate,
+            'evaluate_stock_order_sync',
+            lambda **kwargs: SimpleNamespace(
+                allowed=True,
+                rejection_reason='',
+                to_dict=lambda: {},
+                market_data={},
+                risk_data={},
+            ),
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'place_order_sync',
+            lambda ticker, qty, side, mode=None, order_type='market', duration='day': {
+                'order': {'id': f'watch-{ticker}', 'status': 'open', 'quantity': qty},
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_order_sync',
+            lambda order_id, mode=None: {
+                'order': {
+                    'id': order_id,
+                    'status': 'filled',
+                    'quantity': 1,
+                    'exec_quantity': 1,
+                    'avg_fill_price': 100.0,
+                }
+            },
+        )
+
+        account_cache = {
+            'loaded': False,
+            'account': None,
+            'cashAvailable': 0.0,
+            'remainingCash': 0.0,
+            'reservedCash': 0.0,
+            'error': None,
+        }
+
+        first_result = watchlist_monitoring_orchestrator._submit_stock_entry_candidate(
+            db,
+            monitor_state=rows[0][0],
+            symbol_row=rows[0][1],
+            mode='PAPER',
+            account_cache=account_cache,
+        )
+        second_result = watchlist_monitoring_orchestrator._submit_stock_entry_candidate(
+            db,
+            monitor_state=rows[1][0],
+            symbol_row=rows[1][1],
+            mode='PAPER',
+            account_cache=account_cache,
+        )
+
+        assert size_inputs[:2] == [150.0, 50.0]
+        assert first_result['action'] == 'ENTRY_FILLED'
+        assert second_result['action'] == 'SKIPPED'
+        assert second_result['reason'] == 'POSITION_SIZER_RETURNED_ZERO'
+        assert account_cache['reservedCash'] == 100.0
+        assert account_cache['remainingCash'] == 50.0
+

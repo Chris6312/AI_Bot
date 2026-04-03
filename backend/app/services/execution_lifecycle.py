@@ -168,6 +168,28 @@ class ExecutionLifecycleService:
         db.flush()
         return event
 
+    def mark_submission_uncertain(
+        self,
+        db: Session,
+        intent: OrderIntent,
+        *,
+        reason: str,
+        payload: dict[str, Any] | None = None,
+    ) -> OrderIntent:
+        intent.status = 'SUBMISSION_PENDING'
+        intent.rejection_reason = None
+        self.record_event(
+            db,
+            intent,
+            event_type='ORDER_SUBMISSION_UNCERTAIN',
+            status='SUBMISSION_PENDING',
+            message=reason,
+            payload=payload or {},
+        )
+        db.commit()
+        db.refresh(intent)
+        return intent
+
     def record_submission(self, db: Session, intent: OrderIntent, order_snapshot: dict[str, Any]) -> OrderIntent:
         normalized = self.normalize_order_snapshot(order_snapshot)
         intent.status = 'SUBMITTED'
@@ -398,11 +420,13 @@ class ExecutionLifecycleService:
             position.unrealized_pnl = 0.0
             position.unrealized_pnl_pct = 0.0
         else:
-            unrealized = (exit_price - float(position.avg_entry_price or 0.0)) * remaining_shares
+            avg_entry_price = max(float(position.avg_entry_price or 0.0), 0.0)
+            unrealized = (exit_price - avg_entry_price) * remaining_shares
             position.unrealized_pnl = unrealized
+            cost_basis_remaining = avg_entry_price * remaining_shares
             position.unrealized_pnl_pct = (
-                (unrealized / (float(position.avg_entry_price or 0.0) * remaining_shares) * 100.0)
-                if position.avg_entry_price and remaining_shares > 0
+                (unrealized / cost_basis_remaining * 100.0)
+                if cost_basis_remaining > 0
                 else 0.0
             )
 

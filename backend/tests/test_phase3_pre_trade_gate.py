@@ -13,6 +13,7 @@ from app.core.database import Base, get_db
 from app.main import app
 from app.services.kraken_service import KrakenPairMetadata
 from app.services.pre_trade_gate import PreTradeGateDecision, pre_trade_gate
+from app.services.safety_validator import safety_validator
 
 UTC = timezone.utc
 
@@ -213,3 +214,23 @@ def test_crypto_route_returns_gate_rejection(monkeypatch, tmp_path) -> None:
 
         settings.ADMIN_API_TOKEN = original_token
         app.dependency_overrides.clear()
+
+
+def test_safety_validator_rejects_missing_vix_for_live_stock(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        result = safety_validator.validate_sync(
+            {
+                'candidates': [{'ticker': 'AAPL', 'shares': 5, 'estimated_value': 500.0, 'price': 100.0}],
+                'vix': None,
+                'enforce_vix': True,
+                'require_market_hours': False,
+            },
+            {'accountId': 'live-1', 'cash': 10000.0, 'buyingPower': 10000.0, 'portfolioValue': 10000.0},
+            db,
+            account_id='live-1',
+            asset_class='stock',
+        )
+
+        assert result['safe'] is False
+        assert 'vix unavailable' in result['reason'].lower()

@@ -5,7 +5,6 @@ Handles all position size calculations independent of AI prompts.
 
 import logging
 from typing import Dict, List, Tuple, Optional
-from decimal import Decimal
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -13,19 +12,32 @@ logger = logging.getLogger(__name__)
 
 class PositionSizer:
     """Calculate position sizes for stocks and crypto based on global settings"""
-    
+
     def __init__(self):
         self.global_pct = settings.POSITION_SIZE_PCT
         self.fixed_amount = settings.POSITION_SIZE_FIXED
         self.max_positions = settings.MAX_POSITIONS_PER_DECISION
         self.min_position = settings.MIN_POSITION_USD
         self.max_position_pct = settings.MAX_POSITION_PCT
+
+    @staticmethod
+    def _safe_float(value: object) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if result != result or result in (float('inf'), float('-inf')):
+            return 0.0
+        return result
     
     def calculate_stock_positions(
         self,
         candidates: List[Dict],
         account_equity: float,
-        prices: Optional[Dict[str, float]] = None
+        prices: Optional[Dict[str, float]] = None,
+        *,
+        current_open_positions: int = 0,
+        current_symbol_exposure: Optional[Dict[str, float]] = None,
     ) -> List[Dict]:
         """
         Calculate position sizes for stock candidates.
@@ -49,7 +61,24 @@ class PositionSizer:
                 f"Using first {self.max_positions}."
             )
             candidates = candidates[:self.max_positions]
-        
+
+        current_open_positions = max(int(current_open_positions or 0), 0)
+        available_slots = max(self.max_positions - current_open_positions, 0)
+        if available_slots <= 0:
+            logger.warning("No stock position slots available (%s already open, max %s)", current_open_positions, self.max_positions)
+            return []
+        if len(candidates) > available_slots:
+            logger.warning(
+                "Stock sizing limited to %s candidate(s) because %s position slot(s) are already in use",
+                available_slots,
+                current_open_positions,
+            )
+            candidates = candidates[:available_slots]
+
+        symbol_exposure = {
+            str(symbol).upper(): self._safe_float(value)
+            for symbol, value in (current_symbol_exposure or {}).items()
+        }
         positions = []
         
         for candidate in candidates:
@@ -87,12 +116,15 @@ class PositionSizer:
                 continue
             
             max_position_value = account_equity * self.max_position_pct
-            if position_value > max_position_value:
+            remaining_symbol_capacity = max(max_position_value - symbol_exposure.get(str(ticker).upper(), 0.0), 0.0)
+            if remaining_symbol_capacity <= 0:
+                logger.warning("%s: Existing exposure already consumes max position cap. Skipping.", ticker)
+                continue
+            if position_value > remaining_symbol_capacity:
                 logger.warning(
-                    f"{ticker}: Position too large (${position_value:.2f} > ${max_position_value:.2f}). "
-                    f"Capping at {self.max_position_pct*100:.0f}%"
+                    f"{ticker}: Position capped by remaining symbol exposure (${position_value:.2f} > ${remaining_symbol_capacity:.2f})."
                 )
-                position_value = max_position_value
+                position_value = remaining_symbol_capacity
             
             # Calculate shares if price provided
             shares = None
@@ -115,7 +147,10 @@ class PositionSizer:
         self,
         candidates: List[Dict],
         available_balance: float,
-        prices: Optional[Dict[str, float]] = None
+        prices: Optional[Dict[str, float]] = None,
+        *,
+        current_open_positions: int = 0,
+        current_symbol_exposure: Optional[Dict[str, float]] = None,
     ) -> List[Dict]:
         """
         Calculate position sizes for crypto candidates.
@@ -139,7 +174,24 @@ class PositionSizer:
                 f"Using first {self.max_positions}."
             )
             candidates = candidates[:self.max_positions]
-        
+
+        current_open_positions = max(int(current_open_positions or 0), 0)
+        available_slots = max(self.max_positions - current_open_positions, 0)
+        if available_slots <= 0:
+            logger.warning("No crypto position slots available (%s already open, max %s)", current_open_positions, self.max_positions)
+            return []
+        if len(candidates) > available_slots:
+            logger.warning(
+                "Crypto sizing limited to %s candidate(s) because %s position slot(s) are already in use",
+                available_slots,
+                current_open_positions,
+            )
+            candidates = candidates[:available_slots]
+
+        symbol_exposure = {
+            str(symbol).upper(): self._safe_float(value)
+            for symbol, value in (current_symbol_exposure or {}).items()
+        }
         positions = []
         
         for candidate in candidates:
@@ -177,12 +229,15 @@ class PositionSizer:
                 continue
             
             max_position_value = available_balance * self.max_position_pct
-            if position_value > max_position_value:
+            remaining_symbol_capacity = max(max_position_value - symbol_exposure.get(str(pair).upper(), 0.0), 0.0)
+            if remaining_symbol_capacity <= 0:
+                logger.warning("%s: Existing exposure already consumes max position cap. Skipping.", pair)
+                continue
+            if position_value > remaining_symbol_capacity:
                 logger.warning(
-                    f"{pair}: Position too large (${position_value:.2f} > ${max_position_value:.2f}). "
-                    f"Capping at {self.max_position_pct*100:.0f}%"
+                    f"{pair}: Position capped by remaining symbol exposure (${position_value:.2f} > ${remaining_symbol_capacity:.2f})."
                 )
-                position_value = max_position_value
+                position_value = remaining_symbol_capacity
             
             # Calculate crypto amount if price provided
             crypto_amount = None

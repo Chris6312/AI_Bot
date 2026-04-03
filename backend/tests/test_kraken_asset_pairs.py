@@ -68,3 +68,24 @@ def test_get_supported_pairs_builds_dynamic_assetpairs_map(monkeypatch) -> None:
     assert pairs['CHZ/USD'] == 'CHZUSD'
     assert pairs['SHIB/USD'] == 'SHIBUSD'
     assert pairs['OP/USD'] == 'OPUSD'
+
+
+
+def test_resolve_pair_negative_cache_suppresses_repeat_refresh(monkeypatch) -> None:
+    service = KrakenAPIService()
+    calls = {'count': 0}
+
+    def fake_api(endpoint, params=None):
+        if endpoint == 'AssetPairs':
+            calls['count'] += 1
+            return ASSET_PAIRS_RESULT
+        return None
+
+    monkeypatch.setattr(service, '_api_call', fake_api)
+
+    service.get_supported_pairs()
+    assert calls['count'] == 1
+
+    assert service.resolve_pair('NOTREAL/USD') is None
+    assert service.resolve_pair('NOTREAL/USD') is None
+    assert calls['count'] == 2

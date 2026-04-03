@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, time as dt_time
+from datetime import UTC, datetime, time as dt_time
 from typing import Any, Dict
 from zoneinfo import ZoneInfo
 
@@ -49,9 +49,11 @@ class SafetyValidator:
         if len(candidates) > settings.SAFETY_MAX_TRADES_PER_DAY:
             return self._fail(f"Too many trades in decision ({len(candidates)})")
 
+        today_utc = datetime.now(UTC).date()
+
         trades_today = db.query(Trade).filter(
             Trade.account_id == account_id,
-            func.date(Trade.entry_time) == datetime.utcnow().date(),
+            func.date(Trade.entry_time) == today_utc,
         ).count()
         if trades_today >= settings.SAFETY_MAX_TRADES_PER_DAY:
             return self._fail(
@@ -60,12 +62,21 @@ class SafetyValidator:
 
         daily_pnl = db.query(func.sum(Trade.net_pnl)).filter(
             Trade.account_id == account_id,
-            func.date(Trade.entry_time) == datetime.utcnow().date(),
+            func.date(Trade.entry_time) == today_utc,
         ).scalar() or 0.0
         if daily_pnl <= -settings.SAFETY_MAX_DAILY_LOSS:
             return self._fail(f"Daily loss limit hit (${daily_pnl:.2f})")
 
-        vix = float(decision.get('vix', 0) or 0)
+        enforce_vix = bool(decision.get('enforce_vix', False))
+        raw_vix = decision.get('vix')
+        if asset_class == 'stock' and enforce_vix and raw_vix in (None, ''):
+            return self._fail('VIX unavailable during stock safety validation')
+        try:
+            vix = float(raw_vix) if raw_vix not in (None, '') else 0.0
+        except (TypeError, ValueError):
+            if asset_class == 'stock' and enforce_vix:
+                return self._fail('VIX unavailable during stock safety validation')
+            vix = 0.0
         if vix > settings.SAFETY_VIX_MAX:
             return self._fail(f"VIX too high ({vix:.1f} > {settings.SAFETY_VIX_MAX})")
 
@@ -120,3 +131,5 @@ class SafetyValidator:
         if now_et.weekday() >= 5:
             return False
         return market_open <= now_et.time() <= market_close
+
+safety_validator = SafetyValidator()

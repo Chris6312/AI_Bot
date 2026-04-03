@@ -5,11 +5,12 @@ Validates trades before execution to catch AI/screening errors
 from __future__ import annotations
 
 import logging
-from datetime import datetime, time, timezone
+from datetime import UTC, datetime, timezone
 from typing import Any, Dict, List, Tuple
 from zoneinfo import ZoneInfo
 
 from app.services.kraken_service import kraken_service
+from app.services.market_sessions import get_scope_session_status
 from app.services.tradier_client import tradier_client
 
 logger = logging.getLogger(__name__)
@@ -176,11 +177,9 @@ class TradeValidator:
 
         selected_mode = (mode or "PAPER").upper()
         if selected_mode == "LIVE":
-            now_et = datetime.now(ET)
-            if now_et.weekday() >= 5:
-                return self._result(False, "❌ Market closed (weekend)")
-            if not (time(9, 30) <= now_et.time() <= time(16, 0)):
-                return self._result(False, "❌ Market closed (only paper trading allowed)")
+            session_status = get_scope_session_status("stocks_only", datetime.now(UTC))
+            if not session_status.session_open:
+                return self._result(False, f"❌ Market closed: {session_status.reason}")
 
         try:
             quote_payload = quote or self.tradier.get_quote_sync(ticker, selected_mode)

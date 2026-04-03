@@ -33,11 +33,31 @@ def _normalize_to_list(payload: Any) -> list[dict[str, Any]]:
         return [item for item in payload if isinstance(item, dict)]
     return []
 
+
+def _extract_collection(payload: Any, *path: str) -> list[dict[str, Any]]:
+    current = payload
+    for key in path:
+        if current in (None, ''):
+            return []
+        if isinstance(current, dict):
+            current = current.get(key)
+            continue
+        if isinstance(current, list):
+            if len(current) == 1 and isinstance(current[0], dict):
+                current = current[0].get(key)
+                continue
+            return _normalize_to_list(current)
+        return []
+    return _normalize_to_list(current)
+
 class TradierClient:
     def __init__(self) -> None:
         self.timeout = max(1.0, float(settings.TRADIER_REQUEST_TIMEOUT_SECONDS))
         self._cache_ttl_seconds = 15.0
         self._orders_cache_ttl_seconds = 10.0
+        self._max_positions_cache_entries = 8
+        self._max_positions_snapshot_cache_entries = 8
+        self._max_orders_cache_entries = 32
         self._positions_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._positions_snapshot_cache: dict[tuple[str, bool], tuple[float, list[dict[str, Any]]]] = {}
         self._orders_cache: dict[tuple[str, str, str, tuple[str, ...]], tuple[float, list[dict[str, Any]]]] = {}
@@ -46,6 +66,18 @@ class TradierClient:
     @staticmethod
     def _cache_is_fresh(captured_at: float, ttl_seconds: float) -> bool:
         return (time.monotonic() - captured_at) <= ttl_seconds
+
+    @staticmethod
+    def _prune_cache(cache: dict[Any, tuple[float, Any]], *, ttl_seconds: float, max_entries: int) -> None:
+        now = time.monotonic()
+        stale_keys = [key for key, (captured_at, _value) in cache.items() if (now - captured_at) > ttl_seconds]
+        for key in stale_keys:
+            cache.pop(key, None)
+        overflow = len(cache) - max_entries
+        if overflow > 0:
+            oldest_keys = sorted(cache.items(), key=lambda item: item[1][0])[:overflow]
+            for key, _value in oldest_keys:
+                cache.pop(key, None)
 
     def _credentials_for_mode(self, mode: str | None = None) -> dict[str, str]:
         selected_mode = (mode or "PAPER").upper()
@@ -116,9 +148,7 @@ class TradierClient:
             params={"symbols": ",".join(unique_symbols)},
             timeout=timeout,
         )
-        raw_quotes = payload.get("quotes", {}).get("quote", [])
-        if isinstance(raw_quotes, dict):
-            raw_quotes = [raw_quotes]
+        raw_quotes = _extract_collection(payload, 'quotes', 'quote')
 
         fetched_at = datetime.now(timezone.utc).isoformat()
         normalized_quotes: dict[str, dict[str, Any]] = {}
@@ -224,12 +254,9 @@ class TradierClient:
 
         creds = self._credentials_for_mode(mode)
         payload = self._request_json("GET", f"accounts/{creds['account_id']}/positions", mode=mode, timeout=timeout)
-        positions = payload.get("positions", {}).get("position", [])
-        if isinstance(positions, dict):
-            normalized = [positions]
-        else:
-            normalized = positions if isinstance(positions, list) else []
+        normalized = _extract_collection(payload, 'positions', 'position')
         self._positions_cache[cache_key] = (time.monotonic(), [dict(item) for item in normalized if isinstance(item, dict)])
+        self._prune_cache(self._positions_cache, ttl_seconds=self._cache_ttl_seconds, max_entries=self._max_positions_cache_entries)
         return [dict(item) for item in normalized if isinstance(item, dict)]
 
     async def get_positions_async(self, mode: str | None = None) -> list[dict[str, Any]]:
@@ -286,7 +313,7 @@ class TradierClient:
             mode=mode,
             timeout=timeout,
         )
-        raw_orders = payload.get("orders", {}).get("order", [])
+        raw_orders = _extract_collection(payload, 'orders', 'order')
         orders = self.normalize_orders_response(raw_orders)
 
         filtered: list[dict[str, Any]] = []
@@ -299,6 +326,7 @@ class TradierClient:
                 continue
             filtered.append(order)
         self._orders_cache[cache_key] = (time.monotonic(), [dict(item) for item in filtered])
+        self._prune_cache(self._orders_cache, ttl_seconds=self._orders_cache_ttl_seconds, max_entries=self._max_orders_cache_entries)
         return [dict(item) for item in filtered]
 
     async def get_orders_async(
@@ -434,6 +462,12 @@ class TradierClient:
                 logger.warning("Tradier quote refresh failed during positions snapshot for %s: %s", selected_mode, exc)
                 quotes = {}
 
+        cached_by_symbol = {
+            str(item.get('symbol') or '').upper(): dict(item)
+            for item in (cached[1] if cached else [])
+            if isinstance(item, dict) and item.get('symbol')
+        }
+
         positions: list[dict[str, Any]] = []
         for raw_position in raw_positions:
             symbol = str(raw_position.get("symbol", "")).upper()
@@ -460,8 +494,14 @@ class TradierClient:
                 quote,
                 ["last", "last_extended_hours_trade", "close", "bid", "ask"],
             )
-            market_value = current_price * quantity if current_price else 0.0
-            pnl = market_value - total_cost if market_value else 0.0
+            if current_price <= 0:
+                cached_snapshot = cached_by_symbol.get(symbol, {})
+                current_price = _coalesce_numeric(cached_snapshot, ['currentPrice', 'avgPrice'])
+            if current_price <= 0:
+                current_price = avg_price
+
+            market_value = current_price * quantity if current_price > 0 else total_cost
+            pnl = market_value - total_cost
             pnl_percent = (pnl / total_cost * 100.0) if total_cost else 0.0
 
             positions.append(
@@ -477,6 +517,7 @@ class TradierClient:
             )
 
         self._positions_snapshot_cache[cache_key] = (time.monotonic(), [dict(item) for item in positions])
+        self._prune_cache(self._positions_snapshot_cache, ttl_seconds=self._cache_ttl_seconds, max_entries=self._max_positions_snapshot_cache_entries)
         return [dict(item) for item in positions]
 
 

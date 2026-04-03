@@ -41,6 +41,16 @@ class CryptoAnalyzer:
         self.macd_signal = 9
         self.bb_period = 20
         self.bb_std = 2
+
+    @staticmethod
+    def _safe_float(value: object) -> float | None:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        if result != result or result in (float('inf'), float('-inf')):
+            return None
+        return result
     
     def _get_candles_df(self, pair: str, interval: int = 5, limit: int = 100) -> Optional[pd.DataFrame]:
         """
@@ -67,8 +77,10 @@ class CryptoAnalyzer:
 
         df = pd.DataFrame(candles)
         numeric_columns = ['open', 'high', 'low', 'close', 'volume']
-        df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric)
-        return df
+        for column in numeric_columns:
+            df[column] = pd.to_numeric(df[column], errors='coerce')
+        df = df.dropna(subset=numeric_columns)
+        return df if len(df) >= 20 else None
 
     def calculate_rsi(
         self,
@@ -295,7 +307,9 @@ class CryptoAnalyzer:
         if not ticker or 'c' not in ticker:
             return None
 
-        current_price = float(ticker['c'][0])
+        current_price = self._safe_float((ticker.get('c') or [None])[0])
+        if current_price is None:
+            return None
 
         if df is None:
             df = self._get_candles_df(pair, interval=5, limit=288)

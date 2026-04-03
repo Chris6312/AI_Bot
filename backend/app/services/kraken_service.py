@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
+from threading import RLock
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
@@ -89,6 +90,8 @@ class KrakenAPIService:
         self._display_pair_map: dict[str, KrakenPairMetadata] = {}
         self._asset_pairs_loaded_at: datetime | None = None
         self._pair_lock = Lock()
+        self._unresolved_pair_cache: dict[str, datetime] = {}
+        self.unresolved_pair_ttl_seconds = 5 * 60
 
     @staticmethod
     def _normalize_pair_alias(value: str | None) -> str:
@@ -253,6 +256,15 @@ class KrakenAPIService:
             logger.info('Loaded %s Kraken asset pairs into resolver cache.', len(self._display_pair_map))
             return {display: metadata.rest_pair for display, metadata in self._display_pair_map.items()}
 
+    def _is_unresolved_pair_cached(self, normalized: str) -> bool:
+        cached_at = self._unresolved_pair_cache.get(normalized)
+        if cached_at is None:
+            return False
+        if datetime.now(UTC) - cached_at <= timedelta(seconds=self.unresolved_pair_ttl_seconds):
+            return True
+        self._unresolved_pair_cache.pop(normalized, None)
+        return False
+
     def resolve_pair(self, pair: str, *, force_refresh: bool = False) -> KrakenPairMetadata | None:
         if not self._display_pair_map:
             self.refresh_asset_pairs(force=force_refresh)
@@ -262,12 +274,20 @@ class KrakenAPIService:
         normalized = self._normalize_pair_alias(pair)
         metadata = self._pair_alias_map.get(normalized)
         if metadata is not None:
+            self._unresolved_pair_cache.pop(normalized, None)
             return metadata
+
+        if not force_refresh and self._is_unresolved_pair_cached(normalized):
+            return None
 
         if not force_refresh:
             self.refresh_asset_pairs(force=True)
-            return self._pair_alias_map.get(normalized)
+            metadata = self._pair_alias_map.get(normalized)
+            if metadata is not None:
+                self._unresolved_pair_cache.pop(normalized, None)
+                return metadata
 
+        self._unresolved_pair_cache[normalized] = datetime.now(UTC)
         return None
 
     def get_supported_pairs(self, *, force_refresh: bool = False) -> dict[str, str]:
@@ -427,6 +447,7 @@ class CryptoPaperLedger:
         self.trades: List[Dict] = []
         self.positions: Dict[str, Dict] = {}
         self.kraken = KrakenAPIService()
+        self._ledger_lock = RLock()
 
     def execute_trade(
         self,
@@ -447,45 +468,48 @@ class CryptoPaperLedger:
         price_dec = Decimal(str(price))
         total = amount_dec * price_dec
 
-        if side == 'BUY':
-            if total > self.balance:
-                return {
-                    'status': 'REJECTED',
-                    'reason': f'Insufficient balance: ${self.balance:.2f} < ${total:.2f}',
-                }
-            self.balance -= total
-            if pair not in self.positions:
-                self.positions[pair] = {'amount': Decimal('0'), 'total_cost': Decimal('0')}
-            self.positions[pair]['amount'] += amount_dec
-            self.positions[pair]['total_cost'] += total
-        elif side == 'SELL':
-            if pair not in self.positions or self.positions[pair]['amount'] < amount_dec:
-                return {'status': 'REJECTED', 'reason': f'Insufficient {pair} position'}
+        with self._ledger_lock:
+            if side == 'BUY':
+                if total > self.balance:
+                    return {
+                        'status': 'REJECTED',
+                        'reason': f'Insufficient balance: ${self.balance:.2f} < ${total:.2f}',
+                    }
+                self.balance -= total
+                if pair not in self.positions:
+                    self.positions[pair] = {'amount': Decimal('0'), 'total_cost': Decimal('0')}
+                self.positions[pair]['amount'] += amount_dec
+                self.positions[pair]['total_cost'] += total
+            elif side == 'SELL':
+                if pair not in self.positions or self.positions[pair]['amount'] < amount_dec:
+                    return {'status': 'REJECTED', 'reason': f'Insufficient {pair} position'}
 
-            self.balance += total
-            self.positions[pair]['amount'] -= amount_dec
-            if self.positions[pair]['amount'] > 0:
-                ratio = amount_dec / (self.positions[pair]['amount'] + amount_dec)
-                self.positions[pair]['total_cost'] -= self.positions[pair]['total_cost'] * ratio
+                self.balance += total
+                self.positions[pair]['amount'] -= amount_dec
+                if self.positions[pair]['amount'] > 0:
+                    ratio = amount_dec / (self.positions[pair]['amount'] + amount_dec)
+                    self.positions[pair]['total_cost'] -= self.positions[pair]['total_cost'] * ratio
+                else:
+                    self.positions[pair]['total_cost'] = Decimal('0')
+                if self.positions[pair]['amount'] == 0:
+                    del self.positions[pair]
             else:
-                self.positions[pair]['total_cost'] = Decimal('0')
-            if self.positions[pair]['amount'] == 0:
-                del self.positions[pair]
+                return {'status': 'REJECTED', 'reason': f'Unsupported side: {side}'}
 
-        trade = {
-            'id': f'paper_{len(self.trades) + 1}',
-            'timestamp': datetime.now(UTC).isoformat(),
-            'market': 'CRYPTO',
-            'pair': pair,
-            'ohlcvPair': ohlcv_pair,
-            'side': side,
-            'amount': float(amount_dec),
-            'price': float(price_dec),
-            'total': float(total),
-            'status': 'FILLED',
-            'balance': float(self.balance),
-        }
-        self.trades.append(trade)
+            trade = {
+                'id': f'paper_{len(self.trades) + 1}',
+                'timestamp': datetime.now(UTC).isoformat(),
+                'market': 'CRYPTO',
+                'pair': pair,
+                'ohlcvPair': ohlcv_pair,
+                'side': side,
+                'amount': float(amount_dec),
+                'price': float(price_dec),
+                'total': float(total),
+                'status': 'FILLED',
+                'balance': float(self.balance),
+            }
+            self.trades.append(trade)
 
         discord_notifications.send_trade_alert(
             asset_class='crypto',
@@ -504,7 +528,22 @@ class CryptoPaperLedger:
         logger.info('Paper trade executed: %s %s %s @ $%.2f', side, amount, pair, price)
         return trade
 
-    def _build_position_analytics(self) -> dict[str, Any]:
+
+    def _snapshot_state(self) -> tuple[Decimal, Decimal, list[dict[str, Any]], dict[str, dict[str, Decimal | str | None]]]:
+        with self._ledger_lock:
+            balance = Decimal(str(self.balance))
+            starting_balance = Decimal(str(self.starting_balance))
+            trades = [dict(trade) for trade in self.trades]
+            positions = {
+                pair: {
+                    key: (Decimal(str(value)) if isinstance(value, Decimal) else value)
+                    for key, value in position.items()
+                }
+                for pair, position in self.positions.items()
+            }
+        return balance, starting_balance, trades, positions
+
+    def _build_position_analytics(self, trades: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         analytics: dict[str, Any] = {
             'entry_times': {},
             'realized_pnl_by_pair': {},
@@ -512,7 +551,9 @@ class CryptoPaperLedger:
         }
         running_positions: dict[str, dict[str, Decimal | str | None]] = {}
 
-        for trade in self.trades:
+        trade_rows = trades if trades is not None else self._snapshot_state()[2]
+
+        for trade in trade_rows:
             pair = str(trade.get('pair') or '').strip()
             if not pair:
                 continue
@@ -611,7 +652,8 @@ class CryptoPaperLedger:
     def get_positions(self) -> List[Dict]:
         """Get current positions with P&L and paper-equity context."""
         positions = []
-        if not self.positions:
+        balance, starting_balance, trades_snapshot, positions_snapshot = self._snapshot_state()
+        if not positions_snapshot:
             return positions
 
         # Build reverse mapping: internal_key → display_pair (e.g. 'TAOUSD' → 'TAO/USD')
@@ -619,13 +661,13 @@ class CryptoPaperLedger:
         raw_pair_mappings: dict[str, str] = getattr(self, 'pair_mappings', {}) or {}
         reverse_pair_map: dict[str, str] = {v: k for k, v in raw_pair_mappings.items()}
 
-        pairs_to_check = list(self.positions.keys())
+        pairs_to_check = list(positions_snapshot.keys())
         ohlcv_pairs = [self._resolve_position_ohlcv_pair(pair) for pair in pairs_to_check]
         ohlcv_pairs = [pair for pair in ohlcv_pairs if pair]
         prices = self.kraken.get_prices(ohlcv_pairs)
-        analytics = self._build_position_analytics()
+        analytics = self._build_position_analytics(trades_snapshot)
 
-        for pair, pos in self.positions.items():
+        for pair, pos in positions_snapshot.items():
             ohlcv_pair = self._resolve_position_ohlcv_pair(pair)
             current_price = self._get_price_for_pair(pair, prices, ohlcv_pair)
 
@@ -680,25 +722,26 @@ class CryptoPaperLedger:
 
     def get_ledger(self) -> Dict:
         """Get full ledger including balance, market value, equity, and P&L."""
+        balance_snapshot, starting_balance_snapshot, trades_snapshot, _ = self._snapshot_state()
         positions = self.get_positions()
         market_value = round(sum(float(position.get('marketValue') or 0.0) for position in positions), 8)
         total_pnl = round(sum(float(position.get('pnl') or 0.0) for position in positions), 8)
-        analytics = self._build_position_analytics()
+        analytics = self._build_position_analytics(trades_snapshot)
         realized_pnl = round(float(analytics.get('realized_pnl_total') or 0.0), 8)
-        equity = round(float(self.balance) + market_value, 8)
-        net_pnl = round(equity - float(self.starting_balance), 8)
-        return_pct = round((net_pnl / float(self.starting_balance)) * 100, 8) if float(self.starting_balance) > 0 else 0.0
+        equity = round(float(balance_snapshot) + market_value, 8)
+        net_pnl = round(equity - float(starting_balance_snapshot), 8)
+        return_pct = round((net_pnl / float(starting_balance_snapshot)) * 100, 8) if float(starting_balance_snapshot) > 0 else 0.0
 
         return {
-            'balance': float(self.balance),
-            'startingBalance': float(self.starting_balance),
+            'balance': float(balance_snapshot),
+            'startingBalance': float(starting_balance_snapshot),
             'marketValue': market_value,
             'equity': equity,
             'totalPnL': total_pnl,
             'realizedPnL': realized_pnl,
             'netPnL': net_pnl,
             'returnPct': return_pct,
-            'trades': self.trades,
+            'trades': trades_snapshot,
             'positions': positions,
         }
 

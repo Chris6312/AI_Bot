@@ -1005,7 +1005,7 @@ class WatchlistExitWorkerService:
                 entry_time = entry_time.replace(tzinfo=UTC)
             hours_since_entry = None
             if entry_time is not None:
-                hours_since_entry = (datetime.now(UTC) - entry_time).total_seconds() / 3600.0
+                hours_since_entry = max((datetime.now(UTC) - entry_time).total_seconds(), 0.0) / 3600.0
             avg_entry_price = float(position.avg_entry_price or 0.0)
             max_hold_hours = int(watchlist_row.max_hold_hours) if watchlist_row is not None and watchlist_row.max_hold_hours is not None else None
             follow_through_window_hours = watchlist_service._resolve_follow_through_window_hours(max_hold_hours)
@@ -1089,7 +1089,7 @@ class WatchlistExitWorkerService:
             shares = int(position.shares or 0)
             if avg_entry_price > 0 and shares > 0:
                 unrealized_pnl = round((current_price - avg_entry_price) * shares, 4)
-                unrealized_pnl_pct = round(((current_price / avg_entry_price) - 1.0) * 100.0, 4)
+                unrealized_pnl_pct = round((unrealized_pnl / (avg_entry_price * shares)) * 100.0, 4) if avg_entry_price > 0 and shares > 0 else 0.0
                 if float(position.unrealized_pnl or 0.0) != unrealized_pnl:
                     position.unrealized_pnl = unrealized_pnl
                     changed = True
