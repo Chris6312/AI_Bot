@@ -1998,10 +1998,14 @@ class WatchlistService:
     def _serialize_symbol_row(row: WatchlistSymbol, monitor_state: WatchlistMonitorState | None = None) -> dict[str, Any]:
         monitoring_payload = None
         if monitor_state is not None:
+            decision_context = monitor_state.decision_context_json or {}
+            reentry_blocked_until = decision_context.get('reentryBlockedUntilUtc')
             monitoring_payload = {
                 'latestDecisionState': monitor_state.latest_decision_state,
                 'latestDecisionReason': monitor_state.latest_decision_reason,
-                'decisionContext': monitor_state.decision_context_json or {},
+                'decisionContext': decision_context,
+                'reentryBlockedUntilUtc': reentry_blocked_until,
+                'cooldownActive': bool(reentry_blocked_until),
                 'requiredTimeframes': monitor_state.required_timeframes_json or [],
                 'evaluationIntervalSeconds': monitor_state.evaluation_interval_seconds,
                 'lastDecisionAtUtc': monitor_state.last_decision_at_utc.isoformat() if monitor_state.last_decision_at_utc else None,

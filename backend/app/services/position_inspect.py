@@ -33,7 +33,7 @@ class PositionInspectService:
         if normalized_asset == 'stock':
             return self._build_stock_payload(db, normalized_symbol)
         if normalized_asset == 'crypto':
-            return self._build_crypto_payload(db, normalized_symbol)
+            return self._build_crypto_or_cooldown_payload(db, normalized_symbol)
         raise PositionInspectNotFound(f'Unsupported asset class: {asset_class}')
         
     def _create_reconciliation_event(
@@ -308,6 +308,110 @@ class PositionInspectService:
                 'watchlist': {
                     'uploadId': watch_symbol.upload_id if watch_symbol is not None else watchlist_context.get('uploadId'),
                     'scope': watch_symbol.scope if watch_symbol is not None else watchlist_context.get('scope') or 'crypto_only',
+                    'symbolAliases': sorted(aliases),
+                },
+                'monitorContext': base_monitor_context,
+            },
+        }
+
+    def _build_crypto_or_cooldown_payload(self, db: Session, symbol: str) -> dict[str, Any]:
+        current_position = self._find_crypto_position(symbol)
+        if current_position is not None:
+            return self._build_crypto_payload(db, symbol)
+        return self._build_crypto_cooldown_payload(db, symbol)
+
+    def _build_crypto_cooldown_payload(self, db: Session, symbol: str) -> dict[str, Any]:
+        aliases = self._crypto_symbol_aliases(symbol)
+        watch_symbol = self._find_crypto_watch_symbol(db, aliases)
+        monitor_state = self._find_crypto_monitor_state(db, aliases, watch_symbol)
+        if monitor_state is None:
+            raise PositionInspectNotFound(f'No open crypto position found for {symbol}.')
+
+        upload = None
+        if watch_symbol is not None:
+            upload = db.query(WatchlistUpload).filter(WatchlistUpload.upload_id == watch_symbol.upload_id).first()
+        base_monitor_context = dict(monitor_state.decision_context_json or {}) if isinstance(monitor_state.decision_context_json, dict) else {}
+        exit_execution = dict(base_monitor_context.get('exitExecution') or {})
+        latest_eval = {
+            'state': monitor_state.latest_decision_state,
+            'reason': monitor_state.latest_decision_reason,
+            'details': {
+                'cooldownActive': True,
+                'reentryBlockedUntilUtc': base_monitor_context.get('reentryBlockedUntilUtc'),
+                'lastExitAtUtc': base_monitor_context.get('lastExitAtUtc'),
+            },
+        }
+        configured_timeframes = list(
+            (watch_symbol.bot_timeframes if watch_symbol is not None else None)
+            or (monitor_state.required_timeframes_json if monitor_state is not None else None)
+            or (base_monitor_context.get('botTimeframes') if isinstance(base_monitor_context.get('botTimeframes'), list) else None)
+            or []
+        )
+        timeframe_items = [{'timeframe': timeframe, 'status': 'configured', 'reason': 'Watchlist requires this timeframe.'} for timeframe in configured_timeframes]
+        return {
+            'assetClass': 'crypto',
+            'symbol': symbol,
+            'displaySymbol': (exit_execution.get('displayPair') or (watch_symbol.symbol if watch_symbol is not None else symbol)),
+            'inspectSource': 'watchlist_monitor_state',
+            'positionSnapshot': {
+                'accountId': 'paper-crypto-ledger',
+                'quantityLabel': 'Amount',
+                'quantity': 0.0,
+                'avgEntryPrice': None,
+                'currentPrice': None,
+                'marketValue': 0.0,
+                'costBasis': 0.0,
+                'unrealizedPnl': 0.0,
+                'unrealizedPnlPct': 0.0,
+                'realizedPnl': None,
+                'entryTimeUtc': None,
+                'isOpen': False,
+            },
+            'signalSnapshot': {
+                'marketRegime': upload.market_regime if upload is not None else None,
+                'tradeDirection': watch_symbol.trade_direction if watch_symbol is not None else base_monitor_context.get('tradeDirection'),
+                'bias': watch_symbol.bias if watch_symbol is not None else base_monitor_context.get('bias'),
+                'setupTemplate': watch_symbol.setup_template if watch_symbol is not None else base_monitor_context.get('setupTemplate'),
+                'priorityRank': watch_symbol.priority_rank if watch_symbol is not None else None,
+                'tier': watch_symbol.tier if watch_symbol is not None else base_monitor_context.get('tier'),
+                'riskFlags': watch_symbol.risk_flags if watch_symbol is not None else base_monitor_context.get('riskFlags') or [],
+                'latestDecisionState': monitor_state.latest_decision_state,
+                'latestDecisionReason': monitor_state.latest_decision_reason,
+                'lastExitAtUtc': base_monitor_context.get('lastExitAtUtc'),
+                'lastExitReason': base_monitor_context.get('lastExitReason'),
+                'reentryBlockedUntilUtc': base_monitor_context.get('reentryBlockedUntilUtc'),
+                'cooldownActive': True,
+                'details': latest_eval['details'],
+            },
+            'sizing': {
+                'accountId': 'paper-crypto-ledger',
+                'requestedQuantity': 0.0,
+                'filledQuantity': float(exit_execution.get('filledQuantity') or 0.0),
+                'requestedPrice': None,
+                'avgFillPrice': self._maybe_float(exit_execution.get('filledPrice')),
+                'displayPair': watch_symbol.symbol if watch_symbol is not None else symbol,
+                'ohlcvPair': base_monitor_context.get('ohlcvPair'),
+            },
+            'timeframeAlignment': {
+                'mode': 'single_timeframe_monitor',
+                'configured': configured_timeframes,
+                'confirmed': [],
+                'items': timeframe_items,
+                'note': 'The symbol is flat and in post-exit cooldown. Timeframes remain attached to the watchlist context.',
+            },
+            'exitPlan': {
+                'template': watch_symbol.exit_template if watch_symbol is not None else base_monitor_context.get('exitTemplate'),
+                'maxHoldHours': watch_symbol.max_hold_hours if watch_symbol is not None else base_monitor_context.get('maxHoldHours'),
+                'stopLoss': None,
+                'profitTarget': None,
+                'trailingStop': None,
+            },
+            'latestEvaluation': latest_eval,
+            'lifecycle': [],
+            'rawContext': {
+                'watchlist': {
+                    'uploadId': watch_symbol.upload_id if watch_symbol is not None else None,
+                    'scope': watch_symbol.scope if watch_symbol is not None else 'crypto_only',
                     'symbolAliases': sorted(aliases),
                 },
                 'monitorContext': base_monitor_context,

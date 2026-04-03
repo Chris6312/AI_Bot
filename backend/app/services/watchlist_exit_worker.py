@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.order_intent import OrderIntent
+from app.models.watchlist_monitor_state import WatchlistMonitorState
+from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.position import Position
 from app.models.trade import Trade
 from app.models.watchlist_symbol import WatchlistSymbol
@@ -630,6 +632,88 @@ class WatchlistExitWorkerService:
         except Exception:
             return None
 
+    @staticmethod
+    def _calculate_reentry_blocked_until(
+        *,
+        reference_time: datetime,
+        evaluation_interval_seconds: int | None,
+    ) -> datetime:
+        interval = int(evaluation_interval_seconds or 0)
+        if interval <= 0:
+            return reference_time + timedelta(minutes=15)
+        return reference_time + timedelta(seconds=max(interval, 60))
+
+    def _finalize_crypto_exit_monitor_state(
+        self,
+        db: Session,
+        *,
+        pair: str,
+        candidate: dict[str, Any],
+        event_time: datetime,
+        exit_intent: OrderIntent,
+    ) -> None:
+        aliases = self._crypto_symbol_aliases(pair)
+        watch_symbol = (
+            db.query(WatchlistSymbol)
+            .filter(
+                WatchlistSymbol.scope == 'crypto_only',
+                WatchlistSymbol.symbol.in_(sorted(aliases)),
+            )
+            .order_by(WatchlistSymbol.updated_at.desc(), WatchlistSymbol.created_at.desc(), WatchlistSymbol.id.desc())
+            .first()
+        )
+        query = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.scope == 'crypto_only')
+        if watch_symbol is not None:
+            query = query.filter(WatchlistMonitorState.watchlist_symbol_id == watch_symbol.id)
+        else:
+            query = query.filter(WatchlistMonitorState.symbol.in_(sorted(aliases)))
+        monitor_state = query.order_by(WatchlistMonitorState.updated_at.desc(), WatchlistMonitorState.id.desc()).first()
+        if monitor_state is None:
+            return
+
+        blocked_until = self._calculate_reentry_blocked_until(
+            reference_time=event_time,
+            evaluation_interval_seconds=monitor_state.evaluation_interval_seconds,
+        )
+        context = dict(monitor_state.decision_context_json or {})
+        context['lastExitAtUtc'] = event_time.isoformat()
+        context['lastClosedPositionAtUtc'] = event_time.isoformat()
+        context['lastExitReason'] = candidate.get('reason') or candidate.get('exitTrigger') or EXIT_TRIGGER
+        context['reentryBlockedUntilUtc'] = blocked_until.isoformat()
+        context['cooldownActive'] = True
+        context['exitExecution'] = {
+            'action': 'EXIT_FILLED',
+            'reason': candidate.get('reason') or 'CRYPTO_LEDGER_EXIT_FILLED',
+            'intentId': exit_intent.intent_id,
+            'submittedOrderId': exit_intent.submitted_order_id,
+            'tradeId': candidate.get('tradeId'),
+            'filledPrice': candidate.get('exitPrice'),
+            'filledQuantity': candidate.get('closedAmount'),
+            'notional': round(float(candidate.get('closedAmount') or 0.0) * float(candidate.get('exitPrice') or 0.0), 8),
+            'executedAtUtc': event_time.isoformat(),
+            'source': 'CRYPTO_PAPER_LEDGER',
+            'displayPair': pair,
+        }
+        context['entryExecution'] = {
+            'action': 'EXIT_FILLED',
+            'reason': candidate.get('reason') or 'CRYPTO_LEDGER_EXIT_FILLED',
+            'intentId': exit_intent.intent_id,
+            'submittedOrderId': exit_intent.submitted_order_id,
+            'tradeId': candidate.get('tradeId'),
+            'reentryBlockedUntilUtc': blocked_until.isoformat(),
+            'recordedAtUtc': event_time.isoformat(),
+        }
+        monitor_state.decision_context_json = context
+        monitor_state.latest_decision_state = 'EXIT_FILLED'
+        monitor_state.latest_decision_reason = context['lastExitReason']
+        monitor_state.last_decision_at_utc = event_time
+        monitor_state.last_evaluated_at_utc = event_time
+        monitor_state.next_evaluation_at_utc = blocked_until
+        if monitor_state.monitoring_status not in {'ACTIVE', 'MANAGED_ONLY'}:
+            monitor_state.monitoring_status = 'ACTIVE'
+        db.add(monitor_state)
+        db.flush()
+
     def _submit_crypto_exit(self, db: Session, candidate: dict[str, Any]) -> dict[str, Any]:
         pair = str(candidate.get('ledgerPair') or candidate.get('displaySymbol') or candidate.get('symbol') or '').upper().strip()
         if not pair:
@@ -722,6 +806,13 @@ class WatchlistExitWorkerService:
                 message=f'Confirmed crypto exit fill for {pair}: {amount} filled',
                 payload=trade,
                 event_time=event_time,
+            )
+            self._finalize_crypto_exit_monitor_state(
+                db,
+                pair=pair,
+                candidate={**candidate, 'tradeId': trade.get('id')},
+                event_time=event_time,
+                exit_intent=exit_intent,
             )
             db.commit()
             db.refresh(exit_intent)

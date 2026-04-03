@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -16,6 +16,9 @@ from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_upload import WatchlistUpload
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.kraken_service import crypto_ledger
+from app.services.position_inspect import position_inspect_service
+from app.services.watchlist_service import watchlist_service
+from tests.test_phase4_watchlists import build_crypto_payload
 
 
 @contextmanager
@@ -497,3 +500,39 @@ def test_crypto_position_inspect_surfaces_protective_exit_pending_when_stop_loss
         assert 'STOP_LOSS_BREACH' in payload['signalSnapshot']['latestDecisionReason']
         assert payload['latestEvaluation']['state'] == 'EXIT_PENDING'
         assert 'STOP_LOSS_BREACH' in payload['latestEvaluation']['reason']
+
+
+def test_crypto_inspect_returns_cooldown_payload_after_exit(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'BTC').one()
+        monitor_row.latest_decision_state = 'EXIT_FILLED'
+        monitor_row.latest_decision_reason = 'CRYPTO_LEDGER_EXIT_FILLED'
+        monitor_row.decision_context_json = {
+            **dict(monitor_row.decision_context_json or {}),
+            'lastExitAtUtc': datetime.now(UTC).isoformat(),
+            'lastExitReason': 'CRYPTO_LEDGER_EXIT_FILLED',
+            'reentryBlockedUntilUtc': (datetime.now(UTC) + timedelta(minutes=15)).isoformat(),
+            'cooldownActive': True,
+            'exitExecution': {
+                'action': 'EXIT_FILLED',
+                'filledQuantity': 1.25,
+                'filledPrice': 70000.0,
+                'displayPair': 'BTC/USD',
+            },
+        }
+        db.commit()
+
+        payload = position_inspect_service.get_inspect_payload(db, asset_class='crypto', symbol='BTC')
+        assert payload['positionSnapshot']['isOpen'] is False
+        assert payload['signalSnapshot']['latestDecisionState'] == 'EXIT_FILLED'
+        assert payload['signalSnapshot']['cooldownActive'] is True
+        assert payload['signalSnapshot']['reentryBlockedUntilUtc']
+        assert payload['latestEvaluation']['details']['cooldownActive'] is True

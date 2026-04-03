@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.models.order_intent import OrderIntent
 from app.services.control_plane import ensure_execution_armed, require_admin_token
 from app.services.kraken_service import crypto_ledger, kraken_service
 from app.services.pre_trade_gate import pre_trade_gate
@@ -33,9 +34,43 @@ async def get_crypto_positions():
 
 
 @router.get("/history")
-async def get_crypto_history(limit: int = Query(50, ge=1, le=500)):
-    """Get crypto trade history (paper)"""
+async def get_crypto_history(
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """Get crypto trade history with DB-backed persistence for watchlist fills."""
     try:
+        intents = (
+            db.query(OrderIntent)
+            .filter(OrderIntent.asset_class == 'crypto')
+            .order_by(OrderIntent.last_fill_at.desc(), OrderIntent.created_at.desc(), OrderIntent.id.desc())
+            .limit(limit)
+            .all()
+        )
+        if intents:
+            rows = []
+            for intent in intents:
+                context = intent.context_json if isinstance(intent.context_json, dict) else {}
+                pair = context.get('displayPair') or intent.symbol
+                event_time = intent.last_fill_at or intent.first_fill_at or intent.submitted_at or intent.created_at
+                price = float(intent.avg_fill_price or intent.requested_price or 0.0)
+                qty = float(intent.filled_quantity or intent.requested_quantity or 0.0)
+                rows.append({
+                    'id': intent.intent_id,
+                    'timestamp': event_time.isoformat() if event_time else None,
+                    'market': 'CRYPTO',
+                    'pair': pair,
+                    'ohlcvPair': context.get('ohlcvPair'),
+                    'symbol': intent.symbol,
+                    'side': intent.side,
+                    'amount': qty,
+                    'price': price,
+                    'total': round(qty * price, 8),
+                    'status': intent.status,
+                    'balance': None,
+                })
+            return rows
+
         ledger = crypto_ledger.get_ledger()
         trades = ledger['trades'][-limit:]
         return list(reversed(trades))

@@ -4182,3 +4182,104 @@ def test_crypto_explicit_ledger_stop_loss_overrides_config_and_sets_protective_e
         assert state['stopLossBreached'] is True
         assert state['protectiveExitPending'] is True
         assert 'STOP_LOSS_BREACH' in state['protectiveExitReasons']
+
+
+def test_crypto_exit_sets_cooldown_and_blocks_immediate_reentry(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'BTC').one()
+        monitor_row.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+        db.commit()
+
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(**{
+                'session_open': True,
+                'to_dict': lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': True,
+                    'reason': 'patched open session',
+                    'nextSessionStartUtc': None,
+                    'nextSessionStartEt': None,
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            }),
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.resolve_pair',
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD',
+                rest_pair='XBTUSD',
+                pair_key='XBTUSD',
+                ws_pair='XBT/USD',
+                altname='XBTUSD',
+            ),
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.get_ticker',
+            lambda pair: {
+                'c': ['70000.0', '1'],
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.get_ohlc',
+            lambda pair, interval=15, limit=25: [
+                {'timestamp': 1, 'open': 68000.0, 'high': 69000.0, 'low': 67500.0, 'close': 68500.0, 'vwap': 68500.0, 'volume': 10.0, 'count': 1},
+                {'timestamp': 2, 'open': 68500.0, 'high': 69500.0, 'low': 68000.0, 'close': 69000.0, 'vwap': 69000.0, 'volume': 11.0, 'count': 1},
+                {'timestamp': 3, 'open': 69000.0, 'high': 70000.0, 'low': 68800.0, 'close': 69500.0, 'vwap': 69500.0, 'volume': 12.0, 'count': 1},
+                {'timestamp': 4, 'open': 69500.0, 'high': 70500.0, 'low': 69200.0, 'close': 69800.0, 'vwap': 69800.0, 'volume': 13.0, 'count': 1},
+                {'timestamp': 5, 'open': 69800.0, 'high': 71000.0, 'low': 69700.0, 'close': 70000.0, 'vwap': 70000.0, 'volume': 14.0, 'count': 1},
+                {'timestamp': 6, 'open': 70000.0, 'high': 71200.0, 'low': 69900.0, 'close': 70500.0, 'vwap': 70500.0, 'volume': 15.0, 'count': 1},
+            ],
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_exit_worker.kraken_service.resolve_pair',
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD',
+                rest_pair='XBTUSD',
+                pair_key='XBTUSD',
+                ws_pair='XBT/USD',
+                altname='XBTUSD',
+            ),
+        )
+        original_balance = crypto_ledger.balance
+        original_positions = dict(crypto_ledger.positions)
+        original_trades = list(crypto_ledger.trades)
+        try:
+            crypto_ledger.balance = type(original_balance)('100000')
+            crypto_ledger.positions = {}
+            crypto_ledger.trades = []
+
+            entry_result = watchlist_monitoring_orchestrator.run_due_once(db, scope='crypto_only', limit_per_scope=10)
+            assert entry_result['entryExecution']['filledCount'] == 1
+
+            exit_result = watchlist_exit_worker.run_exit_sweep(db, execute=True, limit=10)
+            assert exit_result['summary']['closedCount'] == 1
+
+            monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'BTC').one()
+            assert monitor_row.latest_decision_state == 'EXIT_FILLED'
+            assert monitor_row.decision_context_json['entryExecution']['action'] == 'EXIT_FILLED'
+            assert monitor_row.decision_context_json['reentryBlockedUntilUtc']
+
+            monitor_row.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+            db.commit()
+
+            reentry_result = watchlist_monitoring_orchestrator.run_due_once(db, scope='crypto_only', limit_per_scope=10)
+            assert reentry_result['entryExecution']['skippedCount'] == 1
+            monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'BTC').one()
+            assert monitor_row.latest_decision_state == 'COOLDOWN_ACTIVE'
+            assert monitor_row.latest_decision_reason == 'CRYPTO_REENTRY_COOLDOWN_ACTIVE'
+        finally:
+            crypto_ledger.balance = original_balance
+            crypto_ledger.positions = original_positions
+            crypto_ledger.trades = original_trades

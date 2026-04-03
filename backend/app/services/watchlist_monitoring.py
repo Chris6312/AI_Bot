@@ -32,6 +32,7 @@ ELIGIBLE_DUE_STATUSES = (ACTIVE, MANAGED_ONLY)
 DEFAULT_SCOPES: tuple[WATCHLIST_SCOPE, ...] = ('stocks_only', 'crypto_only')
 ENTRY_EXECUTION_SOURCE = 'WATCHLIST_MONITOR_ENTRY'
 ACTIVE_ENTRY_INTENT_STATUSES = {'READY', 'SUBMITTED', 'PARTIALLY_FILLED'}
+COOLDOWN_DECISION_STATE = 'COOLDOWN_ACTIVE'
 
 
 @dataclass
@@ -653,6 +654,38 @@ class WatchlistMonitoringOrchestrator:
         db.commit()
         return payload
 
+    @staticmethod
+    def _parse_iso_datetime(value: Any) -> datetime | None:
+        raw = str(value or '').strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def _crypto_reentry_cooldown_state(
+        self,
+        monitor_state: WatchlistMonitorState,
+        *,
+        observed_at: datetime,
+    ) -> tuple[bool, datetime | None, str | None]:
+        context = dict(monitor_state.decision_context_json or {})
+        blocked_until = self._parse_iso_datetime(context.get('reentryBlockedUntilUtc'))
+        if blocked_until is not None and blocked_until > observed_at:
+            return True, blocked_until, 'CRYPTO_REENTRY_COOLDOWN_ACTIVE'
+        last_exit_at = self._parse_iso_datetime(context.get('lastExitAtUtc'))
+        if (
+            str(monitor_state.latest_decision_state or '').upper() == 'EXIT_FILLED'
+            and last_exit_at is not None
+            and (observed_at - last_exit_at).total_seconds() < 60
+        ):
+            return True, blocked_until, 'CRYPTO_EXIT_JUST_FILLED'
+        return False, blocked_until, None
+
     def _submit_crypto_entry_candidate(
         self,
         db: Session,
@@ -681,6 +714,19 @@ class WatchlistMonitoringOrchestrator:
         if resolved_pair is None:
             payload['action'] = 'SKIPPED'
             payload['reason'] = 'PAIR_UNRESOLVED'
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
+        cooldown_active, blocked_until, cooldown_reason = self._crypto_reentry_cooldown_state(
+            monitor_state,
+            observed_at=datetime.now(UTC),
+        )
+        if cooldown_active:
+            payload['action'] = 'SKIPPED'
+            payload['reason'] = cooldown_reason
+            if blocked_until is not None:
+                payload['reentryBlockedUntilUtc'] = blocked_until.isoformat()
             self._record_entry_execution(db, monitor_state, payload)
             db.commit()
             return payload
@@ -846,6 +892,7 @@ class WatchlistMonitoringOrchestrator:
             'submittedOrderId': payload.get('submittedOrderId'),
             'positionId': payload.get('positionId'),
             'tradeId': payload.get('tradeId'),
+            'reentryBlockedUntilUtc': payload.get('reentryBlockedUntilUtc') or context.get('reentryBlockedUntilUtc'),
             'recordedAtUtc': recorded_at.isoformat(),
         }
         monitor_state.decision_context_json = context
@@ -859,6 +906,8 @@ class WatchlistMonitoringOrchestrator:
             monitor_state.latest_decision_reason = 'Open position exists; symbol is now managed under exit rules.'
         elif action in {'ENTRY_FILLED', 'ENTRY_SUBMITTED', 'GATE_REJECTED', 'SUBMISSION_REJECTED'}:
             monitor_state.latest_decision_state = action
+        elif action == 'SKIPPED' and str(reason or '').strip() in {'CRYPTO_REENTRY_COOLDOWN_ACTIVE', 'CRYPTO_EXIT_JUST_FILLED'}:
+            monitor_state.latest_decision_state = COOLDOWN_DECISION_STATE
         monitor_state.last_decision_at_utc = recorded_at
         db.add(monitor_state)
         db.flush()
