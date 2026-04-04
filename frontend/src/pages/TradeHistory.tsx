@@ -90,6 +90,29 @@ function pnlTone(value?: number | null): Tone {
   return 'muted'
 }
 
+function formatPercent(value?: number | null) {
+  if (value == null || Number.isNaN(value)) return '—'
+  return `${value.toFixed(2)}%`
+}
+
+function strategySummary(row: TradeHistoryRow) {
+  const setup = prettifyLabel(row.strategySnapshot?.setupTemplate)
+  const exit = prettifyLabel(row.strategySnapshot?.exitTemplate)
+  const timeframes = (row.strategySnapshot?.botTimeframes ?? []).filter(Boolean).join(', ') || '—'
+  return { setup, exit, timeframes }
+}
+
+function technicalSummary(row: TradeHistoryRow) {
+  const pieces: string[] = []
+  if (row.technicalSnapshot?.changePct != null) pieces.push(`Δ ${formatPercent(row.technicalSnapshot.changePct)}`)
+  if (row.technicalSnapshot?.sma5 != null) pieces.push(`SMA5 ${ET_NUMBER.format(row.technicalSnapshot.sma5)}`)
+  if (row.technicalSnapshot?.sma10 != null) pieces.push(`SMA10 ${ET_NUMBER.format(row.technicalSnapshot.sma10)}`)
+  if (row.technicalSnapshot?.recentHigh != null) pieces.push(`Hi ${ET_NUMBER.format(row.technicalSnapshot.recentHigh)}`)
+  if (row.technicalSnapshot?.recentLow != null) pieces.push(`Lo ${ET_NUMBER.format(row.technicalSnapshot.recentLow)}`)
+  if (row.technicalSnapshot?.continuityOk != null) pieces.push(`Continuity ${row.technicalSnapshot.continuityOk ? 'ok' : 'check'}`)
+  return pieces.join(' • ') || 'Snapshot unavailable'
+}
+
 function exportRowsToCsv(rows: TradeHistoryRow[]) {
   const headers = [
     'Asset Class',
@@ -106,6 +129,16 @@ function exportRowsToCsv(rows: TradeHistoryRow[]) {
     'Price Difference',
     'Difference Amount',
     'Realized PnL',
+    'Setup Template',
+    'Exit Template',
+    'Bias',
+    'Timeframes',
+    'Change Pct',
+    'SMA5',
+    'SMA10',
+    'Recent High',
+    'Recent Low',
+    'Continuity Ok',
     'Exit Trigger',
     'Source',
   ]
@@ -125,6 +158,16 @@ function exportRowsToCsv(rows: TradeHistoryRow[]) {
     row.priceDifference ?? '',
     row.differenceAmount ?? '',
     row.realizedPnl ?? '',
+    row.strategySnapshot?.setupTemplate ?? '',
+    row.strategySnapshot?.exitTemplate ?? '',
+    row.strategySnapshot?.bias ?? '',
+    (row.strategySnapshot?.botTimeframes ?? []).join(' | '),
+    row.technicalSnapshot?.changePct ?? '',
+    row.technicalSnapshot?.sma5 ?? '',
+    row.technicalSnapshot?.sma10 ?? '',
+    row.technicalSnapshot?.recentHigh ?? '',
+    row.technicalSnapshot?.recentLow ?? '',
+    row.technicalSnapshot?.continuityOk ?? '',
     prettifyLabel(row.exitTrigger),
     prettifyLabel(row.source),
   ])
@@ -278,6 +321,7 @@ export default function TradeHistory() {
               <thead>
                 <tr className="text-left text-xs uppercase tracking-[0.2em] text-slate-400">
                   <th className="px-3 py-3">Asset</th>
+                  <th className="px-3 py-3">Strategy</th>
                   <th className="px-3 py-3">Bought ET</th>
                   <th className="px-3 py-3">Buy</th>
                   <th className="px-3 py-3">Sold ET</th>
@@ -296,6 +340,11 @@ export default function TradeHistory() {
                         <StatusPill tone={row.assetClass === 'stock' ? 'info' : 'good'} label={row.assetClass} />
                         <StatusPill tone={row.mode === 'LIVE' ? 'warn' : 'muted'} label={row.mode} />
                       </div>
+                    </td>
+                    <td className="px-3 py-4">
+                      <div className="font-medium text-white">{strategySummary(row).setup}</div>
+                      <div className="text-xs text-slate-400">Exit {strategySummary(row).exit}</div>
+                      <div className="text-xs text-slate-500">TF {strategySummary(row).timeframes}</div>
                     </td>
                     <td className="px-3 py-4 text-slate-300">{formatEt(row.boughtAtEt ?? row.boughtAtUtc)}</td>
                     <td className="px-3 py-4">
@@ -319,7 +368,8 @@ export default function TradeHistory() {
                     </td>
                     <td className="px-3 py-4 text-slate-300">
                       <div>{row.exitTrigger || '—'}</div>
-                      <div className="text-xs text-slate-500">{row.source}</div>
+                      <div className="text-xs text-slate-400">{row.source}</div>
+                      <div className="mt-1 text-xs text-slate-500">{technicalSummary(row)}</div>
                     </td>
                   </tr>
                 ))}

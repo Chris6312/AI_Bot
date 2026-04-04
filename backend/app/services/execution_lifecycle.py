@@ -246,6 +246,33 @@ class ExecutionLifecycleService:
         db.refresh(intent)
         return intent
 
+    @staticmethod
+    def _clean_snapshot(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        return {key: item for key, item in value.items() if item is not None}
+
+    def _entry_reasoning_from_intent(self, intent: OrderIntent) -> dict[str, Any]:
+        context = intent.context_json if isinstance(intent.context_json, dict) else {}
+        watchlist = context.get('watchlist') if isinstance(context.get('watchlist'), dict) else {}
+        strategy_snapshot = self._clean_snapshot(context.get('strategySnapshot'))
+        technical_snapshot = self._clean_snapshot(context.get('technicalSnapshot'))
+        entry_reasoning = {
+            'intentId': intent.intent_id,
+            'executionSource': intent.execution_source,
+            'requestedQuantity': intent.requested_quantity,
+            'filledQuantity': intent.filled_quantity,
+            'status': intent.status,
+            'mode': context.get('mode'),
+        }
+        if watchlist:
+            entry_reasoning['watchlist'] = watchlist
+        if strategy_snapshot:
+            entry_reasoning['strategySnapshot'] = strategy_snapshot
+        if technical_snapshot:
+            entry_reasoning['technicalSnapshot'] = technical_snapshot
+        return entry_reasoning
+
     def materialize_stock_fill(
         self,
         db: Session,
@@ -280,12 +307,7 @@ class ExecutionLifecycleService:
             current_price=float(current_price or entry_price),
             strategy=strategy,
             entry_time=entry_time,
-            entry_reasoning={
-                'intentId': intent.intent_id,
-                'executionSource': intent.execution_source,
-                'requestedQuantity': intent.requested_quantity,
-                'filledQuantity': intent.filled_quantity,
-            },
+            entry_reasoning=self._entry_reasoning_from_intent(intent),
             stop_loss=float(stop_loss),
             profit_target=float(profit_target),
             peak_price=entry_price,
@@ -306,13 +328,7 @@ class ExecutionLifecycleService:
             entry_price=entry_price,
             shares=filled_shares,
             entry_cost=entry_price * filled_shares,
-            entry_reasoning={
-                'intentId': intent.intent_id,
-                'executionSource': intent.execution_source,
-                'requestedQuantity': intent.requested_quantity,
-                'filledQuantity': intent.filled_quantity,
-                'status': intent.status,
-            },
+            entry_reasoning=self._entry_reasoning_from_intent(intent),
             execution_id=intent.intent_id,
             entry_order_id=intent.submitted_order_id,
         )

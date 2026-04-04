@@ -90,6 +90,11 @@ class TradeHistoryService:
             sell_total = self._coalesce_float(trade.exit_proceeds, sell_price * quantity)
             sold_at = self._ensure_utc(trade.exit_time)
             bought_at = self._ensure_utc(trade.entry_time)
+            strategy_snapshot = self._extract_strategy_snapshot(
+                entry_reasoning,
+                fallback_setup_template=trade.strategy,
+            )
+            technical_snapshot = self._extract_technical_snapshot(entry_reasoning)
             row = {
                 'id': f'stock-trade-{trade.id}',
                 'tradeId': trade.trade_id,
@@ -115,6 +120,8 @@ class TradeHistoryService:
                 'realizedPnl': round(float(trade.net_pnl if trade.net_pnl is not None else trade.gross_pnl or 0.0), 8),
                 'holdDurationMinutes': int(trade.duration_minutes or 0) if trade.duration_minutes is not None else None,
                 'exitTrigger': trade.exit_trigger,
+                'strategySnapshot': strategy_snapshot,
+                'technicalSnapshot': technical_snapshot,
             }
             if self._matches_filters(row, filters):
                 rows.append(row)
@@ -157,6 +164,7 @@ class TradeHistoryService:
                         'boughtAtUtc': self._iso_or_none(fill_time),
                         'boughtAtEt': self._et_iso_or_none(fill_time),
                         'boughtAt': fill_time,
+                        'context': context,
                     }
                 )
                 continue
@@ -174,6 +182,12 @@ class TradeHistoryService:
                 sell_total = round(matched_quantity * fill_price, 8)
                 realized = round(sell_total - buy_total, 8)
                 duration_minutes = self._duration_minutes(lot.get('boughtAt'), fill_time)
+                buy_context = self._dict_or_empty(lot.get('context'))
+                strategy_snapshot = self._extract_strategy_snapshot(
+                    buy_context,
+                    fallback_setup_template=((buy_context.get('watchlist') or {}).get('setupTemplate') if isinstance(buy_context.get('watchlist'), dict) else None),
+                )
+                technical_snapshot = self._extract_technical_snapshot(buy_context)
                 row = {
                     'id': f"crypto-{lot['intentId']}-{intent.intent_id}-{len(rows) + 1}",
                     'tradeId': None,
@@ -199,6 +213,8 @@ class TradeHistoryService:
                     'realizedPnl': realized,
                     'holdDurationMinutes': duration_minutes,
                     'exitTrigger': context.get('exitTrigger') or context.get('reason'),
+                    'strategySnapshot': strategy_snapshot,
+                    'technicalSnapshot': technical_snapshot,
                 }
                 if self._matches_filters(row, filters):
                     rows.append(row)
@@ -207,6 +223,46 @@ class TradeHistoryService:
                 if float(lot['remainingQuantity']) <= 1e-12:
                     symbol_lots.pop(0)
         return rows
+
+    @staticmethod
+    def _dict_or_empty(value: Any) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    def _extract_strategy_snapshot(
+        self,
+        source: dict[str, Any],
+        *,
+        fallback_setup_template: Any = None,
+    ) -> dict[str, Any]:
+        strategy_snapshot = dict(self._dict_or_empty(source.get('strategySnapshot')))
+        watchlist = self._dict_or_empty(source.get('watchlist'))
+        if not strategy_snapshot and watchlist:
+            strategy_snapshot = {
+                'scope': watchlist.get('scope'),
+                'priorityRank': watchlist.get('priorityRank'),
+                'tier': watchlist.get('tier'),
+                'bias': watchlist.get('bias'),
+                'setupTemplate': watchlist.get('setupTemplate'),
+                'exitTemplate': watchlist.get('exitTemplate'),
+                'botTimeframes': watchlist.get('botTimeframes') if isinstance(watchlist.get('botTimeframes'), list) else [],
+                'riskFlags': watchlist.get('riskFlags') if isinstance(watchlist.get('riskFlags'), list) else [],
+            }
+        if fallback_setup_template and not strategy_snapshot.get('setupTemplate'):
+            strategy_snapshot['setupTemplate'] = str(fallback_setup_template)
+        cleaned = {key: value for key, value in strategy_snapshot.items() if value is not None}
+        bot_timeframes = cleaned.get('botTimeframes')
+        if not isinstance(bot_timeframes, list):
+            cleaned['botTimeframes'] = [] if bot_timeframes is None else [str(bot_timeframes)]
+        risk_flags = cleaned.get('riskFlags')
+        if not isinstance(risk_flags, list):
+            cleaned['riskFlags'] = [] if risk_flags is None else [str(risk_flags)]
+        return cleaned
+
+    def _extract_technical_snapshot(self, source: dict[str, Any]) -> dict[str, Any]:
+        technical_snapshot = dict(self._dict_or_empty(source.get('technicalSnapshot')))
+        if technical_snapshot:
+            return {key: value for key, value in technical_snapshot.items() if value is not None}
+        return {}
 
     def _matches_filters(self, row: dict[str, Any], filters: TradeHistoryFilters) -> bool:
         if filters.asset_class and str(row.get('assetClass') or '').lower() != filters.asset_class.lower():

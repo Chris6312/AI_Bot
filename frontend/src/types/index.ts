@@ -235,6 +235,41 @@ export interface OrderIntentRecord {
   events: OrderEventRecord[]
 }
 
+export interface TradeHistoryStrategySnapshot {
+  scope?: string | null
+  priorityRank?: number | null
+  tier?: string | null
+  bias?: string | null
+  setupTemplate?: string | null
+  exitTemplate?: string | null
+  botTimeframes?: string[]
+  riskFlags?: string[]
+  evaluationState?: string | null
+  evaluationReason?: string | null
+  evaluatedAtUtc?: string | null
+  marketDataAtUtc?: string | null
+}
+
+export interface TradeHistoryTechnicalSnapshot {
+  currentPrice?: number | null
+  prevClose?: number | null
+  openPrice?: number | null
+  changePct?: number | null
+  recentHigh?: number | null
+  recentLow?: number | null
+  sma5?: number | null
+  sma10?: number | null
+  volume?: number | null
+  quoteAgeSeconds?: number | null
+  tickerAgeSeconds?: number | null
+  continuityOk?: boolean | null
+  continuityGapSeconds?: number | null
+  triggerLevel?: number | null
+  breakoutLevel?: number | null
+  bounceFloor?: number | null
+  marketDataAtUtc?: string | null
+}
+
 export interface TradeHistoryRow {
   id: string
   tradeId?: string | null
@@ -260,6 +295,8 @@ export interface TradeHistoryRow {
   realizedPnl: number
   holdDurationMinutes?: number | null
   exitTrigger?: string | null
+  strategySnapshot?: TradeHistoryStrategySnapshot
+  technicalSnapshot?: TradeHistoryTechnicalSnapshot
 }
 
 export interface TradeHistoryResponse {

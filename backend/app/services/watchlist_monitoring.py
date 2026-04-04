@@ -482,6 +482,59 @@ class WatchlistMonitoringOrchestrator:
             "lifecycleNote": lifecycle.operator_note,
         }
 
+
+    @staticmethod
+    def _latest_evaluation_context(monitor_state: WatchlistMonitorState) -> dict[str, Any]:
+        context = monitor_state.decision_context_json if isinstance(monitor_state.decision_context_json, dict) else {}
+        latest = context.get("latestEvaluation")
+        return latest if isinstance(latest, dict) else {}
+
+    def _build_strategy_snapshot(
+        self,
+        symbol_row: WatchlistSymbol,
+        *,
+        latest_evaluation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        evaluation = latest_evaluation or {}
+        return {
+            "scope": symbol_row.scope,
+            "priorityRank": symbol_row.priority_rank,
+            "tier": symbol_row.tier,
+            "bias": symbol_row.bias,
+            "setupTemplate": symbol_row.setup_template,
+            "exitTemplate": symbol_row.exit_template,
+            "botTimeframes": list(symbol_row.bot_timeframes or []),
+            "riskFlags": list(symbol_row.risk_flags or []),
+            "evaluationState": evaluation.get("state"),
+            "evaluationReason": evaluation.get("reason"),
+            "evaluatedAtUtc": evaluation.get("evaluatedAtUtc"),
+            "marketDataAtUtc": evaluation.get("marketDataAtUtc"),
+        }
+
+    def _build_technical_snapshot(self, monitor_state: WatchlistMonitorState) -> dict[str, Any]:
+        evaluation = self._latest_evaluation_context(monitor_state)
+        details = evaluation.get("details") if isinstance(evaluation.get("details"), dict) else {}
+        technical = {
+            "currentPrice": details.get("currentPrice"),
+            "prevClose": details.get("prevClose"),
+            "openPrice": details.get("openPrice"),
+            "changePct": details.get("changePct"),
+            "recentHigh": details.get("recentHigh"),
+            "recentLow": details.get("recentLow"),
+            "sma5": details.get("sma5"),
+            "sma10": details.get("sma10"),
+            "volume": details.get("volume"),
+            "quoteAgeSeconds": details.get("quoteAgeSeconds"),
+            "tickerAgeSeconds": details.get("tickerAgeSeconds"),
+            "continuityOk": details.get("continuityOk"),
+            "continuityGapSeconds": details.get("continuityGapSeconds"),
+            "triggerLevel": details.get("triggerLevel"),
+            "breakoutLevel": details.get("breakoutLevel"),
+            "bounceFloor": details.get("bounceFloor"),
+            "marketDataAtUtc": details.get("marketDataAtUtc") or evaluation.get("marketDataAtUtc"),
+        }
+        return {key: value for key, value in technical.items() if value is not None}
+
     def _submit_stock_entry_candidate(
         self,
         db: Session,
@@ -522,7 +575,10 @@ class WatchlistMonitoringOrchestrator:
             db.commit()
             return payload
 
-        latest_details = dict((monitor_state.decision_context_json or {}).get("latestEvaluation", {}).get("details", {}) or {})
+        latest_evaluation = self._latest_evaluation_context(monitor_state)
+        latest_details = dict((latest_evaluation.get("details") or {}) if isinstance(latest_evaluation.get("details"), dict) else {})
+        strategy_snapshot = self._build_strategy_snapshot(symbol_row, latest_evaluation=latest_evaluation)
+        technical_snapshot = self._build_technical_snapshot(monitor_state)
         current_price = self._safe_float(latest_details.get("currentPrice"))
         if current_price <= 0:
             quote = tradier_client.get_quote_sync(symbol, mode=mode)
@@ -587,7 +643,9 @@ class WatchlistMonitoringOrchestrator:
                 "exitTemplate": symbol_row.exit_template,
                 "riskFlags": symbol_row.risk_flags or [],
                 "botTimeframes": symbol_row.bot_timeframes or [],
-            }
+            },
+            "strategySnapshot": strategy_snapshot,
+            "technicalSnapshot": technical_snapshot,
         }
         gate = pre_trade_gate.evaluate_stock_order_sync(
             ticker=symbol,
@@ -615,6 +673,8 @@ class WatchlistMonitoringOrchestrator:
                 context={
                     "mode": mode,
                     "watchlist": gate_context["watchlist"],
+                    "strategySnapshot": strategy_snapshot,
+                    "technicalSnapshot": technical_snapshot,
                     "estimatedValue": estimated_value,
                     "positionPct": sized.get("position_pct"),
                     "gate": gate_payload,
@@ -649,6 +709,8 @@ class WatchlistMonitoringOrchestrator:
             context={
                 "mode": mode,
                 "watchlist": gate_context["watchlist"],
+                "strategySnapshot": strategy_snapshot,
+                "technicalSnapshot": technical_snapshot,
                 "estimatedValue": estimated_value,
                 "positionPct": sized.get("position_pct"),
                 "gate": gate_payload,
@@ -843,7 +905,10 @@ class WatchlistMonitoringOrchestrator:
             db.commit()
             return payload
 
-        latest_details = dict((monitor_state.decision_context_json or {}).get("latestEvaluation", {}).get("details", {}) or {})
+        latest_evaluation = self._latest_evaluation_context(monitor_state)
+        latest_details = dict((latest_evaluation.get("details") or {}) if isinstance(latest_evaluation.get("details"), dict) else {})
+        strategy_snapshot = self._build_strategy_snapshot(symbol_row, latest_evaluation=latest_evaluation)
+        technical_snapshot = self._build_technical_snapshot(monitor_state)
         current_price = self._safe_float(latest_details.get("currentPrice"))
         if current_price <= 0:
             ticker = kraken_service.get_ticker(resolved_pair.rest_pair)
@@ -901,6 +966,8 @@ class WatchlistMonitoringOrchestrator:
                     "riskFlags": symbol_row.risk_flags or [],
                     "botTimeframes": symbol_row.bot_timeframes or [],
                 },
+                "strategySnapshot": strategy_snapshot,
+                "technicalSnapshot": technical_snapshot,
                 "estimatedValue": sized.get("estimated_value"),
                 "positionPct": sized.get("position_pct"),
                 "ohlcvPair": resolved_pair.rest_pair,

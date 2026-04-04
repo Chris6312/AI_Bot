@@ -33,7 +33,23 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
                 gross_pnl=100.0,
                 net_pnl=100.0,
                 duration_minutes=120,
-                entry_reasoning={'mode': 'PAPER', 'executionSource': 'WATCHLIST_MONITOR_ENTRY', 'intentId': 'intent_stock_buy_1'},
+                entry_reasoning={
+                    'mode': 'PAPER',
+                    'executionSource': 'WATCHLIST_MONITOR_ENTRY',
+                    'intentId': 'intent_stock_buy_1',
+                    'strategySnapshot': {
+                        'setupTemplate': 'pullback_reclaim',
+                        'exitTemplate': 'first_failed_follow_through',
+                        'bias': 'bullish',
+                        'botTimeframes': ['5m', '15m'],
+                    },
+                    'technicalSnapshot': {
+                        'currentPrice': 100.0,
+                        'changePct': 1.25,
+                        'sma5': 99.2,
+                        'sma10': 98.7,
+                    },
+                },
                 exit_trigger='target_hit',
             )
         )
@@ -51,7 +67,24 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
                     avg_fill_price=50.0,
                     status='FILLED',
                     execution_source='WATCHLIST_MONITOR_ENTRY',
-                    context_json={'mode': 'PAPER', 'displayPair': 'SOL/USD', 'ohlcvPair': 'SOLUSD'},
+                    context_json={
+                        'mode': 'PAPER',
+                        'displayPair': 'SOL/USD',
+                        'ohlcvPair': 'SOLUSD',
+                        'strategySnapshot': {
+                            'setupTemplate': 'pullback_reclaim',
+                            'exitTemplate': 'profit_target',
+                            'bias': 'bullish',
+                            'botTimeframes': ['5m'],
+                        },
+                        'technicalSnapshot': {
+                            'currentPrice': 50.0,
+                            'changePct': 2.1,
+                            'sma5': 49.5,
+                            'sma10': 48.8,
+                            'continuityOk': True,
+                        },
+                    },
                     submitted_at=entry_time,
                     first_fill_at=entry_time,
                     last_fill_at=entry_time,
@@ -115,6 +148,11 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
         assert stock_row['differenceAmount'] == 100.0
         assert stock_row['realizedPnl'] == 100.0
         assert stock_row['soldAtEt'].endswith('-04:00')
+        assert stock_row['strategySnapshot']['setupTemplate'] == 'pullback_reclaim'
+        assert stock_row['strategySnapshot']['botTimeframes'] == ['5m', '15m']
+        assert stock_row['technicalSnapshot']['sma5'] == 99.2
+        assert crypto_row['strategySnapshot']['setupTemplate'] == 'pullback_reclaim'
+        assert crypto_row['technicalSnapshot']['continuityOk'] is True
 
 
 
