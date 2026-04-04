@@ -1,7 +1,21 @@
-import { useEffect, useMemo, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { format } from 'date-fns'
-import { Activity, Bitcoin, Clock3, Layers3, Wallet, X } from 'lucide-react'
+import { useMemo, useState, type ReactNode } from 'react'
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  Activity,
+  ArrowRightLeft,
+  Bitcoin,
+  CalendarClock,
+  ChevronDown,
+  ChevronUp,
+  CircleAlert,
+  Clock3,
+  Layers3,
+  ShieldCheck,
+  Target,
+  TrendingUp,
+  Wallet,
+  X,
+} from 'lucide-react'
 
 import { api } from '@/lib/api'
 import {
@@ -11,33 +25,64 @@ import {
   SectionCard,
   StatusPill,
   ToneBadge,
+  getStatusMeta,
   type Tone,
 } from '@/components/operator-ui'
 import type {
   BotStatus,
   CryptoLedger,
   OrderIntentRecord,
+  PositionInspectRecord,
+  PositionInspectTimeframeItem,
+  PositionInspectTimelineEvent,
   StockAccount,
   TradeHistoryEntry,
-  PositionInspectRecord,
   WatchlistExitReadinessSnapshot,
   WatchlistSymbolRecord,
 } from '@/types'
 
+const ET_DATE_TIME = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  month: 'short',
+  day: '2-digit',
+  year: 'numeric',
+  hour: 'numeric',
+  minute: '2-digit',
+  hour12: false,
+})
+
+const ET_TIME = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  hour: 'numeric',
+  minute: '2-digit',
+  hour12: false,
+})
+
 function formatMoney(value: number) {
   return `$${value.toFixed(2)}`
 }
-
 
 function formatPercent(value: number) {
   const prefix = value >= 0 ? '+' : ''
   return `${prefix}${value.toFixed(2)}%`
 }
 
-
 function formatTimestamp(value?: string | null) {
   if (!value) return '—'
-  return format(new Date(value), 'MMM dd, yyyy HH:mm')
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return value
+  return `${ET_DATE_TIME.format(parsed)} ET`
+}
+
+function formatCompactDateTime(value?: string | null) {
+  return formatTimestamp(value)
+}
+
+function formatTimeOnly(value?: string | null) {
+  if (!value) return '—'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return value
+  return `${ET_TIME.format(parsed)} ET`
 }
 
 function getAvailableToTrade(account?: StockAccount) {
@@ -93,6 +138,34 @@ type UnifiedPositionsResponse = {
   }
 }
 
+type InspectTarget = {
+  assetClass: 'stock' | 'crypto'
+  symbol: string
+  fallbackTitle: string
+}
+
+type StatCardRow = {
+  label: string
+  value: string
+  tone?: Tone
+}
+
+type LabeledStat = {
+  label: string
+  value: string
+  tone?: Tone
+}
+
+type DerivedInspectSections = {
+  overview: StatCardRow[]
+  strategyRows: LabeledStat[]
+  sizingRows: LabeledStat[]
+  exitRows: LabeledStat[]
+  latestEvaluationRows: LabeledStat[]
+  latestEvaluationReason: string | null
+  rawSections: Array<{ label: string; value: unknown }>
+}
+
 async function getUnifiedPositions(): Promise<UnifiedPositionsResponse> {
   const response = await fetch('/api/positions/unified')
   if (!response.ok) {
@@ -102,10 +175,8 @@ async function getUnifiedPositions(): Promise<UnifiedPositionsResponse> {
 }
 
 export default function Positions() {
-  const [selectedInspectTarget, setSelectedInspectTarget] = useState<{ assetClass: 'stock' | 'crypto'; symbol: string; fallbackTitle: string } | null>(null)
-  const [selectedInspect, setSelectedInspect] = useState<PositionInspectRecord | null>(null)
-  const [inspectLoading, setInspectLoading] = useState(false)
-  const [inspectError, setInspectError] = useState<string | null>(null)
+  const queryClient = useQueryClient()
+  const [selectedInspectTarget, setSelectedInspectTarget] = useState<InspectTarget | null>(null)
   const [positionFilter, setPositionFilter] = useState<'all' | 'stock' | 'crypto'>('all')
 
   const { data: unifiedPositions } = useQuery<UnifiedPositionsResponse>({
@@ -156,6 +227,20 @@ export default function Positions() {
     refetchInterval: 10000,
   })
 
+  const inspectQuery = useQuery<PositionInspectRecord>({
+    queryKey: ['positionInspect', selectedInspectTarget?.assetClass ?? null, selectedInspectTarget?.symbol ?? null],
+    queryFn: () => {
+      if (!selectedInspectTarget) {
+        throw new Error('No inspect target selected.')
+      }
+      return getPositionInspect(selectedInspectTarget.assetClass, selectedInspectTarget.symbol)
+    },
+    enabled: Boolean(selectedInspectTarget),
+    staleTime: 30_000,
+    gcTime: 5 * 60_000,
+    placeholderData: keepPreviousData,
+  })
+
   const summary = useMemo(() => {
     const rows = unifiedPositions?.rows ?? []
     const stockRows = rows.filter((row) => row.assetClass === 'stock')
@@ -190,38 +275,13 @@ export default function Positions() {
     return rows.slice(0, 10)
   }, [cryptoExitReadiness, stockExitReadiness])
 
-
-  useEffect(() => {
-    if (!selectedInspectTarget) {
-      setSelectedInspect(null)
-      setInspectLoading(false)
-      setInspectError(null)
-      return
-    }
-
-    let cancelled = false
-    setInspectLoading(true)
-    setInspectError(null)
-    getPositionInspect(selectedInspectTarget.assetClass, selectedInspectTarget.symbol)
-      .then((payload) => {
-        if (!cancelled) setSelectedInspect(payload)
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          const message = error instanceof Error ? error.message : 'Failed to load inspect payload.'
-          setInspectError(message)
-          setSelectedInspect(null)
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setInspectLoading(false)
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [selectedInspectTarget])
-
+  function prefetchInspect(target: InspectTarget) {
+    void queryClient.prefetchQuery({
+      queryKey: ['positionInspect', target.assetClass, target.symbol],
+      queryFn: () => getPositionInspect(target.assetClass, target.symbol),
+      staleTime: 30_000,
+    })
+  }
 
   return (
     <>
@@ -305,11 +365,16 @@ export default function Positions() {
                 positions={filteredPositions}
                 positionFilter={positionFilter}
                 onFilterChange={setPositionFilter}
-                onSelect={(position) => setSelectedInspectTarget({
-                  assetClass: position.inspectAssetClass,
-                  symbol: position.inspectSymbol,
-                  fallbackTitle: position.displaySymbol,
-                })}
+                onHover={prefetchInspect}
+                onSelect={(position) => {
+                  const target = {
+                    assetClass: position.inspectAssetClass,
+                    symbol: position.inspectSymbol,
+                    fallbackTitle: position.displaySymbol,
+                  } satisfies InspectTarget
+                  prefetchInspect(target)
+                  setSelectedInspectTarget(target)
+                }}
               />
             </SectionCard>
           </div>
@@ -352,15 +417,17 @@ export default function Positions() {
       </div>
 
       <PositionInspectDrawer
-        inspect={selectedInspect}
-        loading={inspectLoading}
-        error={inspectError}
+        inspect={selectedInspectTarget ? inspectQuery.data ?? null : null}
+        loading={Boolean(selectedInspectTarget) && (inspectQuery.isLoading || inspectQuery.isFetching)}
+        error={
+          selectedInspectTarget && inspectQuery.isError
+            ? inspectQuery.error instanceof Error
+              ? inspectQuery.error.message
+              : 'Failed to load inspect payload.'
+            : null
+        }
         fallbackTitle={selectedInspectTarget?.fallbackTitle ?? null}
-        onClose={() => {
-          setSelectedInspectTarget(null)
-          setSelectedInspect(null)
-          setInspectError(null)
-        }}
+        onClose={() => setSelectedInspectTarget(null)}
       />
     </>
   )
@@ -441,11 +508,13 @@ function UnifiedPositionsTable({
   positions,
   positionFilter,
   onFilterChange,
+  onHover,
   onSelect,
 }: {
   positions: UnifiedPositionRow[]
   positionFilter: 'all' | 'stock' | 'crypto'
   onFilterChange: (value: 'all' | 'stock' | 'crypto') => void
+  onHover: (target: InspectTarget) => void
   onSelect: (position: UnifiedPositionRow) => void
 }) {
   const sorted = [...positions].sort((a, b) => b.marketValue - a.marketValue)
@@ -468,54 +537,63 @@ function UnifiedPositionsTable({
       {sorted.length > 0 ? (
         <div className="overflow-x-auto">
           <table className="w-full min-w-[1120px] text-sm">
-        <thead>
-          <tr className="border-b border-slate-800 text-left text-xs uppercase tracking-wide text-slate-500">
-            <th className="pb-3 pr-4">Asset</th>
-            <th className="pb-3 pr-4">Symbol</th>
-            <th className="pb-3 pr-4">Quantity</th>
-            <th className="pb-3 pr-4">Avg</th>
-            <th className="pb-3 pr-4">Current</th>
-            <th className="pb-3 pr-4">Market value</th>
-            <th className="pb-3 pr-4">P&amp;L</th>
-            <th className="pb-3 pr-4">P&amp;L %</th>
-            <th className="pb-3 pr-4">Source</th>
-            <th className="pb-3">Inspect</th>
-          </tr>
-        </thead>
-        <tbody>
-          {sorted.map((position) => (
-            <tr key={`${position.assetClass}-${position.symbol}`} className="border-b border-slate-900/80 text-slate-300">
-              <td className="py-3 pr-4">
-                <ToneBadge tone={position.assetClass === 'stock' ? 'info' : 'good'}>{position.assetClass === 'stock' ? 'Stock' : 'Crypto'}</ToneBadge>
-              </td>
-              <td className="py-3 pr-4 font-semibold text-white">
-                <div>{position.displaySymbol}</div>
-                {position.entryTime ? <div className="mt-1 text-xs text-slate-500">Entry {formatTimestamp(position.entryTime)}</div> : null}
-              </td>
-              <td className="py-3 pr-4">{position.quantity.toFixed(position.assetClass === 'crypto' ? 6 : 0)} {position.quantityUnit}</td>
-              <td className="py-3 pr-4">{formatMoney(position.avgPrice)}</td>
-              <td className="py-3 pr-4">{formatMoney(position.currentPrice)}</td>
-              <td className="py-3 pr-4">{formatMoney(position.marketValue)}</td>
-              <td className={`py-3 pr-4 ${position.pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{formatMoney(position.pnl)}</td>
-              <td className={`${position.pnlPercent >= 0 ? 'py-3 pr-4 text-emerald-300' : 'py-3 pr-4 text-rose-300'}`}>{formatPercent(position.pnlPercent)}</td>
-              <td className="py-3 pr-4">
-                <div className="flex flex-col gap-2">
-                  <ToneBadge tone={position.sourceStatus === 'aligned' || position.sourceStatus === 'ledger' ? 'good' : 'warn'}>{position.sourceStatus.replace('_', ' ')}</ToneBadge>
-                  <span className="text-xs text-slate-500">{position.sourceDetail}</span>
-                </div>
-              </td>
-              <td className="py-3">
-                <button
-                  type="button"
-                  onClick={() => onSelect(position)}
-                  className="rounded-full border border-slate-700 bg-slate-950/70 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-200 transition hover:border-cyan-600 hover:text-cyan-200"
-                >
-                  Inspect
-                </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
+            <thead>
+              <tr className="border-b border-slate-800 text-left text-xs uppercase tracking-wide text-slate-500">
+                <th className="pb-3 pr-4">Asset</th>
+                <th className="pb-3 pr-4">Symbol</th>
+                <th className="pb-3 pr-4">Quantity</th>
+                <th className="pb-3 pr-4">Avg</th>
+                <th className="pb-3 pr-4">Current</th>
+                <th className="pb-3 pr-4">Market value</th>
+                <th className="pb-3 pr-4">P&amp;L</th>
+                <th className="pb-3 pr-4">P&amp;L %</th>
+                <th className="pb-3 pr-4">Source</th>
+                <th className="pb-3">Inspect</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((position) => {
+                const target = {
+                  assetClass: position.inspectAssetClass,
+                  symbol: position.inspectSymbol,
+                  fallbackTitle: position.displaySymbol,
+                } satisfies InspectTarget
+                return (
+                  <tr key={`${position.assetClass}-${position.symbol}`} className="border-b border-slate-900/80 text-slate-300">
+                    <td className="py-3 pr-4">
+                      <ToneBadge tone={position.assetClass === 'stock' ? 'info' : 'good'}>{position.assetClass === 'stock' ? 'Stock' : 'Crypto'}</ToneBadge>
+                    </td>
+                    <td className="py-3 pr-4 font-semibold text-white">
+                      <div>{position.displaySymbol}</div>
+                      {position.entryTime ? <div className="mt-1 text-xs text-slate-500">Entry {formatTimestamp(position.entryTime)}</div> : null}
+                    </td>
+                    <td className="py-3 pr-4">{position.quantity.toFixed(position.assetClass === 'crypto' ? 6 : 0)} {position.quantityUnit}</td>
+                    <td className="py-3 pr-4">{formatMoney(position.avgPrice)}</td>
+                    <td className="py-3 pr-4">{formatMoney(position.currentPrice)}</td>
+                    <td className="py-3 pr-4">{formatMoney(position.marketValue)}</td>
+                    <td className={`py-3 pr-4 ${position.pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{formatMoney(position.pnl)}</td>
+                    <td className={`${position.pnlPercent >= 0 ? 'py-3 pr-4 text-emerald-300' : 'py-3 pr-4 text-rose-300'}`}>{formatPercent(position.pnlPercent)}</td>
+                    <td className="py-3 pr-4">
+                      <div className="flex flex-col gap-2">
+                        <ToneBadge tone={position.sourceStatus === 'aligned' || position.sourceStatus === 'ledger' ? 'good' : 'warn'}>{position.sourceStatus.replace('_', ' ')}</ToneBadge>
+                        <span className="text-xs text-slate-500">{position.sourceDetail}</span>
+                      </div>
+                    </td>
+                    <td className="py-3">
+                      <button
+                        type="button"
+                        onMouseEnter={() => onHover(target)}
+                        onFocus={() => onHover(target)}
+                        onClick={() => onSelect(position)}
+                        className="rounded-full border border-slate-700 bg-slate-950/70 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-200 transition hover:border-cyan-600 hover:text-cyan-200"
+                      >
+                        Inspect
+                      </button>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
           </table>
         </div>
       ) : null}
@@ -536,16 +614,21 @@ function PositionInspectDrawer({
   fallbackTitle: string | null
   onClose: () => void
 }) {
+  const [showRaw, setShowRaw] = useState(false)
+  const [timelineExpanded, setTimelineExpanded] = useState<Record<string, boolean>>({})
+
   if (!inspect && !loading && !error && !fallbackTitle) return null
 
-  const detailRows = inspect
-    ? Object.entries(inspect.positionSnapshot ?? {}).map(([label, value]) => [humanizeKey(label), renderInspectValue(label, value)] as [string, string])
-    : []
+  const sections = inspect ? deriveInspectSections(inspect) : null
+
+  function toggleTimeline(key: string) {
+    setTimelineExpanded((current) => ({ ...current, [key]: !current[key] }))
+  }
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/80">
       <button type="button" aria-label="Close position drawer" className="absolute inset-0 cursor-default" onClick={onClose} />
-      <aside className="relative h-full w-full max-w-xl overflow-y-auto border-l border-slate-800 bg-slate-950 p-6 shadow-2xl shadow-black/60">
+      <aside className="relative h-full w-full max-w-3xl overflow-y-auto border-l border-slate-800 bg-slate-950 p-6 shadow-2xl shadow-black/60">
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Position inspect</div>
@@ -553,6 +636,7 @@ function PositionInspectDrawer({
             <div className="mt-3 flex flex-wrap gap-2">
               <ToneBadge tone="info">{inspect?.assetClass ?? 'loading'}</ToneBadge>
               {inspect?.inspectSource ? <ToneBadge tone="muted">{inspect.inspectSource}</ToneBadge> : null}
+              {inspect?.latestEvaluation?.state ? <ToneBadge tone={getStatusMeta(String(inspect.latestEvaluation.state)).tone}>{String(inspect.latestEvaluation.state)}</ToneBadge> : null}
             </div>
           </div>
           <button type="button" onClick={onClose} className="rounded-full border border-slate-700 p-2 text-slate-300 transition hover:border-cyan-600 hover:text-cyan-200">
@@ -560,82 +644,91 @@ function PositionInspectDrawer({
           </button>
         </div>
 
-        {loading ? <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4 text-sm text-slate-300">Loading inspect payload…</div> : null}
+        {loading ? <DrawerLoadingSkeleton /> : null}
         {error ? <div className="mt-6 rounded-2xl border border-rose-900/70 bg-rose-950/30 p-4 text-sm text-rose-200">{error}</div> : null}
 
-        {inspect ? (
+        {inspect && sections ? (
           <>
-            <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Position snapshot</div>
-              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-                {detailRows.map(([label, value]) => (
-                  <div key={label} className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-                    <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
-                    <div className="mt-2 text-sm text-slate-200">{value}</div>
-                  </div>
-                ))}
-              </div>
+            <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+              {sections.overview.map((row) => (
+                <MetricTile key={row.label} label={row.label} value={row.value} tone={row.tone ?? 'muted'} />
+              ))}
             </div>
 
-            <InspectJsonCard title="Signal snapshot" value={inspect.signalSnapshot ?? {}} />
-            <InspectJsonCard title="Sizing math" value={inspect.sizing ?? {}} />
+            <StructuredInspectCard title="Signal snapshot" eyebrow="Strategy" icon={<Target className="h-4 w-4 text-cyan-300" />}>
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                <KeyValueList rows={sections.strategyRows} />
+                <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-300">
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                    <ArrowRightLeft className="h-4 w-4 text-cyan-300" />
+                    Entry source
+                  </div>
+                  <p className="mt-3 leading-6 text-slate-400">
+                    This panel keeps the execution breadcrumbs visible without spraying raw JSON across the drawer. The raw payload still exists below for deep-debug spelunking.
+                  </p>
+                </div>
+              </div>
+            </StructuredInspectCard>
 
-            <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Timeframe alignment</div>
-              {inspect.timeframeAlignment?.note ? <p className="mt-3 text-sm leading-6 text-slate-400">{inspect.timeframeAlignment.note}</p> : null}
-              <div className="mt-4 overflow-x-auto">
-                <table className="w-full min-w-[420px] text-sm">
-                  <thead>
-                    <tr className="border-b border-slate-800 text-left text-xs uppercase tracking-wide text-slate-500">
-                      <th className="pb-3 pr-4">Timeframe</th>
-                      <th className="pb-3 pr-4">Status</th>
-                      <th className="pb-3">Why</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(inspect.timeframeAlignment?.items ?? []).map((item) => (
-                      <tr key={item.timeframe} className="border-b border-slate-900/80 text-slate-300">
-                        <td className="py-3 pr-4 font-semibold text-white">{item.timeframe}</td>
-                        <td className="py-3 pr-4">{item.status}</td>
-                        <td className="py-3">{item.reason}</td>
-                      </tr>
+            <StructuredInspectCard title="Sizing math" eyebrow="Fill and sizing" icon={<TrendingUp className="h-4 w-4 text-cyan-300" />}>
+              <KeyValueGrid rows={sections.sizingRows} />
+            </StructuredInspectCard>
+
+            <StructuredInspectCard title="Timeframe alignment" eyebrow="Confirmation map" icon={<ShieldCheck className="h-4 w-4 text-cyan-300" />}>
+              {inspect.timeframeAlignment?.note ? (
+                <div className="mb-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm leading-6 text-slate-400">
+                  {inspect.timeframeAlignment.note}
+                </div>
+              ) : null}
+              <TimeframeAlignmentTable items={inspect.timeframeAlignment?.items ?? []} />
+            </StructuredInspectCard>
+
+            <StructuredInspectCard title="Exit plan" eyebrow="Risk rails" icon={<CircleAlert className="h-4 w-4 text-cyan-300" />}>
+              <KeyValueGrid rows={sections.exitRows} />
+            </StructuredInspectCard>
+
+            <StructuredInspectCard title="Latest evaluation" eyebrow="Current worker verdict" icon={<CalendarClock className="h-4 w-4 text-cyan-300" />}>
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+                <KeyValueList rows={sections.latestEvaluationRows} />
+                <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+                  <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Why</div>
+                  <p className="mt-3 text-sm leading-6 text-slate-300">{sections.latestEvaluationReason ?? 'No evaluation reason stored yet.'}</p>
+                </div>
+              </div>
+            </StructuredInspectCard>
+
+            <StructuredInspectCard title="Lifecycle timeline" eyebrow="Intent → broker → fill" icon={<Clock3 className="h-4 w-4 text-cyan-300" />}>
+              <LifecycleTimeline events={inspect.lifecycle ?? []} expandedState={timelineExpanded} onToggle={toggleTimeline} />
+            </StructuredInspectCard>
+
+            <StructuredInspectCard title="Raw debug" eyebrow="Folded away on purpose" icon={<Layers3 className="h-4 w-4 text-cyan-300" />}>
+              <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+                <button
+                  type="button"
+                  onClick={() => setShowRaw((current) => !current)}
+                  className="flex w-full items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-900/70 px-4 py-3 text-left transition hover:border-cyan-700"
+                >
+                  <div>
+                    <div className="text-sm font-medium text-slate-200">Raw payload sections</div>
+                    <div className="mt-1 text-xs text-slate-500">Open this only when you need the wiring diagram instead of the dashboard.</div>
+                  </div>
+                  {showRaw ? <ChevronUp className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
+                </button>
+                {showRaw ? (
+                  <div className="mt-4 space-y-4">
+                    {sections.rawSections.map((section) => (
+                      <InspectJsonCard key={section.label} title={section.label} value={section.value} compact />
                     ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            <InspectJsonCard title="Exit plan" value={inspect.exitPlan ?? {}} />
-            <InspectJsonCard title="Latest evaluation" value={inspect.latestEvaluation ?? {}} />
-
-            <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Lifecycle timeline</div>
-              <div className="mt-4 space-y-3">
-                {(inspect.lifecycle ?? []).length === 0 ? (
-                  <div className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm text-slate-400">No lifecycle events were stored for this position yet.</div>
-                ) : (inspect.lifecycle ?? []).map((event, index) => (
-                  <div key={`${event.eventType}-${event.eventTime ?? index}`} className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <ToneBadge tone="info">{event.eventType}</ToneBadge>
-                      <ToneBadge tone="muted">{event.status}</ToneBadge>
-                      <span className="text-xs uppercase tracking-wide text-slate-500">{formatTimestamp(event.eventTime)}</span>
-                    </div>
-                    {event.message ? <p className="mt-3 text-sm text-slate-300">{event.message}</p> : null}
-                    <pre className="mt-3 overflow-x-auto whitespace-pre-wrap break-words rounded-2xl border border-slate-800 bg-slate-950/70 p-3 text-xs text-slate-400">{formatJson(event.payload ?? {})}</pre>
                   </div>
-                ))}
+                ) : null}
               </div>
-            </div>
-
-            <InspectJsonCard title="Raw context" value={inspect.rawContext ?? {}} />
+            </StructuredInspectCard>
           </>
         ) : null}
       </aside>
     </div>
   )
 }
-
-
 
 async function getPositionInspect(assetClass: 'stock' | 'crypto', symbol: string): Promise<PositionInspectRecord> {
   const params = new URLSearchParams({ asset_class: assetClass, symbol })
@@ -650,30 +743,345 @@ async function getPositionInspect(assetClass: 'stock' | 'crypto', symbol: string
 function humanizeKey(value: string) {
   return value
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/_/g, ' ')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
     .split(' ')
-    .map((part) => (part ? part[0].toUpperCase() + part.slice(1) : part))
+    .map((part) => (part ? part[0].toUpperCase() + part.slice(1).toLowerCase() : part))
     .join(' ')
 }
 
-function renderInspectValue(label: string, value: unknown) {
-  if (value == null) return '—'
+function displayValue(label: string, value: unknown): string {
+  if (value == null || value === '') return '—'
   if (typeof value === 'number') {
-    if (label.toLowerCase().includes('pct')) return formatPercent(value)
-    if (label.toLowerCase().includes('price') || label.toLowerCase().includes('value') || label.toLowerCase().includes('pnl') || label.toLowerCase().includes('basis')) {
+    const normalized = label.toLowerCase()
+    if (normalized.includes('pct') || normalized.includes('percent')) return formatPercent(value)
+    if (
+      normalized.includes('price') ||
+      normalized.includes('value') ||
+      normalized.includes('pnl') ||
+      normalized.includes('basis') ||
+      normalized.includes('target') ||
+      normalized.includes('stop') ||
+      normalized.includes('notional')
+    ) {
       return formatMoney(value)
     }
-    return String(value)
+    if (normalized.includes('hours')) {
+      return `${value}`
+    }
+    return `${value}`
   }
-  if (typeof value === 'boolean') return value ? 'True' : 'False'
-  if (typeof value === 'string' && (label.toLowerCase().includes('time') || label.toLowerCase().includes('atutc'))) return formatTimestamp(value)
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No'
+  if (typeof value === 'string') {
+    if (isTimestampLike(label, value)) return formatCompactDateTime(value)
+
+    const normalized = label.toLowerCase()
+    const shouldHumanize =
+      normalized.includes('strategy') ||
+      normalized.includes('source') ||
+      normalized.includes('template') ||
+      normalized.includes('status') ||
+      normalized.includes('event') ||
+      normalized.includes('state') ||
+      normalized.includes('bias') ||
+      normalized.includes('trigger')
+
+    if (shouldHumanize) {
+      return humanizeKey(value)
+    }
+
+    return value
+  }
+  if (Array.isArray(value)) return value.length ? value.map((item) => displayValue(label, item)).join(' · ') : '—'
   if (typeof value === 'object') return formatJson(value)
   return String(value)
 }
 
-function InspectJsonCard({ title, value }: { title: string; value: unknown }) {
+function isTimestampLike(label: string, value: string) {
+  const normalized = label.toLowerCase()
+  return normalized.includes('time') || normalized.includes('utc') || normalized.includes('date') || normalized.includes('expires') || normalized.includes('syncedat') || normalized.includes('observedat') || (!Number.isNaN(new Date(value).getTime()) && /\d{4}-\d{2}-\d{2}/.test(value))
+}
+
+function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSections {
+  const snapshot = inspect.positionSnapshot ?? {}
+  const signal = inspect.signalSnapshot ?? {}
+  const entryReasoning = asRecord(signal.entryReasoning)
+  const watchlist = asRecord(entryReasoning.watchlist)
+  const reconciliation = asRecord(entryReasoning.reconciliation)
+  const brokerSnapshot = asRecord(entryReasoning.brokerSnapshot)
+  const sizing = inspect.sizing ?? {}
+  const exitPlan = inspect.exitPlan ?? {}
+  const latestEvaluation = inspect.latestEvaluation ?? {}
+
+  const overview: StatCardRow[] = [
+    { label: 'Quantity', value: displayValue('quantity', snapshot.quantity), tone: 'info' },
+    { label: 'Avg entry', value: displayValue('avgEntryPrice', snapshot.avgEntryPrice), tone: 'muted' },
+    { label: 'Current price', value: displayValue('currentPrice', snapshot.currentPrice), tone: 'muted' },
+    { label: 'Market value', value: displayValue('marketValue', snapshot.marketValue), tone: 'muted' },
+    { label: 'Unrealized P&L', value: displayValue('unrealizedPnl', snapshot.unrealizedPnl), tone: toneFromPnl(asNumber(snapshot.unrealizedPnl) ?? 0) },
+    { label: 'Unrealized P&L %', value: displayValue('unrealizedPnlPct', snapshot.unrealizedPnlPct), tone: toneFromPnl(asNumber(snapshot.unrealizedPnlPct) ?? 0) },
+    { label: 'Entry time', value: displayValue('entryTimeUtc', snapshot.entryTimeUtc), tone: 'muted' },
+    { label: 'Account ID', value: displayValue('accountId', snapshot.accountId), tone: 'muted' },
+    { label: 'Position open', value: displayValue('isOpen', snapshot.isOpen), tone: 'good' },
+  ]
+
+  const strategyRows: LabeledStat[] = [
+    { label: 'Strategy', value: displayValue('strategy', signal.strategy), tone: 'info' },
+    { label: 'Execution source', value: displayValue('executionSource', signal.executionSource), tone: 'muted' },
+    { label: 'Setup template', value: displayValue('setupTemplate', watchlist.setupTemplate), tone: 'muted' },
+    { label: 'Exit template', value: displayValue('exitTemplate', watchlist.exitTemplate), tone: 'muted' },
+    { label: 'Max hold hours', value: displayValue('maxHoldHours', watchlist.maxHoldHours), tone: 'muted' },
+    { label: 'Seed intent status', value: displayValue('seedIntentStatus', entryReasoning.seedIntentStatus), tone: 'muted' },
+    { label: 'Sync source', value: displayValue('syncSource', entryReasoning.syncSource), tone: 'muted' },
+    { label: 'Broker shares', value: displayValue('shares', brokerSnapshot.shares), tone: 'muted' },
+    { label: 'Broker avg price', value: displayValue('avgPrice', brokerSnapshot.avgPrice), tone: 'muted' },
+    { label: 'Reconciliation event', value: displayValue('event', reconciliation.event), tone: 'warn' },
+    { label: 'Observed at', value: displayValue('observedAtUtc', reconciliation.observedAtUtc), tone: 'muted' },
+  ]
+
+  const requestedQuantity = asNumber(sizing.requestedQuantity)
+  const filledQuantity = asNumber(sizing.filledQuantity)
+  const requestedPrice = asNumber(sizing.requestedPrice)
+  const averageFillPrice = asNumber(sizing.avgFillPrice)
+  const requestedNotional = requestedQuantity != null && requestedPrice != null ? requestedQuantity * requestedPrice : null
+  const actualNotional = filledQuantity != null && averageFillPrice != null ? filledQuantity * averageFillPrice : null
+  const slippage = requestedPrice != null && averageFillPrice != null ? averageFillPrice - requestedPrice : null
+
+  const sizingRows: LabeledStat[] = [
+    { label: 'Requested quantity', value: displayValue('requestedQuantity', requestedQuantity), tone: 'info' },
+    { label: 'Filled quantity', value: displayValue('filledQuantity', filledQuantity), tone: 'good' },
+    { label: 'Requested price', value: displayValue('requestedPrice', requestedPrice), tone: 'muted' },
+    { label: 'Average fill price', value: displayValue('avgFillPrice', averageFillPrice), tone: 'muted' },
+    { label: 'Requested notional', value: displayValue('requestedNotional', requestedNotional), tone: 'muted' },
+    { label: 'Actual fill notional', value: displayValue('actualNotional', actualNotional), tone: 'muted' },
+    { label: 'Slippage', value: displayValue('slippage', slippage), tone: toneFromPnl(-(slippage ?? 0)) },
+    { label: 'Account ID', value: displayValue('accountId', sizing.accountId), tone: 'muted' },
+  ]
+
+  const exitRows: LabeledStat[] = [
+    { label: 'Exit template', value: displayValue('template', exitPlan.template), tone: 'info' },
+    { label: 'Stop loss', value: displayValue('stopLoss', exitPlan.stopLoss), tone: 'danger' },
+    { label: 'Profit target', value: displayValue('profitTarget', exitPlan.profitTarget), tone: 'good' },
+    { label: 'Trailing stop', value: displayValue('trailingStop', exitPlan.trailingStop), tone: 'warn' },
+    { label: 'Peak price', value: displayValue('peakPrice', exitPlan.peakPrice), tone: 'muted' },
+    { label: 'Exit trigger', value: displayValue('tradeExitTrigger', exitPlan.tradeExitTrigger), tone: 'muted' },
+  ]
+
+  const latestEvaluationRows: LabeledStat[] = [
+    { label: 'State', value: displayValue('state', latestEvaluation.state), tone: getStatusMeta(String(latestEvaluation.state ?? '')).tone },
+    { label: 'Worker time', value: displayValue('evaluatedAtUtc', latestEvaluation.evaluatedAtUtc), tone: 'muted' },
+    { label: 'Broker exit pending', value: displayValue('brokerExitPending', signal.brokerExitPending), tone: 'warn' },
+  ]
+
+  const rawSections = [
+    { label: 'Signal snapshot', value: inspect.signalSnapshot ?? {} },
+    { label: 'Sizing math', value: inspect.sizing ?? {} },
+    { label: 'Exit plan', value: inspect.exitPlan ?? {} },
+    { label: 'Latest evaluation', value: inspect.latestEvaluation ?? {} },
+    { label: 'Raw context', value: inspect.rawContext ?? {} },
+  ]
+
+  return {
+    overview,
+    strategyRows,
+    sizingRows,
+    exitRows,
+    latestEvaluationRows,
+    latestEvaluationReason: asText(latestEvaluation.reason),
+    rawSections,
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+}
+
+function asNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function asText(value: unknown): string | null {
+  if (value == null) return null
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return null
+}
+
+function StructuredInspectCard({
+  title,
+  eyebrow,
+  icon,
+  children,
+}: {
+  title: string
+  eyebrow: string
+  icon: ReactNode
+  children: ReactNode
+}) {
   return (
-    <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
+    <div className="mt-6 rounded-3xl border border-slate-800 bg-slate-900/70 p-4">
+      <div className="mb-4 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+        {icon}
+        {eyebrow}
+      </div>
+      <div className="mb-4 text-lg font-semibold text-white">{title}</div>
+      {children}
+    </div>
+  )
+}
+
+function MetricTile({ label, value, tone }: { label: string; value: string; tone: Tone }) {
+  return (
+    <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
+      <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{label}</div>
+      <div className={`mt-3 text-lg font-semibold ${toneTextClassForTile(tone)}`}>{value}</div>
+    </div>
+  )
+}
+
+function toneTextClassForTile(tone: Tone) {
+  switch (tone) {
+    case 'good':
+      return 'text-emerald-300'
+    case 'warn':
+      return 'text-amber-300'
+    case 'danger':
+      return 'text-rose-300'
+    case 'info':
+      return 'text-cyan-200'
+    default:
+      return 'text-white'
+  }
+}
+
+function KeyValueList({ rows }: { rows: LabeledStat[] }) {
+  const filteredRows = rows.filter((row) => row.value && row.value !== '—')
+
+  return (
+    <div className="space-y-3 text-sm">
+      {filteredRows.length === 0 ? <EmptyState message="No detail rows were stored for this section yet." /> : null}
+      {filteredRows.map((row) => (
+        <DetailRow key={row.label} label={row.label} value={row.value} tone={row.tone ?? 'muted'} />
+      ))}
+    </div>
+  )
+}
+
+function KeyValueGrid({ rows }: { rows: LabeledStat[] }) {
+  const filteredRows = rows.filter((row) => row.value && row.value !== '—')
+  return (
+    <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+      {filteredRows.length === 0 ? <EmptyState message="No structured values were stored for this section yet." /> : null}
+      {filteredRows.map((row) => (
+        <div key={row.label} className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+          <div className="text-xs uppercase tracking-wide text-slate-500">{row.label}</div>
+          <div className={`mt-2 text-sm ${toneTextClassForTile(row.tone ?? 'muted')}`}>{row.value}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function TimeframeAlignmentTable({ items }: { items: PositionInspectTimeframeItem[] }) {
+  if (items.length === 0) {
+    return <EmptyState message="No normalized timeframe confirmations were stored for this position." />
+  }
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[420px] text-sm">
+        <thead>
+          <tr className="border-b border-slate-800 text-left text-xs uppercase tracking-wide text-slate-500">
+            <th className="pb-3 pr-4">Timeframe</th>
+            <th className="pb-3 pr-4">Status</th>
+            <th className="pb-3">Why</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((item) => {
+            const meta = getStatusMeta(item.status)
+            return (
+              <tr key={item.timeframe} className="border-b border-slate-900/80 text-slate-300">
+                <td className="py-3 pr-4 font-semibold text-white">{item.timeframe}</td>
+                <td className="py-3 pr-4"><ToneBadge tone={meta.tone}>{item.status}</ToneBadge></td>
+                <td className="py-3 text-slate-400">{item.reason || 'No reason stored.'}</td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function LifecycleTimeline({
+  events,
+  expandedState,
+  onToggle,
+}: {
+  events: PositionInspectTimelineEvent[]
+  expandedState: Record<string, boolean>
+  onToggle: (key: string) => void
+}) {
+  if (events.length === 0) {
+    return <EmptyState message="No lifecycle events were stored for this position yet." />
+  }
+
+  return (
+    <div className="space-y-3">
+      {events.map((event, index) => {
+        const key = `${event.eventType}-${event.eventTime ?? index}`
+        const expanded = Boolean(expandedState[key])
+        const statusMeta = getStatusMeta(event.status)
+
+        return (
+          <div key={key} className="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <ToneBadge tone="info">{event.eventType}</ToneBadge>
+              <ToneBadge tone={statusMeta.tone}>{event.status}</ToneBadge>
+              <span className="text-xs uppercase tracking-wide text-slate-500">{formatTimeOnly(event.eventTime)}</span>
+            </div>
+            {event.message ? <p className="mt-3 text-sm text-slate-300">{event.message}</p> : null}
+            <button
+              type="button"
+              onClick={() => onToggle(key)}
+              className="mt-3 inline-flex items-center gap-2 rounded-full border border-slate-700 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-300 transition hover:border-cyan-700 hover:text-cyan-200"
+            >
+              {expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+              {expanded ? 'Hide details' : 'Show details'}
+            </button>
+            {expanded ? <pre className="mt-3 overflow-x-auto whitespace-pre-wrap break-words rounded-2xl border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-400">{formatJson(event.payload ?? {})}</pre> : null}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function DrawerLoadingSkeleton() {
+  return (
+    <div className="mt-6 space-y-4">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        {Array.from({ length: 6 }).map((_, index) => (
+          <div key={index} className="h-24 animate-pulse rounded-2xl border border-slate-800 bg-slate-900/70" />
+        ))}
+      </div>
+      {Array.from({ length: 3 }).map((_, index) => (
+        <div key={index} className="h-40 animate-pulse rounded-3xl border border-slate-800 bg-slate-900/70" />
+      ))}
+    </div>
+  )
+}
+
+function InspectJsonCard({ title, value, compact = false }: { title: string; value: unknown; compact?: boolean }) {
+  return (
+    <div className={`${compact ? '' : 'mt-6 '}rounded-2xl border border-slate-800 bg-slate-900/70 p-4`}>
       <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{title}</div>
       <pre className="mt-3 overflow-x-auto whitespace-pre-wrap break-words rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-xs text-slate-300">{formatJson(value ?? {})}</pre>
     </div>
