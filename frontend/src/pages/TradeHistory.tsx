@@ -70,6 +70,20 @@ function formatEt(value?: string | null) {
   return `${ET_DATE_FORMAT.format(date)} ET`
 }
 
+function prettifyLabel(value?: string | null) {
+  if (!value) return '—'
+  return value
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0) + part.slice(1).toLowerCase())
+    .join(' ')
+}
+
+function titleCase(value?: string | null) {
+  if (!value) return '—'
+  return value.charAt(0).toUpperCase() + value.slice(1).toLowerCase()
+}
+
 function pnlTone(value?: number | null): Tone {
   if ((value ?? 0) > 0) return 'good'
   if ((value ?? 0) < 0) return 'danger'
@@ -95,23 +109,24 @@ function exportRowsToCsv(rows: TradeHistoryRow[]) {
     'Exit Trigger',
     'Source',
   ]
+
   const lines = rows.map((row) => [
-    row.assetClass,
-    row.mode,
+    titleCase(row.assetClass),
+    titleCase(row.mode),
     row.symbol,
-    row.boughtAtEt ?? '',
-    row.buyPrice,
-    row.buyQuantity,
-    row.buyTotal,
-    row.soldAtEt ?? '',
-    row.sellPrice,
-    row.sellQuantity,
-    row.sellTotal,
-    row.priceDifference,
-    row.differenceAmount,
-    row.realizedPnl,
-    row.exitTrigger ?? '',
-    row.source,
+    formatEt(row.boughtAtEt ?? row.boughtAtUtc),
+    row.buyPrice ?? '',
+    row.buyQuantity ?? '',
+    row.buyTotal ?? '',
+    formatEt(row.soldAtEt ?? row.soldAtUtc),
+    row.sellPrice ?? '',
+    row.sellQuantity ?? '',
+    row.sellTotal ?? '',
+    row.priceDifference ?? '',
+    row.differenceAmount ?? '',
+    row.realizedPnl ?? '',
+    prettifyLabel(row.exitTrigger),
+    prettifyLabel(row.source),
   ])
 
   const csv = [headers, ...lines]
