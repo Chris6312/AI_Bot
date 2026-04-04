@@ -98,8 +98,8 @@ function formatPercent(value?: number | null) {
 function strategySummary(row: TradeHistoryRow) {
   const setup = prettifyLabel(row.strategySnapshot?.setupTemplate)
   const exit = prettifyLabel(row.strategySnapshot?.exitTemplate)
-  const timeframes = (row.strategySnapshot?.botTimeframes ?? []).filter(Boolean).join(', ') || '—'
-  return { setup, exit, timeframes }
+  const triggerTimeframe = row.strategySnapshot?.triggerTimeframe || '—'
+  return { setup, exit, triggerTimeframe }
 }
 
 function technicalSummary(row: TradeHistoryRow) {
@@ -132,7 +132,7 @@ function exportRowsToCsv(rows: TradeHistoryRow[]) {
     'Setup Template',
     'Exit Template',
     'Bias',
-    'Timeframes',
+    'Trigger Timeframe',
     'Change Pct',
     'SMA5',
     'SMA10',
@@ -161,7 +161,7 @@ function exportRowsToCsv(rows: TradeHistoryRow[]) {
     row.strategySnapshot?.setupTemplate ?? '',
     row.strategySnapshot?.exitTemplate ?? '',
     row.strategySnapshot?.bias ?? '',
-    (row.strategySnapshot?.botTimeframes ?? []).join(' | '),
+    row.strategySnapshot?.triggerTimeframe ?? '',
     row.technicalSnapshot?.changePct ?? '',
     row.technicalSnapshot?.sma5 ?? '',
     row.technicalSnapshot?.sma10 ?? '',
@@ -344,7 +344,7 @@ export default function TradeHistory() {
                     <td className="px-3 py-4">
                       <div className="font-medium text-white">{strategySummary(row).setup}</div>
                       <div className="text-xs text-slate-400">Exit {strategySummary(row).exit}</div>
-                      <div className="text-xs text-slate-500">TF {strategySummary(row).timeframes}</div>
+                      <div className="text-xs text-slate-500">TF {strategySummary(row).triggerTimeframe}</div>
                     </td>
                     <td className="px-3 py-4 text-slate-300">{formatEt(row.boughtAtEt ?? row.boughtAtUtc)}</td>
                     <td className="px-3 py-4">

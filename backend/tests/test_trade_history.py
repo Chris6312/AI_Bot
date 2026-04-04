@@ -41,7 +41,7 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
                         'setupTemplate': 'pullback_reclaim',
                         'exitTemplate': 'first_failed_follow_through',
                         'bias': 'bullish',
-                        'botTimeframes': ['5m', '15m'],
+                        'triggerTimeframe': '5m',
                     },
                     'technicalSnapshot': {
                         'currentPrice': 100.0,
@@ -75,7 +75,7 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
                             'setupTemplate': 'pullback_reclaim',
                             'exitTemplate': 'profit_target',
                             'bias': 'bullish',
-                            'botTimeframes': ['5m'],
+                            'triggerTimeframe': '5m',
                         },
                         'technicalSnapshot': {
                             'currentPrice': 50.0,
@@ -149,7 +149,7 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
         assert stock_row['realizedPnl'] == 100.0
         assert stock_row['soldAtEt'].endswith('-04:00')
         assert stock_row['strategySnapshot']['setupTemplate'] == 'pullback_reclaim'
-        assert stock_row['strategySnapshot']['botTimeframes'] == ['5m', '15m']
+        assert stock_row['strategySnapshot']['triggerTimeframe'] == '5m'
         assert stock_row['technicalSnapshot']['sma5'] == 99.2
         assert crypto_row['strategySnapshot']['setupTemplate'] == 'pullback_reclaim'
         assert crypto_row['technicalSnapshot']['continuityOk'] is True

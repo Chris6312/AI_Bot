@@ -242,6 +242,7 @@ export interface TradeHistoryStrategySnapshot {
   bias?: string | null
   setupTemplate?: string | null
   exitTemplate?: string | null
+  triggerTimeframe?: string | null
   botTimeframes?: string[]
   riskFlags?: string[]
   evaluationState?: string | null

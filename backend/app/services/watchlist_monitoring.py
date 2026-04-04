@@ -489,6 +489,15 @@ class WatchlistMonitoringOrchestrator:
         latest = context.get("latestEvaluation")
         return latest if isinstance(latest, dict) else {}
 
+    @staticmethod
+    def _infer_trigger_timeframe(timeframes: list[str] | None) -> str | None:
+        items = [str(item).strip() for item in (timeframes or []) if str(item).strip()]
+        if not items:
+            return None
+        order = ["5m", "15m", "1h", "4h", "1d"]
+        ranked = sorted(items, key=lambda item: order.index(item) if item in order else len(order))
+        return ranked[0] if ranked else items[0]
+
     def _build_strategy_snapshot(
         self,
         symbol_row: WatchlistSymbol,
@@ -496,6 +505,7 @@ class WatchlistMonitoringOrchestrator:
         latest_evaluation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         evaluation = latest_evaluation or {}
+        configured_timeframes = list(symbol_row.bot_timeframes or [])
         return {
             "scope": symbol_row.scope,
             "priorityRank": symbol_row.priority_rank,
@@ -503,7 +513,7 @@ class WatchlistMonitoringOrchestrator:
             "bias": symbol_row.bias,
             "setupTemplate": symbol_row.setup_template,
             "exitTemplate": symbol_row.exit_template,
-            "botTimeframes": list(symbol_row.bot_timeframes or []),
+            "triggerTimeframe": self._infer_trigger_timeframe(configured_timeframes),
             "riskFlags": list(symbol_row.risk_flags or []),
             "evaluationState": evaluation.get("state"),
             "evaluationReason": evaluation.get("reason"),
