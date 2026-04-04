@@ -829,6 +829,8 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
   const sizing = inspect.sizing ?? {}
   const exitPlan = inspect.exitPlan ?? {}
   const latestEvaluation = inspect.latestEvaluation ?? {}
+  const signalLifecycleState = asText(signal.lifecycleState) ?? asText(watchlist.lifecycleState) ?? asText(entryReasoning.lifecycleState) ?? asText(signal.monitoringStatus)
+  const signalLifecycleNote = asText(signal.lifecycleNote) ?? asText(watchlist.lifecycleNote) ?? asText(entryReasoning.lifecycleNote)
 
   const overview: StatCardRow[] = [
     { label: 'Quantity', value: displayValue('quantity', snapshot.quantity), tone: 'info' },
@@ -855,6 +857,8 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
     { label: 'Priority rank', value: displayValue('priorityRank', signal.priorityRank), tone: 'muted' },
     { label: 'Risk flags', value: displayValue('riskFlags', signal.riskFlags), tone: 'warn' },
     { label: 'Monitoring status', value: displayValue('monitoringStatus', signal.monitoringStatus), tone: 'muted' },
+    { label: 'Lifecycle state', value: displayValue('lifecycleState', signalLifecycleState), tone: 'muted' },
+    { label: 'Lifecycle note', value: displayValue('lifecycleNote', signalLifecycleNote), tone: 'warn' },
     { label: 'Cooldown active', value: displayValue('cooldownActive', signal.cooldownActive), tone: 'warn' },
     { label: 'Re-entry blocked until', value: displayValue('reentryBlockedUntilUtc', signal.reentryBlockedUntilUtc), tone: 'warn' },
     { label: 'Last exit at', value: displayValue('lastExitAtUtc', signal.lastExitAtUtc), tone: 'muted' },
@@ -918,6 +922,7 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
     { label: 'Worker time', value: displayValue('evaluatedAtUtc', latestEvaluation.evaluatedAtUtc), tone: 'muted' },
     { label: 'Broker exit pending', value: displayValue('brokerExitPending', signal.brokerExitPending), tone: 'warn' },
     { label: 'Monitoring status', value: displayValue('monitoringStatus', latestDetails.monitoringStatus ?? signal.monitoringStatus), tone: 'muted' },
+    { label: 'Lifecycle state', value: displayValue('lifecycleState', latestDetails.lifecycleState ?? signalLifecycleState), tone: 'muted' },
     { label: 'Cooldown active', value: displayValue('cooldownActive', latestDetails.cooldownActive ?? signal.cooldownActive), tone: 'warn' },
     { label: 'Re-entry blocked until', value: displayValue('reentryBlockedUntilUtc', latestDetails.reentryBlockedUntilUtc ?? signal.reentryBlockedUntilUtc), tone: 'warn' },
     { label: 'Last exit at', value: displayValue('lastExitAtUtc', latestDetails.lastExitAtUtc ?? signal.lastExitAtUtc), tone: 'muted' },

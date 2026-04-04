@@ -18,6 +18,7 @@ from app.models.watchlist_monitor_state import MONITOR_ONLY, WatchlistMonitorSta
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.kraken_service import crypto_ledger, kraken_service
+from app.services.lifecycle_state_machine import describe_lifecycle
 from app.services.market_sessions import get_scope_session_status
 from app.services.position_sizer import position_sizer
 from app.services.pre_trade_gate import pre_trade_gate
@@ -462,6 +463,25 @@ class WatchlistMonitoringOrchestrator:
         actual_mode = str(context.get("mode") or "").upper().strip()
         return not actual_mode or actual_mode == str(expected_mode).upper().strip()
 
+    @staticmethod
+    def _entry_block_payload(*, monitor_state: WatchlistMonitorState, symbol_row: WatchlistSymbol, reason: str) -> dict[str, Any]:
+        lifecycle = describe_lifecycle(getattr(monitor_state, "monitoring_status", None))
+        return {
+            "symbol": str(symbol_row.symbol or "").upper(),
+            "uploadId": symbol_row.upload_id,
+            "priorityRank": symbol_row.priority_rank,
+            "setupTemplate": symbol_row.setup_template,
+            "exitTemplate": symbol_row.exit_template,
+            "action": "SKIPPED",
+            "reason": reason,
+            "intentId": None,
+            "submittedOrderId": None,
+            "positionId": None,
+            "tradeId": None,
+            "lifecycleState": lifecycle.state,
+            "lifecycleNote": lifecycle.operator_note,
+        }
+
     def _submit_stock_entry_candidate(
         self,
         db: Session,
@@ -797,6 +817,18 @@ class WatchlistMonitoringOrchestrator:
             db.commit()
             return payload
 
+        lifecycle = describe_lifecycle(monitor_state.monitoring_status)
+        if not lifecycle.allows_entry:
+            payload.update({
+                "action": "SKIPPED",
+                "reason": "MANAGED_ONLY_ENTRY_BLOCKED" if lifecycle.state == "MANAGED_ONLY" else "ENTRY_NOT_ALLOWED",
+                "lifecycleState": lifecycle.state,
+                "lifecycleNote": lifecycle.operator_note,
+            })
+            self._record_entry_execution(db, monitor_state, payload)
+            db.commit()
+            return payload
+
         if self._has_open_crypto_position(pair):
             payload["action"] = "SKIPPED"
             payload["reason"] = "OPEN_POSITION_EXISTS"
@@ -953,6 +985,9 @@ class WatchlistMonitoringOrchestrator:
     def _record_entry_execution(self, db: Session, monitor_state: WatchlistMonitorState, payload: dict[str, Any]) -> None:
         recorded_at = self._utcnow()
         context = dict(monitor_state.decision_context_json or {})
+        lifecycle = describe_lifecycle(monitor_state.monitoring_status)
+        context["lifecycleState"] = payload.get("lifecycleState") or lifecycle.state
+        context["lifecycleNote"] = payload.get("lifecycleNote") or lifecycle.operator_note
         context["entryExecution"] = {
             "action": payload.get("action"),
             "reason": payload.get("reason"),
@@ -960,6 +995,8 @@ class WatchlistMonitoringOrchestrator:
             "submittedOrderId": payload.get("submittedOrderId"),
             "positionId": payload.get("positionId"),
             "tradeId": payload.get("tradeId"),
+            "lifecycleState": payload.get("lifecycleState") or lifecycle.state,
+            "lifecycleNote": payload.get("lifecycleNote") or lifecycle.operator_note,
             "reentryBlockedUntilUtc": payload.get("reentryBlockedUntilUtc") or context.get("reentryBlockedUntilUtc"),
             "recordedAtUtc": recorded_at.isoformat(),
         }

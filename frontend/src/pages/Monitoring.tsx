@@ -287,7 +287,10 @@ function MonitoringTable({ scope, rows, selectedSymbol }: { scope: WatchlistScop
             const entryExecution = (row.monitoring?.decisionContext as Record<string, unknown> | undefined)?.entryExecution as Record<string, unknown> | undefined
             const executionAction = String(entryExecution?.action ?? '').trim()
             const executionReason = String(entryExecution?.reason ?? '').trim()
+            const lifecycleState = String(entryExecution?.lifecycleState ?? (row.monitoring?.decisionContext as Record<string, unknown> | undefined)?.lifecycleState ?? row.monitoringStatus).trim()
+            const lifecycleNote = String(entryExecution?.lifecycleNote ?? (row.monitoring?.decisionContext as Record<string, unknown> | undefined)?.lifecycleNote ?? '').trim()
             const isFocused = selectedSymbol != null && row.symbol.toUpperCase() === selectedSymbol.toUpperCase()
+            const lifecycleMetaForState = getStatusMeta(lifecycleState || row.monitoringStatus)
 
             return (
               <tr key={`${row.uploadId}-${row.symbol}`} className={`border-b border-slate-900/80 align-top text-slate-300 ${isFocused ? 'bg-cyan-500/5' : ''}`}>
@@ -297,8 +300,9 @@ function MonitoringTable({ scope, rows, selectedSymbol }: { scope: WatchlistScop
                 </td>
                 <td className="py-3 pr-4 align-top">
                   <div className="flex flex-col gap-2">
-                    <ToneBadge tone={lifecycleMeta.tone}>{lifecycleMeta.canonicalLabel}</ToneBadge>
-                    <span className="text-xs text-slate-500">Raw: {lifecycleMeta.rawLabel}</span>
+                    <ToneBadge tone={lifecycleMetaForState.tone}>{lifecycleMetaForState.canonicalLabel}</ToneBadge>
+                    <span className="text-xs text-slate-500">Raw: {lifecycleState || lifecycleMeta.rawLabel}</span>
+                    {lifecycleNote ? <span className="text-xs text-amber-300">{lifecycleNote}</span> : null}
                   </div>
                 </td>
                 <td className="py-3 pr-4 align-top">
@@ -336,7 +340,9 @@ function MonitoringTable({ scope, rows, selectedSymbol }: { scope: WatchlistScop
                               ? 'Expired'
                               : row.positionState.hoursUntilExpiry != null
                                 ? `${row.positionState.hoursUntilExpiry.toFixed(1)}h left`
-                                : 'Watching'}
+                                : row.managedOnly
+                                  ? 'Managed-only supervision'
+                                  : 'Watching'}
                       </div>
                     </div>
                   ) : (
