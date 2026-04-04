@@ -5,6 +5,7 @@ import AuditTrail from './pages/AuditTrail'
 import Dashboard from './pages/Dashboard'
 import Monitoring from './pages/Monitoring'
 import Positions from './pages/Positions'
+import PaperLedger from './pages/PaperLedger'
 import TradeHistory from './pages/TradeHistory'
 import Settings from './pages/Settings'
 import Watchlists from './pages/Watchlists'
@@ -21,17 +22,18 @@ function App() {
               <Route path="/watchlists" element={<Watchlists />} />
               <Route path="/monitoring" element={<Monitoring />} />
               <Route path="/positions" element={<Positions />} />
+              <Route path="/paper-ledger" element={<PaperLedger />} />
               <Route path="/trade-history" element={<TradeHistory />} />
               <Route path="/audit" element={<AuditTrail />} />
               <Route path="/runtime" element={<Settings />} />
 
+              {/* Legacy fallbacks */}
               <Route path="/positions/stocks" element={<Navigate to="/positions" replace />} />
               <Route path="/positions/crypto" element={<Navigate to="/positions" replace />} />
-              <Route path="/positions/paper-ledger" element={<Navigate to="/positions" replace />} />
+              <Route path="/positions/paper-ledger" element={<Navigate to="/paper-ledger" replace />} />
               <Route path="/audit/ai-decisions" element={<Navigate to="/audit" replace />} />
               <Route path="/stocks" element={<Navigate to="/positions" replace />} />
               <Route path="/crypto" element={<Navigate to="/positions" replace />} />
-              <Route path="/paper-ledger" element={<Navigate to="/positions" replace />} />
               <Route path="/ai-decisions" element={<Navigate to="/audit" replace />} />
               <Route path="/settings" element={<Navigate to="/runtime" replace />} />
               <Route path="*" element={<Navigate to="/" replace />} />
