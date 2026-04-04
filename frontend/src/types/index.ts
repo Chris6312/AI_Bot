@@ -84,12 +84,55 @@ export interface GateSnapshot {
   recentRejections: GateDecisionRecord[]
 }
 
+
+export interface AuditReplayRejection {
+  recordedAtUtc: string
+  reason: string
+  messageId: string
+  authorId: string
+  channelId: string
+  schemaVersion: string
+  scope: string
+  provider: string
+  payloadHash: string
+}
+
+export interface AuditSystemError {
+  id: string
+  timestamp: string
+  source: string
+  component: string
+  severity: 'error' | 'warn' | string
+  state: string
+  message: string
+  symbol?: string | null
+  details: Record<string, unknown>
+}
+
+export interface AuditExitEvent {
+  id: string
+  timestamp: string
+  symbol: string
+  assetClass: string
+  status: string
+  eventType: string
+  executionSource: string
+  trigger: string
+  message: string
+  details: Record<string, unknown>
+}
+
 export interface RuntimeVisibility {
   capturedAtUtc: string
   controlPlane: ControlPlaneStatus
   executionGate: ExecutionGateStatus
   dependencies: DependencyVisibility
   gate: GateSnapshot
+  audit: {
+    replayRejections: AuditReplayRejection[]
+    systemErrors: AuditSystemError[]
+    exitTimeline: AuditExitEvent[]
+  }
 }
 
 export interface StockPosition {

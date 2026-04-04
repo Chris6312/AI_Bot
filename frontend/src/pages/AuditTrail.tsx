@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow, format } from 'date-fns'
-import { BrainCircuit, ClipboardList, FileSearch, Siren, Shield, TrendingUp } from 'lucide-react'
+import { AlertTriangle, ClipboardList, FileSearch, RotateCcw, Shield, XCircle } from 'lucide-react'
 
 import { api } from '@/lib/api'
 import {
@@ -24,7 +24,7 @@ import type {
   WatchlistUploadRecord,
 } from '@/types'
 
-type AuditLane = 'all' | 'receipt' | 'gate' | 'stock' | 'crypto' | 'ai'
+type AuditLane = 'all' | 'receipt' | 'gate' | 'stock' | 'crypto' | 'ai' | 'replay' | 'error' | 'exit'
 
 type AuditEvent = {
   id: string
@@ -84,7 +84,7 @@ function decisionScope(decision: { assetClass?: string | null } | { market?: str
 export default function AuditTrail() {
   const [searchParams, setSearchParams] = useSearchParams()
   const laneParam = searchParams.get('lane')
-  const lane = (['all', 'receipt', 'gate', 'stock', 'crypto', 'ai'] as AuditLane[]).includes((laneParam as AuditLane) ?? 'all') ? ((laneParam as AuditLane) || 'all') : 'all'
+  const lane = (['all', 'receipt', 'gate', 'stock', 'crypto', 'ai', 'replay', 'error', 'exit'] as AuditLane[]).includes((laneParam as AuditLane) ?? 'all') ? ((laneParam as AuditLane) || 'all') : 'all'
   const symbolFilter = (searchParams.get('symbol') ?? '').trim().toUpperCase()
   const scopeFilter = (searchParams.get('scope') ?? '').trim()
 
@@ -196,12 +196,52 @@ export default function AuditTrail() {
       scope: decisionScope(row),
     }))
 
-    return [...receiptEvents, ...gateEvents, ...stockEvents, ...cryptoEvents, ...aiEvents].sort((a, b) => {
+    const replayEvents: AuditEvent[] = (runtimeVisibility?.audit.replayRejections ?? []).map((row) => ({
+      id: `replay-${row.messageId || row.payloadHash}`,
+      lane: 'replay',
+      title: 'Replay rejection suppressed',
+      subtitle: `${row.provider || 'Unknown provider'} · ${row.scope || 'unknown scope'}`,
+      detail: row.reason,
+      timestamp: row.recordedAtUtc,
+      tone: 'warn',
+      statusLabel: 'Suppressed',
+      to: buildLaneHref('/watchlists', { scope: row.scope === 'stocks_only' || row.scope === 'crypto_only' ? row.scope : null }),
+      scope: row.scope === 'stocks_only' || row.scope === 'crypto_only' ? row.scope : null,
+    }))
+
+    const errorEvents: AuditEvent[] = (runtimeVisibility?.audit.systemErrors ?? []).map((row) => ({
+      id: row.id,
+      lane: 'error',
+      title: row.component,
+      subtitle: `${row.source} · ${row.state}`,
+      detail: row.message,
+      timestamp: row.timestamp,
+      tone: row.severity === 'warn' ? 'warn' : 'danger',
+      statusLabel: row.severity === 'warn' ? 'Warning' : 'Error',
+      to: row.symbol ? buildLaneHref('/monitoring', { symbol: row.symbol }) : '/settings',
+      symbol: row.symbol ?? null,
+    }))
+
+    const exitEvents: AuditEvent[] = (runtimeVisibility?.audit.exitTimeline ?? []).map((row) => ({
+      id: row.id,
+      lane: 'exit',
+      title: `${row.symbol} ${row.eventType.split('_').join(' ')}`,
+      subtitle: `${row.assetClass} · ${row.executionSource}`,
+      detail: row.trigger ? `${row.message} · trigger ${row.trigger}` : row.message,
+      timestamp: row.timestamp,
+      tone: row.status.toUpperCase().includes('REJECT') ? 'danger' : row.status.toUpperCase().includes('FILL') || row.status.toUpperCase().includes('CLOSED') ? 'good' : 'info',
+      statusLabel: getStatusMeta(row.status).canonicalLabel,
+      to: buildLaneHref('/monitoring', { symbol: row.symbol, scope: row.assetClass === 'stock' ? 'stocks_only' : row.assetClass === 'crypto' ? 'crypto_only' : null }),
+      symbol: row.symbol,
+      scope: row.assetClass === 'stock' ? 'stocks_only' : row.assetClass === 'crypto' ? 'crypto_only' : null,
+    }))
+
+    return [...receiptEvents, ...gateEvents, ...stockEvents, ...cryptoEvents, ...aiEvents, ...replayEvents, ...errorEvents, ...exitEvents].sort((a, b) => {
       const aTime = a.timestamp ? new Date(a.timestamp).getTime() : 0
       const bTime = b.timestamp ? new Date(b.timestamp).getTime() : 0
       return bTime - aTime
     })
-  }, [aiDecisions, cryptoHistory, cryptoWatchlist, runtimeVisibility?.gate.recent, stockHistory, stockWatchlist])
+  }, [aiDecisions, cryptoHistory, cryptoWatchlist, runtimeVisibility?.audit.exitTimeline, runtimeVisibility?.audit.replayRejections, runtimeVisibility?.audit.systemErrors, runtimeVisibility?.gate.recent, stockHistory, stockWatchlist])
 
   const filteredEvents = events.filter((event) => {
     if (lane !== 'all' && event.lane !== lane) return false
@@ -222,7 +262,7 @@ export default function AuditTrail() {
           </>
         }
         title="Receipts, gate decisions, and execution breadcrumbs"
-        description="This page gathers the evidence we actually persist right now: watchlist receipts, gate outcomes, stock lifecycle records, crypto paper tape, and the derived AI watchlist feed built from stored uploads."
+        description="This page gathers the evidence we actually persist right now: watchlist receipts, gate outcomes, stock lifecycle records, crypto paper tape, replay suppressions, system errors, exit decisions, and the derived AI watchlist feed built from stored uploads."
         aside={
           <>
             <StatusPill tone={stockWatchlist ? 'good' : 'warn'} label={stockWatchlist ? 'Stock receipt present' : 'No stock receipt'} />
@@ -236,8 +276,8 @@ export default function AuditTrail() {
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
         <MetricCard label="Watchlist receipts" value={String([stockWatchlist, cryptoWatchlist].filter(Boolean).length)} detail="Latest stock + crypto uploads" icon={<ClipboardList className="h-5 w-5" />} />
         <MetricCard label="Recent gate decisions" value={String(runtimeVisibility?.gate.summary.total ?? 0)} detail={`${runtimeVisibility?.gate.summary.rejectedCount ?? 0} rejected`} icon={<Shield className="h-5 w-5" />} />
-        <MetricCard label="Stock lifecycle records" value={String(stockHistory.length)} detail="Order intents with event trails" icon={<TrendingUp className="h-5 w-5" />} />
-        <MetricCard label="AI decision feed" value={String(aiDecisions.length)} detail={aiDecisions.length > 0 ? 'Derived from stored watchlist uploads' : 'No derived decisions stored yet'} icon={<BrainCircuit className="h-5 w-5" />} />
+        <MetricCard label="Replay suppressions" value={String(runtimeVisibility?.audit.replayRejections.length ?? 0)} detail={(runtimeVisibility?.audit.replayRejections.length ?? 0) > 0 ? 'Duplicate Discord payloads captured' : 'No duplicate payloads seen'} icon={<RotateCcw className="h-5 w-5" />} />
+        <MetricCard label="System + exit timeline" value={String((runtimeVisibility?.audit.systemErrors.length ?? 0) + (runtimeVisibility?.audit.exitTimeline.length ?? 0))} detail={`${runtimeVisibility?.audit.systemErrors.length ?? 0} errors · ${runtimeVisibility?.audit.exitTimeline.length ?? 0} exit events`} icon={<AlertTriangle className="h-5 w-5" />} />
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(340px,0.95fr)]">
@@ -246,7 +286,7 @@ export default function AuditTrail() {
           eyebrow="Evidence stream"
           icon={<FileSearch className="h-4 w-4 text-cyan-300" />}
           actions={
-            (['all', 'receipt', 'gate', 'stock', 'crypto', 'ai'] as AuditLane[]).map((option) => (
+            (['all', 'receipt', 'gate', 'stock', 'crypto', 'ai', 'replay', 'error', 'exit'] as AuditLane[]).map((option) => (
               <button
                 key={option}
                 onClick={() => {
@@ -305,12 +345,12 @@ export default function AuditTrail() {
             </div>
           </SectionCard>
 
-          <SectionCard title="Gaps still visible" eyebrow="Known holes" icon={<Siren className="h-4 w-4 text-amber-300" />}>
+          <SectionCard title="Visibility checkpoints" eyebrow="Former holes" icon={<XCircle className="h-4 w-4 text-cyan-300" />}>
             <div className="space-y-3 text-sm text-slate-400">
               <DetailRow label="AI decisions feed" value={aiDecisions.length > 0 ? 'Present' : 'No derived entries yet'} tone={aiDecisions.length > 0 ? 'good' : 'warn'} />
-              <DetailRow label="Replay rejection stream" value="Not yet exposed in frontend API" tone="warn" />
-              <DetailRow label="System error timeline" value="Not yet exposed in frontend API" tone="warn" />
-              <DetailRow label="Exit decision timeline" value="Partially visible through stock lifecycle and tape" tone="info" />
+              <DetailRow label="Replay rejection stream" value={(runtimeVisibility?.audit.replayRejections.length ?? 0) > 0 ? `${runtimeVisibility?.audit.replayRejections.length ?? 0} captured` : 'Live and waiting for first duplicate'} tone="good" />
+              <DetailRow label="System error timeline" value={(runtimeVisibility?.audit.systemErrors.length ?? 0) > 0 ? `${runtimeVisibility?.audit.systemErrors.length ?? 0} events visible` : 'Exposed and currently quiet'} tone={(runtimeVisibility?.audit.systemErrors.length ?? 0) > 0 ? 'warn' : 'good'} />
+              <DetailRow label="Exit decision timeline" value={(runtimeVisibility?.audit.exitTimeline.length ?? 0) > 0 ? `${runtimeVisibility?.audit.exitTimeline.length ?? 0} lifecycle events visible` : 'Exposed and waiting for next exit'} tone="good" />
             </div>
           </SectionCard>
         </div>
