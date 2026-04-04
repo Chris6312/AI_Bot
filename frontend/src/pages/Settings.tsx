@@ -131,6 +131,8 @@ export default function Settings() {
   )
 
   const dependencyChecks = runtimeVisibility?.dependencies.checks
+  const truthBoard = runtimeVisibility?.truthBoard
+  const truthScopes = truthBoard ? Object.values(truthBoard.scopes).filter((scope) => scope.tracked) : []
   const gateSummary = runtimeVisibility?.gate.summary
   const recentGateDecisions = runtimeVisibility?.gate.recent ?? []
   const recentRejections = runtimeVisibility?.gate.recentRejections ?? []
@@ -161,6 +163,79 @@ export default function Settings() {
         <MetricCard label="Operational readiness" value={runtimeVisibility?.dependencies.summary.operationalReady ? 'Ready' : 'Review'} detail={runtimeVisibility?.dependencies.summary.workerReady ? 'Dependency and worker probes look healthy' : 'At least one worker or dependency probe needs attention'} icon={<Wifi className="h-5 w-5" />} />
         <MetricCard label="Last heartbeat" value={formatRelative(status?.lastHeartbeat)} detail={formatAbsolute(status?.lastHeartbeat)} icon={<Clock3 className="h-5 w-5" />} />
       </div>
+
+      <section className="rounded-3xl border border-slate-800 bg-slate-900/70 p-5">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <div className="text-sm font-semibold text-slate-200">Fresh-entry truth board</div>
+            <div className="mt-1 max-w-3xl text-sm leading-6 text-slate-400">
+              This board splits the world in two: supervision for positions already in orbit, and actual clearance for fresh entries. Managed-only rows still need babysitting, but they should not sneak back into the launch queue.
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusPill tone={stateTone(truthBoard?.state)} label={`Truth ${truthBoard?.state ?? 'Unknown'}`} />
+            <StatusPill tone={truthBoard?.freshEntryReady ? 'good' : 'warn'} label={truthBoard?.freshEntryReady ? 'Fresh entries enabled' : 'Fresh entries blocked'} />
+            <StatusPill tone={truthBoard?.supervisionReady ? 'good' : 'warn'} label={truthBoard?.supervisionReady ? 'Supervision healthy' : 'Supervision degraded'} />
+          </div>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(300px,0.85fr)]">
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+              <MiniMetric label="Truth state" value={truthBoard?.state ?? '—'} />
+              <MiniMetric label="Tracked scopes" value={String(truthBoard?.trackedScopeCount ?? 0)} />
+              <MiniMetric label="Gate status" value={status?.executionGate.state ?? '—'} />
+            </div>
+
+            <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+              <div className="text-xs uppercase tracking-wide text-slate-500">Current truth reason</div>
+              <div className="mt-2 text-sm text-slate-300">{truthBoard?.reason || 'Waiting for truth-board telemetry.'}</div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              {truthScopes.length === 0 ? (
+                <EmptyState message="No tracked watchlist scopes are loaded yet." compact />
+              ) : (
+                truthScopes.map((scope) => (
+                  <div key={scope.scope} className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="font-semibold text-white">{humanize(scope.scope)}</div>
+                        <div className="mt-1 text-sm text-slate-400">{scope.reason || 'Scope is clear for fresh-entry evaluation.'}</div>
+                      </div>
+                      <StatusBadge tone={stateTone(scope.state)}>{scope.state}</StatusBadge>
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-2 text-sm text-slate-400">
+                      <MiniMetric label="Fresh entry" value={scope.freshEntryReady ? 'ready' : 'blocked'} />
+                      <MiniMetric label="Supervision" value={scope.supervisionReady ? 'healthy' : 'review'} />
+                      <MiniMetric label="Active symbols" value={String(scope.activeSymbolCount)} />
+                      <MiniMetric label="Managed only" value={String(scope.managedOnlyCount)} />
+                      <MiniMetric label="Open positions" value={String(scope.openPositionCount)} />
+                      <MiniMetric label="Data warnings" value={String(scope.dataWarningCount)} />
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+            <div className="text-sm font-semibold text-slate-200">Blocking issues</div>
+            <div className="mt-1 text-sm text-slate-400">These are the sharp rocks currently touching readiness or scope truth.</div>
+            <div className="mt-4 space-y-3">
+              {truthBoard?.activeIssues?.length ? (
+                truthBoard.activeIssues.map((issue, index) => (
+                  <div key={`${issue}-${index}`} className="rounded-2xl border border-amber-900/60 bg-amber-500/5 px-4 py-3 text-sm text-amber-100">
+                    {issue}
+                  </div>
+                ))
+              ) : (
+                <EmptyState message="No active blockers. The rails are quiet." compact />
+              )}
+            </div>
+          </div>
+        </div>
+      </section>
 
       {message ? <Notice tone="success" message={message} /> : null}
       {errorMessage ? <Notice tone="error" message={errorMessage} /> : null}

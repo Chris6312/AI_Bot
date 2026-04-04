@@ -609,11 +609,7 @@ class WatchlistService:
                 (row['monitoring']['lastEvaluatedAtUtc'] for row in rows if row.get('monitoring') and row['monitoring']['lastEvaluatedAtUtc']),
                 default=None,
             )
-            result[scope_value] = {
-                'scope': scope_value,
-                'capturedAtUtc': observed_at.isoformat(),
-                'activeUploadId': active_upload.upload_id if active_upload else None,
-                'summary': {
+            summary = {
                     'total': len(rows),
                     'activeCount': sum(1 for row in rows if row['monitoringStatus'] == ACTIVE),
                     'managedOnlyCount': sum(1 for row in rows if row['monitoringStatus'] == MANAGED_ONLY),
@@ -663,7 +659,55 @@ class WatchlistService:
                     ),
                     'nextEvaluationAtUtc': next_eval,
                     'lastEvaluatedAtUtc': last_eval,
-                },
+                }
+            active_upload_received_at = active_upload.received_at_utc.isoformat() if active_upload and active_upload.received_at_utc else None
+            watchlist_expires_at = active_upload.watchlist_expires_at_utc.isoformat() if active_upload and active_upload.watchlist_expires_at_utc else None
+            watchlist_expired = bool(
+                active_upload
+                and active_upload.watchlist_expires_at_utc
+                and _normalize_dt(active_upload.watchlist_expires_at_utc) <= observed_at
+            )
+            data_warning_count = int(summary['dataStaleCount'] + summary['dataUnavailableCount'] + summary['evaluationBlockedCount'])
+            if active_upload is None:
+                if summary['openPositionCount'] > 0 or summary['managedOnlyCount'] > 0:
+                    scope_truth_state = 'DEGRADED'
+                    scope_truth_reason = 'No active watchlist upload is loaded, but existing positions still need supervision.'
+                else:
+                    scope_truth_state = 'MISSING'
+                    scope_truth_reason = 'No active watchlist upload is loaded for this scope.'
+            elif watchlist_expired:
+                scope_truth_state = 'STALE'
+                scope_truth_reason = 'Active watchlist upload has expired for fresh entries.'
+            elif summary['managedOnlyCount'] > 0:
+                scope_truth_state = 'DEGRADED'
+                if summary['activeCount'] <= 0:
+                    scope_truth_reason = 'Scope is supervision-only. Managed-only rows remain, but no fresh-entry symbols are eligible.'
+                else:
+                    scope_truth_reason = 'Scope is not supervision-only-ready. Managed-only rows still require supervision-only review before it can be treated as fully ready.'
+            else:
+                scope_truth_state = 'READY'
+                scope_truth_reason = '' if data_warning_count == 0 else 'Scope has active symbols, but some rows currently need data or evaluation review.'
+
+            scope_truth = {
+                'scope': scope_value,
+                'state': scope_truth_state,
+                'ready': bool(scope_truth_state == 'READY'),
+                'reason': scope_truth_reason,
+                'activeUploadId': active_upload.upload_id if active_upload else None,
+                'activeUploadReceivedAtUtc': active_upload_received_at,
+                'watchlistExpiresAtUtc': watchlist_expires_at,
+                'watchlistExpired': watchlist_expired,
+                'activeSymbolCount': int(summary['activeCount']),
+                'managedOnlyCount': int(summary['managedOnlyCount']),
+                'openPositionCount': int(summary['openPositionCount']),
+                'dataWarningCount': data_warning_count,
+            }
+            result[scope_value] = {
+                'scope': scope_value,
+                'capturedAtUtc': observed_at.isoformat(),
+                'activeUploadId': active_upload.upload_id if active_upload else None,
+                'scopeTruth': scope_truth,
+                'summary': summary,
                 'rows': rows,
             }
         return result[scope] if scope is not None else result

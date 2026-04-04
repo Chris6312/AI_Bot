@@ -4952,3 +4952,40 @@ def test_watchlist_exit_worker_oversell_rejection_records_quantity_truth(tmp_pat
         assert event.payload_json['quantityTruth']['expectedPositionQty'] == 289
         assert event.payload_json['quantityTruth']['brokerReportedQty'] == 120
         assert event.payload_json['quantityTruth']['sellableQty'] == 120
+
+
+def test_monitoring_snapshot_scope_truth_flags_managed_only_review_and_missing_scope(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        active_row = (
+            db.query(WatchlistSymbol)
+            .filter(WatchlistSymbol.scope == 'stocks_only')
+            .order_by(WatchlistSymbol.id.asc())
+            .first()
+        )
+        assert active_row is not None
+        active_row.monitoring_status = MANAGED_ONLY
+
+        monitor_state = (
+            db.query(WatchlistMonitorState)
+            .filter(WatchlistMonitorState.watchlist_symbol_id == active_row.id)
+            .first()
+        )
+        assert monitor_state is not None
+        monitor_state.monitoring_status = MANAGED_ONLY
+        db.commit()
+
+        stock_snapshot = watchlist_service.get_monitoring_snapshot(db, scope='stocks_only')
+        crypto_snapshot = watchlist_service.get_monitoring_snapshot(db, scope='crypto_only')
+
+        assert stock_snapshot['scopeTruth']['state'] == 'DEGRADED'
+        assert stock_snapshot['scopeTruth']['ready'] is False
+        assert stock_snapshot['scopeTruth']['managedOnlyCount'] >= 1
+        assert 'supervision-only' in stock_snapshot['scopeTruth']['reason']
+
+        assert crypto_snapshot['scopeTruth']['state'] == 'MISSING'
+        assert crypto_snapshot['scopeTruth']['ready'] is False
+        assert crypto_snapshot['scopeTruth']['activeUploadId'] is None

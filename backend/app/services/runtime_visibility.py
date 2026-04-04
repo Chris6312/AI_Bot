@@ -130,6 +130,16 @@ class RuntimeVisibilityService:
         execution_gate = get_execution_gate_status()
         dependencies = self.get_dependency_status(force_refresh=force_refresh)
         gate = self.get_gate_snapshot(limit=limit)
+        truth_board = self._build_truth_board(
+            control_plane=control_plane,
+            execution_gate={
+                "allowed": execution_gate.allowed,
+                "state": execution_gate.state,
+                "reason": execution_gate.reason,
+                "statusCode": execution_gate.status_code,
+            },
+            dependencies=dependencies,
+        )
         return {
             "capturedAtUtc": _utcnow().isoformat(),
             "controlPlane": control_plane,
@@ -140,6 +150,7 @@ class RuntimeVisibilityService:
                 "statusCode": execution_gate.status_code,
             },
             "dependencies": dependencies,
+            "truthBoard": truth_board,
             "gate": gate,
             "audit": {
                 "replayRejections": self.get_replay_rejections(limit=limit),
@@ -272,6 +283,112 @@ class RuntimeVisibilityService:
                 }
             )
         return rows
+
+
+    def _build_truth_board(
+        self,
+        *,
+        control_plane: dict[str, Any],
+        execution_gate: dict[str, Any],
+        dependencies: dict[str, Any],
+    ) -> dict[str, Any]:
+        dependency_summary = dependencies.get("summary") if isinstance(dependencies, dict) else {}
+        checks = dependencies.get("checks") if isinstance(dependencies, dict) else {}
+        monitor_check = checks.get("watchlistMonitor") if isinstance(checks, dict) else {}
+        scope_truth_raw = monitor_check.get("details", {}).get("scopeTruth") if isinstance(monitor_check, dict) else {}
+        scopes: dict[str, dict[str, Any]] = {}
+        tracked_scope_payloads: list[dict[str, Any]] = []
+
+        authorization_ready = bool(control_plane.get("authorizationReady"))
+        runtime_running = bool(control_plane.get("runtimeRunning"))
+        dependencies_operational = bool(dependency_summary.get("operationalReady"))
+        supervision_ready = bool(authorization_ready and dependencies_operational)
+        fresh_entry_base_ready = bool(supervision_ready and runtime_running and execution_gate.get("allowed"))
+
+        for scope_name in ("stocks_only", "crypto_only"):
+            truth = scope_truth_raw.get(scope_name) if isinstance(scope_truth_raw, dict) else {}
+            normalized = {
+                "scope": scope_name,
+                "state": str((truth or {}).get("state") or "MISSING"),
+                "reason": str((truth or {}).get("reason") or ""),
+                "ready": bool((truth or {}).get("ready", False)),
+                "activeUploadId": (truth or {}).get("activeUploadId"),
+                "activeUploadReceivedAtUtc": (truth or {}).get("activeUploadReceivedAtUtc"),
+                "watchlistExpiresAtUtc": (truth or {}).get("watchlistExpiresAtUtc"),
+                "watchlistExpired": bool((truth or {}).get("watchlistExpired", False)),
+                "activeSymbolCount": _safe_int((truth or {}).get("activeSymbolCount")),
+                "managedOnlyCount": _safe_int((truth or {}).get("managedOnlyCount")),
+                "openPositionCount": _safe_int((truth or {}).get("openPositionCount")),
+                "dataWarningCount": _safe_int((truth or {}).get("dataWarningCount")),
+            }
+            tracked = bool(
+                normalized["activeUploadId"]
+                or normalized["activeSymbolCount"] > 0
+                or normalized["managedOnlyCount"] > 0
+                or normalized["openPositionCount"] > 0
+            )
+            normalized["tracked"] = tracked
+            normalized["freshEntryReady"] = bool(fresh_entry_base_ready and tracked and normalized["ready"])
+            normalized["supervisionReady"] = bool(supervision_ready and (tracked or authorization_ready))
+            scopes[scope_name] = normalized
+            if tracked:
+                tracked_scope_payloads.append(normalized)
+
+        active_issues: list[str] = []
+        if not authorization_ready:
+            active_issues.append(str(control_plane.get("reason") or "Authorization surfaces are not fully configured."))
+        elif not runtime_running:
+            active_issues.append(str(control_plane.get("reason") or "Runtime running flag is false."))
+
+        if not dependencies_operational:
+            active_issues.append("One or more critical dependencies or worker probes are degraded.")
+
+        if not execution_gate.get("allowed"):
+            gate_reason = str(execution_gate.get("reason") or execution_gate.get("state") or "Execution gate is blocking entries.")
+            if gate_reason:
+                active_issues.append(gate_reason)
+
+        for scope_name, scope_payload in scopes.items():
+            if not scope_payload["tracked"]:
+                continue
+            if scope_payload["state"] != "READY":
+                reason = scope_payload.get("reason") or scope_payload["state"]
+                active_issues.append(f"{scope_name}: {reason}")
+
+        unique_issues: list[str] = []
+        seen: set[str] = set()
+        for issue in active_issues:
+            normalized_issue = str(issue).strip()
+            if not normalized_issue or normalized_issue in seen:
+                continue
+            seen.add(normalized_issue)
+            unique_issues.append(normalized_issue)
+
+        fresh_entry_ready = bool(any(scope["freshEntryReady"] for scope in tracked_scope_payloads))
+        if not tracked_scope_payloads:
+            fresh_entry_ready = False
+            if runtime_running and authorization_ready:
+                unique_issues.append("No active watchlist scopes are currently loaded for fresh entries.")
+
+        if not supervision_ready:
+            truth_state = "BLOCKED"
+            truth_reason = unique_issues[0] if unique_issues else "Supervision rails are not operational."
+        elif fresh_entry_ready:
+            truth_state = "READY"
+            truth_reason = "At least one tracked scope is eligible for fresh entries and supervision is healthy."
+        else:
+            truth_state = "REVIEW"
+            truth_reason = unique_issues[0] if unique_issues else "No tracked scope is currently eligible for fresh entries."
+
+        return {
+            "state": truth_state,
+            "reason": truth_reason,
+            "freshEntryReady": fresh_entry_ready,
+            "supervisionReady": supervision_ready,
+            "trackedScopeCount": len(tracked_scope_payloads),
+            "activeIssues": unique_issues,
+            "scopes": scopes,
+        }
 
     def _probe_dependencies(self, observed_at: datetime) -> dict[str, Any]:
         ttl = max(int(settings.RUNTIME_VISIBILITY_PROBE_TTL_SECONDS), 5)

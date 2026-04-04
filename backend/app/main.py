@@ -193,23 +193,29 @@ async def root():
 
 
 @app.get('/health')
-async def health():
-    dependencies = runtime_visibility_service.get_dependency_status()
+async def health(force_refresh: bool = Query(False)):
+    runtime_visibility = runtime_visibility_service.get_runtime_snapshot(limit=5, force_refresh=force_refresh)
+    truth_board = runtime_visibility['truthBoard']
     return {
-        'status': 'healthy' if dependencies['summary']['criticalReady'] else 'degraded',
-        'dependencies': dependencies,
+        'status': 'healthy' if truth_board['supervisionReady'] else 'degraded',
+        'reason': truth_board['reason'],
+        'truthBoard': truth_board,
+        'dependencies': runtime_visibility['dependencies'],
     }
 
 
 @app.get('/ready')
 async def ready(force_refresh: bool = Query(False)):
-    control_plane = get_control_plane_status()
-    dependencies = runtime_visibility_service.get_dependency_status(force_refresh=force_refresh)
-    readiness_ok = bool(control_plane['authorizationReady'] and dependencies['summary']['criticalReady'])
+    runtime_visibility = runtime_visibility_service.get_runtime_snapshot(limit=5, force_refresh=force_refresh)
+    truth_board = runtime_visibility['truthBoard']
+    readiness_ok = bool(truth_board['freshEntryReady'])
     return {
         'status': 'ready' if readiness_ok else 'degraded',
-        'controlPlane': control_plane,
-        'dependencies': dependencies,
+        'reason': truth_board['reason'],
+        'controlPlane': runtime_visibility['controlPlane'],
+        'executionGate': runtime_visibility['executionGate'],
+        'dependencies': runtime_visibility['dependencies'],
+        'truthBoard': truth_board,
         'stockCapabilities': {
             'paperReady': tradier_client.is_ready('PAPER'),
             'liveReady': tradier_client.is_ready('LIVE'),
@@ -245,6 +251,7 @@ async def get_status():
         'runtimeVisibility': {
             'gateSummary': runtime_visibility['gate']['summary'],
             'dependencySummary': runtime_visibility['dependencies']['summary'],
+            'truthBoard': runtime_visibility['truthBoard'],
             'lastDecision': runtime_visibility['gate']['summary']['lastDecision'],
             'lastRejected': runtime_visibility['gate']['summary']['lastRejected'],
         },

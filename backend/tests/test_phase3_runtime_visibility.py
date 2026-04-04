@@ -388,3 +388,94 @@ def test_runtime_visibility_system_error_timeline_includes_dependency_and_order_
 
     assert any(row['component'] == 'Tradier Live' for row in rows)
     assert any(row['component'] == 'WATCHLIST_MONITOR' and row['symbol'] == 'MSFT' for row in rows)
+
+
+def test_runtime_visibility_truth_board_marks_managed_only_scope_as_review(monkeypatch) -> None:
+    runtime_visibility_service.reset_for_tests()
+
+    payload = _mock_dependencies()
+    payload['checks']['watchlistMonitor']['details'] = {
+        'scopeTruth': {
+            'stocks_only': {
+                'scope': 'stocks_only',
+                'state': 'READY',
+                'ready': True,
+                'reason': '',
+                'activeUploadId': 'stocks-1',
+                'activeSymbolCount': 2,
+                'managedOnlyCount': 0,
+                'openPositionCount': 1,
+                'dataWarningCount': 0,
+            },
+            'crypto_only': {
+                'scope': 'crypto_only',
+                'state': 'DEGRADED',
+                'ready': False,
+                'reason': 'Scope is supervision-only. Managed-only rows remain, but no fresh-entry symbols are eligible.',
+                'activeUploadId': 'crypto-1',
+                'activeSymbolCount': 0,
+                'managedOnlyCount': 2,
+                'openPositionCount': 2,
+                'dataWarningCount': 0,
+            },
+        }
+    }
+    monkeypatch.setattr(runtime_visibility_service, 'get_dependency_status', lambda force_refresh=False: payload)
+
+    snapshot = runtime_visibility_service.get_runtime_snapshot(limit=5, force_refresh=True)
+    truth_board = snapshot['truthBoard']
+
+    assert truth_board['state'] == 'READY'
+    assert truth_board['supervisionReady'] is True
+    assert truth_board['freshEntryReady'] is True
+    assert truth_board['scopes']['stocks_only']['freshEntryReady'] is True
+    assert truth_board['scopes']['crypto_only']['freshEntryReady'] is False
+    assert any('crypto_only:' in issue for issue in truth_board['activeIssues'])
+
+
+
+def test_ready_endpoint_uses_truth_board_fresh_entry_semantics(monkeypatch) -> None:
+    runtime_visibility_service.reset_for_tests()
+    monkeypatch.setattr(
+        runtime_visibility_service,
+        'get_runtime_snapshot',
+        lambda limit=5, force_refresh=False: {
+            'capturedAtUtc': '2026-03-31T14:30:00+00:00',
+            'controlPlane': {
+                'state': 'ARMED',
+                'reason': 'Execution surfaces are authenticated and runtime is enabled.',
+                'runtimeRunning': True,
+                'adminApiReady': True,
+                'discordAuthReady': True,
+                'authorizationReady': True,
+                'lastHeartbeat': '2026-03-31T14:29:55+00:00',
+            },
+            'executionGate': {
+                'allowed': True,
+                'state': 'ARMED',
+                'reason': '',
+                'statusCode': 200,
+            },
+            'dependencies': _mock_dependencies(),
+            'truthBoard': {
+                'state': 'REVIEW',
+                'reason': 'No tracked scope is currently eligible for fresh entries.',
+                'freshEntryReady': False,
+                'supervisionReady': True,
+                'trackedScopeCount': 1,
+                'activeIssues': ['crypto_only: Scope is supervision-only.'],
+                'scopes': {},
+            },
+            'gate': {'summary': {'total': 0, 'allowedCount': 0, 'rejectedCount': 0, 'lastDecision': None, 'lastAllowed': None, 'lastRejected': None}, 'recent': [], 'recentRejections': []},
+            'audit': {'replayRejections': [], 'systemErrors': [], 'exitTimeline': []},
+        },
+    )
+
+    with TestClient(app) as client:
+        response = client.get('/ready')
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['status'] == 'degraded'
+    assert payload['truthBoard']['supervisionReady'] is True
+    assert payload['truthBoard']['freshEntryReady'] is False

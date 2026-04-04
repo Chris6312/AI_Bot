@@ -122,11 +122,40 @@ export interface AuditExitEvent {
   details: Record<string, unknown>
 }
 
+export interface RuntimeTruthScope {
+  scope: WatchlistScope
+  state: 'READY' | 'REVIEW' | 'DEGRADED' | 'STALE' | 'MISSING' | 'BLOCKED' | string
+  reason: string
+  ready: boolean
+  tracked: boolean
+  freshEntryReady: boolean
+  supervisionReady: boolean
+  activeUploadId: string | null
+  activeUploadReceivedAtUtc: string | null
+  watchlistExpiresAtUtc: string | null
+  watchlistExpired: boolean
+  activeSymbolCount: number
+  managedOnlyCount: number
+  openPositionCount: number
+  dataWarningCount: number
+}
+
+export interface RuntimeTruthBoard {
+  state: 'READY' | 'REVIEW' | 'BLOCKED' | string
+  reason: string
+  freshEntryReady: boolean
+  supervisionReady: boolean
+  trackedScopeCount: number
+  activeIssues: string[]
+  scopes: Record<WatchlistScope, RuntimeTruthScope>
+}
+
 export interface RuntimeVisibility {
   capturedAtUtc: string
   controlPlane: ControlPlaneStatus
   executionGate: ExecutionGateStatus
   dependencies: DependencyVisibility
+  truthBoard: RuntimeTruthBoard
   gate: GateSnapshot
   audit: {
     replayRejections: AuditReplayRejection[]
@@ -340,6 +369,7 @@ export interface BotStatus {
   runtimeVisibility: {
     gateSummary: GateSnapshot['summary']
     dependencySummary: DependencyVisibility['summary']
+    truthBoard: RuntimeTruthBoard
     lastDecision: GateDecisionRecord | null
     lastRejected: GateDecisionRecord | null
   }
