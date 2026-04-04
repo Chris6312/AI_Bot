@@ -242,7 +242,6 @@ export interface TradeHistoryStrategySnapshot {
   bias?: string | null
   setupTemplate?: string | null
   exitTemplate?: string | null
-  triggerTimeframe?: string | null
   botTimeframes?: string[]
   riskFlags?: string[]
   evaluationState?: string | null
@@ -268,6 +267,9 @@ export interface TradeHistoryTechnicalSnapshot {
   triggerLevel?: number | null
   breakoutLevel?: number | null
   bounceFloor?: number | null
+  signalStrength?: number | null
+  distanceFromSma10Pct?: number | null
+  breakoutDistancePct?: number | null
   marketDataAtUtc?: string | null
 }
 

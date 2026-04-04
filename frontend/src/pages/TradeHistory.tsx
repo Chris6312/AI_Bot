@@ -95,15 +95,23 @@ function formatPercent(value?: number | null) {
   return `${value.toFixed(2)}%`
 }
 
+function formatStrength(value?: number | null) {
+  if (value == null || Number.isNaN(value)) return '—'
+  return value.toFixed(2)
+}
+
 function strategySummary(row: TradeHistoryRow) {
   const setup = prettifyLabel(row.strategySnapshot?.setupTemplate)
   const exit = prettifyLabel(row.strategySnapshot?.exitTemplate)
-  const triggerTimeframe = row.strategySnapshot?.triggerTimeframe || '—'
-  return { setup, exit, triggerTimeframe }
+  const timeframes = (row.strategySnapshot?.botTimeframes ?? []).filter(Boolean).join(', ') || '—'
+  return { setup, exit, timeframes }
 }
 
 function technicalSummary(row: TradeHistoryRow) {
   const pieces: string[] = []
+  if (row.technicalSnapshot?.signalStrength != null) pieces.push(`Strength ${formatStrength(row.technicalSnapshot.signalStrength)}`)
+  if (row.technicalSnapshot?.distanceFromSma10Pct != null) pieces.push(`vs SMA10 ${formatPercent(row.technicalSnapshot.distanceFromSma10Pct)}`)
+  if (row.technicalSnapshot?.breakoutDistancePct != null) pieces.push(`vs Breakout ${formatPercent(row.technicalSnapshot.breakoutDistancePct)}`)
   if (row.technicalSnapshot?.changePct != null) pieces.push(`Δ ${formatPercent(row.technicalSnapshot.changePct)}`)
   if (row.technicalSnapshot?.sma5 != null) pieces.push(`SMA5 ${ET_NUMBER.format(row.technicalSnapshot.sma5)}`)
   if (row.technicalSnapshot?.sma10 != null) pieces.push(`SMA10 ${ET_NUMBER.format(row.technicalSnapshot.sma10)}`)
@@ -132,7 +140,10 @@ function exportRowsToCsv(rows: TradeHistoryRow[]) {
     'Setup Template',
     'Exit Template',
     'Bias',
-    'Trigger Timeframe',
+    'Timeframes',
+    'Signal Strength',
+    'Distance From SMA10 Pct',
+    'Breakout Distance Pct',
     'Change Pct',
     'SMA5',
     'SMA10',
@@ -161,7 +172,10 @@ function exportRowsToCsv(rows: TradeHistoryRow[]) {
     row.strategySnapshot?.setupTemplate ?? '',
     row.strategySnapshot?.exitTemplate ?? '',
     row.strategySnapshot?.bias ?? '',
-    row.strategySnapshot?.triggerTimeframe ?? '',
+    (row.strategySnapshot?.botTimeframes ?? []).join(' | '),
+    row.technicalSnapshot?.signalStrength ?? '',
+    row.technicalSnapshot?.distanceFromSma10Pct ?? '',
+    row.technicalSnapshot?.breakoutDistancePct ?? '',
     row.technicalSnapshot?.changePct ?? '',
     row.technicalSnapshot?.sma5 ?? '',
     row.technicalSnapshot?.sma10 ?? '',
@@ -344,7 +358,7 @@ export default function TradeHistory() {
                     <td className="px-3 py-4">
                       <div className="font-medium text-white">{strategySummary(row).setup}</div>
                       <div className="text-xs text-slate-400">Exit {strategySummary(row).exit}</div>
-                      <div className="text-xs text-slate-500">TF {strategySummary(row).triggerTimeframe}</div>
+                      <div className="text-xs text-slate-500">TF {strategySummary(row).timeframes}</div>
                     </td>
                     <td className="px-3 py-4 text-slate-300">{formatEt(row.boughtAtEt ?? row.boughtAtUtc)}</td>
                     <td className="px-3 py-4">

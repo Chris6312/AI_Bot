@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 ACTIVE_EXIT_INTENT_STATUSES = {'READY', 'SUBMITTED', 'PARTIALLY_FILLED'}
 TERMINAL_EXIT_INTENT_STATUSES = {'REJECTED', 'CLOSED', 'CANCELED', 'CANCELLED', 'ERROR', 'FAILED', 'FILLED'}
 ACTIVE_BROKER_EXIT_ORDER_STATUSES = {'OPEN', 'PENDING', 'SUBMITTED', 'ACCEPTED', 'PARTIALLY_FILLED', 'NEW'}
+REPLAYABLE_CRYPTO_INTENT_STATUSES = {'FILLED', 'CLOSED'}
 EXIT_TRIGGER = 'TIME_STOP_EXPIRED'
 STOP_LOSS_TRIGGER = 'STOP_LOSS_BREACH'
 TRAILING_STOP_TRIGGER = 'TRAILING_STOP_BREACH'
@@ -637,7 +638,9 @@ class WatchlistExitWorkerService:
         symbol = str(row.get('symbol') or '').upper().strip()
         position_state = row.get('positionState', {}) or {}
         ledger_position = self._find_crypto_ledger_position(symbol)
-        requested_quantity = self._safe_float((ledger_position or {}).get('amount'))
+        ledger_quantity = self._safe_float((ledger_position or {}).get('amount'))
+        quantity_truth = self._get_crypto_exit_quantity_truth(db, symbol=symbol, ledger_quantity=ledger_quantity)
+        requested_quantity = self._safe_float(quantity_truth.get('requestedExitQuantity'))
         payload = {
             'scope': 'crypto_only',
             'assetClass': 'crypto',
@@ -652,12 +655,13 @@ class WatchlistExitWorkerService:
             'exitReasons': self._build_exit_reasons(row),
             'action': None,
             'reason': None,
-            'brokerQuantity': None,
+            'brokerQuantity': ledger_quantity,
             'brokerReservedQuantity': 0,
             'brokerAvailableQuantity': requested_quantity,
             'brokerExitPending': False,
             'brokerPendingOrders': [],
             'requestedQuantity': requested_quantity,
+            'quantityTruth': quantity_truth,
             'ledgerPair': (ledger_position or {}).get('pair') or row.get('symbol'),
             'ohlcvPair': (ledger_position or {}).get('ohlcvPair') or self._resolve_crypto_ohlcv_pair((ledger_position or {}).get('pair') or row.get('symbol')),
             'currentPrice': self._safe_float((ledger_position or {}).get('currentPrice') or position_state.get('currentPrice')),
@@ -671,6 +675,8 @@ class WatchlistExitWorkerService:
         if requested_quantity <= 0:
             payload['action'] = 'SKIPPED'
             payload['reason'] = 'NO_OPEN_QUANTITY'
+        elif bool(quantity_truth.get('driftDetected')):
+            payload['reason'] = str(quantity_truth.get('reason') or 'CRYPTO_EXIT_QTY_CLAMPED_TO_TRUTH')
         return payload
 
     @staticmethod
@@ -708,6 +714,70 @@ class WatchlistExitWorkerService:
             if pair in aliases or cls._crypto_symbol_aliases(pair).intersection(aliases):
                 return row
         return None
+
+    def _get_crypto_exit_quantity_truth(self, db: Session, *, symbol: str, ledger_quantity: float) -> dict[str, Any]:
+        aliases = sorted(self._crypto_symbol_aliases(symbol))
+        db_net_open_quantity = 0.0
+        buy_filled_quantity = 0.0
+        sell_filled_quantity = 0.0
+
+        intents = (
+            db.query(OrderIntent)
+            .filter(
+                OrderIntent.asset_class == 'crypto',
+                OrderIntent.account_id == 'paper-crypto-ledger',
+                OrderIntent.status.in_(REPLAYABLE_CRYPTO_INTENT_STATUSES),
+            )
+            .order_by(OrderIntent.created_at.asc(), OrderIntent.id.asc())
+            .all()
+        )
+
+        for intent in intents:
+            intent_symbol = str(intent.symbol or '').upper().strip()
+            if not intent_symbol:
+                continue
+            if intent_symbol not in aliases and not self._crypto_symbol_aliases(intent_symbol).intersection(aliases):
+                continue
+            filled_quantity = self._safe_float(intent.filled_quantity)
+            if filled_quantity <= 0:
+                continue
+            side = str(intent.side or '').upper().strip()
+            if side == 'BUY':
+                buy_filled_quantity += filled_quantity
+                db_net_open_quantity += filled_quantity
+            elif side == 'SELL':
+                sell_filled_quantity += filled_quantity
+                db_net_open_quantity -= filled_quantity
+
+        db_net_open_quantity = max(round(db_net_open_quantity, 12), 0.0)
+        ledger_quantity = max(round(float(ledger_quantity or 0.0), 12), 0.0)
+
+        if ledger_quantity > 0 and db_net_open_quantity > 0:
+            requested_exit_quantity = min(ledger_quantity, db_net_open_quantity)
+            quantity_source = 'MIN_LEDGER_DB_NET' if abs(ledger_quantity - db_net_open_quantity) > 1e-8 else 'LEDGER'
+        elif ledger_quantity > 0:
+            requested_exit_quantity = ledger_quantity
+            quantity_source = 'LEDGER'
+        else:
+            requested_exit_quantity = 0.0
+            quantity_source = 'NONE'
+
+        drift_detected = abs(ledger_quantity - db_net_open_quantity) > 1e-8 if db_net_open_quantity > 0 else False
+        reason = None
+        if drift_detected and requested_exit_quantity > 0:
+            reason = 'CRYPTO_EXIT_QTY_CLAMPED_TO_DB_NET_OPEN'
+
+        return {
+            'aliases': aliases,
+            'ledgerOpenQuantity': ledger_quantity,
+            'dbNetOpenQuantity': db_net_open_quantity,
+            'buyFilledQuantity': round(buy_filled_quantity, 12),
+            'sellFilledQuantity': round(sell_filled_quantity, 12),
+            'requestedExitQuantity': round(requested_exit_quantity, 12),
+            'quantitySource': quantity_source,
+            'driftDetected': drift_detected,
+            'reason': reason,
+        }
 
     @staticmethod
     def _resolve_crypto_ohlcv_pair(pair: str | None) -> str | None:
@@ -809,6 +879,7 @@ class WatchlistExitWorkerService:
             return candidate
 
         amount = self._safe_float(candidate.get('requestedQuantity'))
+        candidate.setdefault('quantityTruth', candidate.get('quantityTruth') or {})
         if amount <= 0:
             candidate['action'] = 'SKIPPED'
             candidate['reason'] = 'NO_SELLABLE_QUANTITY'

@@ -244,32 +244,19 @@ class TradeHistoryService:
                 'bias': watchlist.get('bias'),
                 'setupTemplate': watchlist.get('setupTemplate'),
                 'exitTemplate': watchlist.get('exitTemplate'),
-                'triggerTimeframe': self._coerce_trigger_timeframe(watchlist.get('triggerTimeframe') or watchlist.get('botTimeframes')),
+                'botTimeframes': watchlist.get('botTimeframes') if isinstance(watchlist.get('botTimeframes'), list) else [],
                 'riskFlags': watchlist.get('riskFlags') if isinstance(watchlist.get('riskFlags'), list) else [],
             }
         if fallback_setup_template and not strategy_snapshot.get('setupTemplate'):
             strategy_snapshot['setupTemplate'] = str(fallback_setup_template)
-        if 'triggerTimeframe' not in strategy_snapshot:
-            strategy_snapshot['triggerTimeframe'] = self._coerce_trigger_timeframe(strategy_snapshot.get('botTimeframes'))
-        cleaned = {key: value for key, value in strategy_snapshot.items() if value is not None and key != 'botTimeframes'}
-        cleaned['triggerTimeframe'] = self._coerce_trigger_timeframe(cleaned.get('triggerTimeframe'))
+        cleaned = {key: value for key, value in strategy_snapshot.items() if value is not None}
+        bot_timeframes = cleaned.get('botTimeframes')
+        if not isinstance(bot_timeframes, list):
+            cleaned['botTimeframes'] = [] if bot_timeframes is None else [str(bot_timeframes)]
         risk_flags = cleaned.get('riskFlags')
         if not isinstance(risk_flags, list):
             cleaned['riskFlags'] = [] if risk_flags is None else [str(risk_flags)]
         return cleaned
-
-
-    @staticmethod
-    def _coerce_trigger_timeframe(value: Any) -> str | None:
-        if isinstance(value, list):
-            items = [str(item).strip() for item in value if str(item).strip()]
-            if not items:
-                return None
-            order = ['5m', '15m', '1h', '4h', '1d']
-            ranked = sorted(items, key=lambda item: order.index(item) if item in order else len(order))
-            return ranked[0] if ranked else items[0]
-        raw = str(value or '').strip()
-        return raw or None
 
     def _extract_technical_snapshot(self, source: dict[str, Any]) -> dict[str, Any]:
         technical_snapshot = dict(self._dict_or_empty(source.get('technicalSnapshot')))

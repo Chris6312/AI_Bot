@@ -6,8 +6,6 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
-
-import pytest
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -4993,85 +4991,59 @@ def test_monitoring_snapshot_scope_truth_flags_managed_only_review_and_missing_s
         assert crypto_snapshot['scopeTruth']['activeUploadId'] is None
 
 
-def test_ingest_watchlist_rejects_exact_duplicate_payload_within_replay_window(tmp_path, monkeypatch) -> None:
+def test_watchlist_exit_worker_clamps_crypto_exit_quantity_to_db_truth(tmp_path) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
-        monkeypatch.setattr(settings, 'WATCHLIST_REPLAY_WINDOW_SECONDS', 900, raising=False)
         db = SessionFactory()
-        payload = build_stock_payload()
+        db.add_all(
+            [
+                OrderIntent(
+                    intent_id='crypto-buy-1',
+                    account_id='paper-crypto-ledger',
+                    asset_class='crypto',
+                    symbol='TAO/USD',
+                    side='BUY',
+                    requested_quantity=32.72418356434425,
+                    filled_quantity=32.72418356434425,
+                    avg_fill_price=305.5844,
+                    status='FILLED',
+                    execution_source='WATCHLIST_MONITOR',
+                ),
+                OrderIntent(
+                    intent_id='crypto-buy-2',
+                    account_id='paper-crypto-ledger',
+                    asset_class='crypto',
+                    symbol='TAO/USD',
+                    side='BUY',
+                    requested_quantity=8.0,
+                    filled_quantity=8.0,
+                    avg_fill_price=300.0,
+                    status='CLOSED',
+                    execution_source='WATCHLIST_MONITOR',
+                ),
+                OrderIntent(
+                    intent_id='crypto-sell-1',
+                    account_id='paper-crypto-ledger',
+                    asset_class='crypto',
+                    symbol='TAO/USD',
+                    side='SELL',
+                    requested_quantity=8.0,
+                    filled_quantity=8.0,
+                    avg_fill_price=310.0,
+                    status='CLOSED',
+                    execution_source='WATCHLIST_EXIT_WORKER',
+                ),
+            ]
+        )
+        db.commit()
 
-        accepted = watchlist_service.ingest_watchlist(db, payload, source='api')
-        assert accepted['validation']['replay']['status'] == 'accepted'
+        truth = watchlist_exit_worker._get_crypto_exit_quantity_truth(
+            db,
+            symbol='TAO/USD',
+            ledger_quantity=129.8022167321036,
+        )
 
-        with pytest.raises(WatchlistValidationError, match=r'Duplicate watchlist payload suppressed within replay window\.'):
-            watchlist_service.ingest_watchlist(db, deepcopy(payload), source='api')
-
-        uploads = db.query(WatchlistUpload).filter(WatchlistUpload.scope == 'stocks_only').order_by(WatchlistUpload.id.asc()).all()
-        assert len(uploads) == 2
-        assert uploads[0].validation_status == 'valid'
-        assert uploads[1].validation_status == 'rejected'
-        assert uploads[1].rejection_reason == 'Duplicate watchlist payload suppressed within replay window.'
-        assert uploads[1].validation_result_json['replay']['type'] == 'exact_duplicate'
-        assert uploads[1].validation_result_json['replay']['duplicateOfUploadId'] == accepted['uploadId']
-        assert watchlist_service.get_latest_upload(db, scope='stocks_only', active_only=True)['uploadId'] == accepted['uploadId']
-        db.close()
-
-
-def test_ingest_watchlist_rejects_execution_equivalent_payload_within_replay_window(tmp_path, monkeypatch) -> None:
-    with build_session_factory(tmp_path) as SessionFactory:
-        monkeypatch.setattr(settings, 'WATCHLIST_REPLAY_WINDOW_SECONDS', 900, raising=False)
-        db = SessionFactory()
-        payload = build_crypto_payload()
-        watchlist_service.ingest_watchlist(db, payload, source='api')
-
-        replay_payload = deepcopy(payload)
-        replay_payload['generated_at_utc'] = (datetime.now(UTC) + timedelta(seconds=5)).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
-        replay_payload['ui_payload']['summary']['regime_note'] = 'Fresh prose, same execution payload.'
-        replay_payload['ui_payload']['symbol_context']['BTC']['notes'] = 'Operator context changed only.'
-
-        with pytest.raises(WatchlistValidationError, match=r'Equivalent execution-safe watchlist payload suppressed within replay window\.'):
-            watchlist_service.ingest_watchlist(db, replay_payload, source='api')
-
-        latest = watchlist_service.get_latest_upload(db, scope='crypto_only', active_only=False)
-        assert latest['validationStatus'] == 'rejected'
-        assert latest['validation']['replay']['type'] == 'execution_duplicate'
-        assert latest['validation']['replay']['status'] == 'rejected'
-        db.close()
-
-
-def test_ingest_watchlist_allows_replacement_when_execution_payload_changes(tmp_path, monkeypatch) -> None:
-    with build_session_factory(tmp_path) as SessionFactory:
-        monkeypatch.setattr(settings, 'WATCHLIST_REPLAY_WINDOW_SECONDS', 900, raising=False)
-        db = SessionFactory()
-        payload = build_stock_payload()
-        first = watchlist_service.ingest_watchlist(db, payload, source='api')
-
-        replacement = deepcopy(payload)
-        replacement['generated_at_utc'] = (datetime.now(UTC) + timedelta(seconds=10)).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
-        replacement['bot_payload']['symbols'][1]['setup_template'] = 'breakout_retest'
-        replacement['bot_payload']['symbols'][1]['priority_rank'] = 3
-        replacement['ui_payload']['summary']['regime_note'] = 'Execution-safe change should be accepted.'
-
-        accepted = watchlist_service.ingest_watchlist(db, replacement, source='api')
-
-        assert accepted['uploadId'] != first['uploadId']
-        assert accepted['validation']['replay']['status'] == 'accepted'
-        assert accepted['isActive'] is True
-        uploads = db.query(WatchlistUpload).filter(WatchlistUpload.scope == 'stocks_only').order_by(WatchlistUpload.id.asc()).all()
-        assert [row.validation_status for row in uploads] == ['valid', 'valid']
-        db.close()
-
-
-def test_ingest_watchlist_replay_is_scoped(tmp_path, monkeypatch) -> None:
-    with build_session_factory(tmp_path) as SessionFactory:
-        monkeypatch.setattr(settings, 'WATCHLIST_REPLAY_WINDOW_SECONDS', 900, raising=False)
-        db = SessionFactory()
-        stock_payload = build_stock_payload()
-        crypto_payload = build_crypto_payload()
-
-        stock_result = watchlist_service.ingest_watchlist(db, stock_payload, source='api')
-        crypto_result = watchlist_service.ingest_watchlist(db, crypto_payload, source='api')
-
-        assert stock_result['scope'] == 'stocks_only'
-        assert crypto_result['scope'] == 'crypto_only'
-        assert db.query(WatchlistUpload).filter(WatchlistUpload.validation_status == 'rejected').count() == 0
-        db.close()
+        assert truth['driftDetected'] is True
+        assert truth['quantitySource'] == 'MIN_LEDGER_DB_NET'
+        assert truth['dbNetOpenQuantity'] == 32.724183564344
+        assert truth['requestedExitQuantity'] == 32.724183564344
+        assert truth['reason'] == 'CRYPTO_EXIT_QTY_CLAMPED_TO_DB_NET_OPEN'

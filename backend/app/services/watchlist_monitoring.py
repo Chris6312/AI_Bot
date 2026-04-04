@@ -489,15 +489,6 @@ class WatchlistMonitoringOrchestrator:
         latest = context.get("latestEvaluation")
         return latest if isinstance(latest, dict) else {}
 
-    @staticmethod
-    def _infer_trigger_timeframe(timeframes: list[str] | None) -> str | None:
-        items = [str(item).strip() for item in (timeframes or []) if str(item).strip()]
-        if not items:
-            return None
-        order = ["5m", "15m", "1h", "4h", "1d"]
-        ranked = sorted(items, key=lambda item: order.index(item) if item in order else len(order))
-        return ranked[0] if ranked else items[0]
-
     def _build_strategy_snapshot(
         self,
         symbol_row: WatchlistSymbol,
@@ -505,7 +496,6 @@ class WatchlistMonitoringOrchestrator:
         latest_evaluation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         evaluation = latest_evaluation or {}
-        configured_timeframes = list(symbol_row.bot_timeframes or [])
         return {
             "scope": symbol_row.scope,
             "priorityRank": symbol_row.priority_rank,
@@ -513,7 +503,7 @@ class WatchlistMonitoringOrchestrator:
             "bias": symbol_row.bias,
             "setupTemplate": symbol_row.setup_template,
             "exitTemplate": symbol_row.exit_template,
-            "triggerTimeframe": self._infer_trigger_timeframe(configured_timeframes),
+            "botTimeframes": list(symbol_row.bot_timeframes or []),
             "riskFlags": list(symbol_row.risk_flags or []),
             "evaluationState": evaluation.get("state"),
             "evaluationReason": evaluation.get("reason"),
@@ -524,6 +514,39 @@ class WatchlistMonitoringOrchestrator:
     def _build_technical_snapshot(self, monitor_state: WatchlistMonitorState) -> dict[str, Any]:
         evaluation = self._latest_evaluation_context(monitor_state)
         details = evaluation.get("details") if isinstance(evaluation.get("details"), dict) else {}
+        current_price = self._safe_float(details.get("currentPrice"))
+        prev_close = self._safe_float(details.get("prevClose"))
+        sma5 = self._safe_float(details.get("sma5"))
+        sma10 = self._safe_float(details.get("sma10"))
+        change_pct = self._safe_float(details.get("changePct"))
+        trigger_level = self._safe_float(details.get("triggerLevel"))
+        breakout_level = self._safe_float(details.get("breakoutLevel"))
+        recent_high = self._safe_float(details.get("recentHigh"))
+
+        distance_from_sma10_pct = None
+        if current_price > 0 and sma10 > 0:
+            distance_from_sma10_pct = round(((current_price - sma10) / sma10) * 100.0, 4)
+
+        breakout_anchor = breakout_level or trigger_level or recent_high
+        breakout_distance_pct = None
+        if current_price > 0 and breakout_anchor > 0:
+            breakout_distance_pct = round(((current_price - breakout_anchor) / breakout_anchor) * 100.0, 4)
+
+        signal_strength = 0.0
+        if str(evaluation.get("state") or "").upper() == "ENTRY_CANDIDATE":
+            signal_strength += 0.35
+        if current_price > 0 and sma5 > 0 and current_price >= sma5:
+            signal_strength += 0.2
+        if sma5 > 0 and sma10 > 0 and sma5 >= sma10:
+            signal_strength += 0.2
+        if change_pct > 0:
+            signal_strength += 0.15
+        elif current_price > 0 and prev_close > 0 and current_price >= prev_close:
+            signal_strength += 0.15
+        if details.get("continuityOk") is True:
+            signal_strength += 0.1
+        signal_strength = round(max(0.0, min(signal_strength, 1.0)), 4)
+
         technical = {
             "currentPrice": details.get("currentPrice"),
             "prevClose": details.get("prevClose"),
@@ -541,6 +564,9 @@ class WatchlistMonitoringOrchestrator:
             "triggerLevel": details.get("triggerLevel"),
             "breakoutLevel": details.get("breakoutLevel"),
             "bounceFloor": details.get("bounceFloor"),
+            "signalStrength": signal_strength,
+            "distanceFromSma10Pct": distance_from_sma10_pct,
+            "breakoutDistancePct": breakout_distance_pct,
             "marketDataAtUtc": details.get("marketDataAtUtc") or evaluation.get("marketDataAtUtc"),
         }
         return {key: value for key, value in technical.items() if value is not None}
@@ -1228,32 +1254,89 @@ class WatchlistMonitoringOrchestrator:
     @staticmethod
     def _get_open_crypto_exposure() -> dict[str, Any]:
         ledger = crypto_ledger.get_ledger()
-        positions = dict(ledger.get('positions') or {})
+        raw_positions = ledger.get('positions') or []
+
         symbol_exposure: dict[str, float] = {}
         open_count = 0
-        prices = kraken_service.get_prices(list(positions.keys())) if positions else {}
-        for pair, payload in positions.items():
+
+        if not isinstance(raw_positions, list):
+            raw_positions = []
+
+        symbols: list[str] = []
+        normalized_rows: list[dict[str, Any]] = []
+
+        for row in raw_positions:
+            if not isinstance(row, dict):
+                continue
+
+            pair = str(
+                row.get('pair')
+                or row.get('symbol')
+                or row.get('ticker')
+                or ''
+            ).upper().strip()
+            if not pair:
+                continue
+
             try:
-                amount = float((payload or {}).get('amount') or 0.0)
-            except (AttributeError, TypeError, ValueError):
+                amount = float(
+                    row.get('amount')
+                    or row.get('quantity')
+                    or row.get('qty')
+                    or 0.0
+                )
+            except (TypeError, ValueError):
                 amount = 0.0
+
             if amount <= 0:
                 continue
-            symbol = str(pair or '').upper().strip()
-            if not symbol:
-                continue
+
+            normalized_rows.append(
+                {
+                    'pair': pair,
+                    'amount': amount,
+                    'marketValue': row.get('marketValue'),
+                    'costBasis': row.get('costBasis'),
+                    'currentPrice': row.get('currentPrice'),
+                }
+            )
+            symbols.append(pair)
+
+        prices = kraken_service.get_prices(symbols) if symbols else {}
+
+        for row in normalized_rows:
+            pair = row['pair']
+            amount = float(row['amount'] or 0.0)
+
+            current_price = 0.0
             try:
-                current_price = float((prices.get(pair) or {}).get('last') or prices.get(pair) or 0.0)
-            except (AttributeError, TypeError, ValueError):
+                current_price = float(row.get('currentPrice') or 0.0)
+            except (TypeError, ValueError):
                 current_price = 0.0
+
+            if current_price <= 0:
+                try:
+                    current_price = float((prices.get(pair) or {}).get('last') or prices.get(pair) or 0.0)
+                except (AttributeError, TypeError, ValueError):
+                    current_price = 0.0
+
             exposure_value = max(current_price, 0.0) * amount
+
             if exposure_value <= 0:
                 try:
-                    exposure_value = float((payload or {}).get('total_cost') or 0.0)
-                except (AttributeError, TypeError, ValueError):
+                    exposure_value = float(row.get('marketValue') or 0.0)
+                except (TypeError, ValueError):
                     exposure_value = 0.0
-            symbol_exposure[symbol] = symbol_exposure.get(symbol, 0.0) + exposure_value
+
+            if exposure_value <= 0:
+                try:
+                    exposure_value = float(row.get('costBasis') or 0.0)
+                except (TypeError, ValueError):
+                    exposure_value = 0.0
+
+            symbol_exposure[pair] = symbol_exposure.get(pair, 0.0) + exposure_value
             open_count += 1
+
         return {"openCount": open_count, "symbolExposure": symbol_exposure}
 
     @staticmethod

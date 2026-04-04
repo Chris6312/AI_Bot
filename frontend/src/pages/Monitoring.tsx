@@ -27,6 +27,21 @@ type MonitoringCollection = Partial<Record<WatchlistScope, WatchlistMonitoringSn
 type ExitReadinessCollection = Partial<Record<WatchlistScope, WatchlistExitReadinessSnapshot>>
 type OrchestrationCollection = Partial<Record<WatchlistScope, WatchlistOrchestrationStatus | null>>
 
+function normalizeMonitoringSymbol(value: string | null | undefined): string {
+  const raw = String(value ?? '').trim().toUpperCase()
+  if (!raw) return ''
+  const compact = raw.replace(/[^A-Z0-9]/g, '')
+  if (raw.includes('/')) return compact
+  if (compact.endsWith('USD') && compact.length > 3) return compact
+  return `${compact}USD`
+}
+
+function symbolsMatchForMonitoringFilter(left: string | null | undefined, right: string | null | undefined): boolean {
+  const normalizedLeft = normalizeMonitoringSymbol(left)
+  const normalizedRight = normalizeMonitoringSymbol(right)
+  return normalizedLeft !== '' && normalizedLeft === normalizedRight
+}
+
 const scopeLabels: Record<WatchlistScope, string> = {
   stocks_only: 'Stocks',
   crypto_only: 'Crypto',
@@ -190,7 +205,7 @@ function ScopeMonitoringPanel({
   selectedSymbol?: string | null
 }) {
   const rows = monitoring?.rows ?? []
-  const filteredRows = selectedSymbol ? rows.filter((row) => row.symbol.toUpperCase() === selectedSymbol.toUpperCase()) : rows
+  const filteredRows = selectedSymbol ? rows.filter((row) => symbolsMatchForMonitoringFilter(row.symbol, selectedSymbol)) : rows
   const sessionMeta = getScopeSessionMeta(scope, orchestration?.session)
   const scopeTruthMeta = getStatusMeta(monitoring?.scopeTruth?.state)
 
@@ -289,7 +304,7 @@ function MonitoringTable({ scope, rows, selectedSymbol }: { scope: WatchlistScop
             const executionReason = String(entryExecution?.reason ?? '').trim()
             const lifecycleState = String(entryExecution?.lifecycleState ?? (row.monitoring?.decisionContext as Record<string, unknown> | undefined)?.lifecycleState ?? row.monitoringStatus).trim()
             const lifecycleNote = String(entryExecution?.lifecycleNote ?? (row.monitoring?.decisionContext as Record<string, unknown> | undefined)?.lifecycleNote ?? '').trim()
-            const isFocused = selectedSymbol != null && row.symbol.toUpperCase() === selectedSymbol.toUpperCase()
+            const isFocused = selectedSymbol != null && symbolsMatchForMonitoringFilter(row.symbol, selectedSymbol)
             const lifecycleMetaForState = getStatusMeta(lifecycleState || row.monitoringStatus)
 
             return (

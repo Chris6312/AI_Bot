@@ -6,6 +6,7 @@ You must perform a completely new scan of the Kraken app RIGHT NOW because top g
 Treat every run as a fresh morning scan from scratch.
 
 Use ONLY information available through this Kraken app right now:
+- Spot pairs only
 - top gainers
 - top losers
 - trending crypto assets

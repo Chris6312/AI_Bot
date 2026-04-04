@@ -41,13 +41,16 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
                         'setupTemplate': 'pullback_reclaim',
                         'exitTemplate': 'first_failed_follow_through',
                         'bias': 'bullish',
-                        'triggerTimeframe': '5m',
+                        'botTimeframes': ['5m', '15m'],
                     },
                     'technicalSnapshot': {
                         'currentPrice': 100.0,
                         'changePct': 1.25,
                         'sma5': 99.2,
                         'sma10': 98.7,
+                        'signalStrength': 0.9,
+                        'distanceFromSma10Pct': 1.3171,
+                        'breakoutDistancePct': 0.4049,
                     },
                 },
                 exit_trigger='target_hit',
@@ -75,7 +78,7 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
                             'setupTemplate': 'pullback_reclaim',
                             'exitTemplate': 'profit_target',
                             'bias': 'bullish',
-                            'triggerTimeframe': '5m',
+                            'botTimeframes': ['5m'],
                         },
                         'technicalSnapshot': {
                             'currentPrice': 50.0,
@@ -83,6 +86,9 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
                             'sma5': 49.5,
                             'sma10': 48.8,
                             'continuityOk': True,
+                            'signalStrength': 1.0,
+                            'distanceFromSma10Pct': 2.459,
+                            'breakoutDistancePct': 0.0,
                         },
                     },
                     submitted_at=entry_time,
@@ -149,7 +155,7 @@ def test_trade_history_returns_closed_stock_and_crypto_rows(tmp_path) -> None:
         assert stock_row['realizedPnl'] == 100.0
         assert stock_row['soldAtEt'].endswith('-04:00')
         assert stock_row['strategySnapshot']['setupTemplate'] == 'pullback_reclaim'
-        assert stock_row['strategySnapshot']['triggerTimeframe'] == '5m'
+        assert stock_row['strategySnapshot']['botTimeframes'] == ['5m', '15m']
         assert stock_row['technicalSnapshot']['sma5'] == 99.2
         assert crypto_row['strategySnapshot']['setupTemplate'] == 'pullback_reclaim'
         assert crypto_row['technicalSnapshot']['continuityOk'] is True
@@ -213,3 +219,64 @@ def test_trade_history_filters_by_asset_mode_symbol_and_date(tmp_path) -> None:
         assert payload['summary']['dateRange']['toEt'].startswith('2026-04-02T23:59:59.999999')
         assert payload['rows'][0]['symbol'] == 'MSFT'
         assert payload['rows'][0]['mode'] == 'LIVE'
+
+
+
+def test_trade_history_preserves_normalized_signal_fields(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        entry_time = datetime(2026, 4, 3, 12, 0, tzinfo=UTC)
+        exit_time = entry_time + timedelta(minutes=45)
+        db.add(
+            Trade(
+                trade_id='trade_stock_metrics_1',
+                account_id='paper-stock',
+                ticker='NVDA',
+                direction='LONG',
+                strategy='range_breakout',
+                entry_time=entry_time,
+                entry_price=101.0,
+                shares=10,
+                entry_cost=1010.0,
+                exit_time=exit_time,
+                exit_price=99.0,
+                exit_proceeds=990.0,
+                gross_pnl=-20.0,
+                net_pnl=-20.0,
+                duration_minutes=45,
+                entry_reasoning={
+                    'mode': 'PAPER',
+                    'strategySnapshot': {'setupTemplate': 'range_breakout'},
+                    'technicalSnapshot': {
+                        'currentPrice': 101.0,
+                        'sma10': 99.0,
+                        'breakoutLevel': 100.0,
+                        'signalStrength': 0.7,
+                        'distanceFromSma10Pct': 2.0202,
+                        'breakoutDistancePct': 1.0,
+                    },
+                },
+            )
+        )
+        db.commit()
+
+        def override_get_db():
+            local_db = SessionFactory()
+            try:
+                yield local_db
+            finally:
+                local_db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        try:
+            client = TestClient(app)
+            response = client.get('/api/trade-history')
+        finally:
+            app.dependency_overrides.clear()
+            db.close()
+
+        assert response.status_code == 200
+        row = next(item for item in response.json()['rows'] if item['symbol'] == 'NVDA')
+        assert row['technicalSnapshot']['signalStrength'] == 0.7
+        assert row['technicalSnapshot']['distanceFromSma10Pct'] == 2.0202
+        assert row['technicalSnapshot']['breakoutDistancePct'] == 1.0
