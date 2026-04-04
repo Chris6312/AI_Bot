@@ -84,6 +84,50 @@ FOLLOW_THROUGH_EXIT_TEMPLATES = {'first_failed_follow_through'}
 IMPULSE_TRAIL_TEMPLATES = {'trail_after_impulse'}
 IMPULSE_TRAIL_STOP_FACTOR = 0.5
 POSITION_MIRROR_SYNC_SOURCE = 'broker_position_mirror'
+VALIDATION_ACCEPTED_STATUSES = {'accepted', 'valid'}
+REPLAY_REJECTED = 'rejected'
+
+
+def _stable_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    ).hexdigest()
+
+
+def _execution_safe_symbol_payload(symbol: BaseWatchlistSymbol | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(symbol, BaseWatchlistSymbol):
+        payload = symbol.model_dump(mode='json')
+    else:
+        payload = dict(symbol or {})
+    return {
+        'symbol': str(payload.get('symbol') or '').strip().upper(),
+        'quote_currency': str(payload.get('quote_currency') or '').strip().upper(),
+        'asset_class': str(payload.get('asset_class') or '').strip().lower(),
+        'enabled': bool(payload.get('enabled', False)),
+        'trade_direction': str(payload.get('trade_direction') or '').strip().lower(),
+        'priority_rank': int(payload.get('priority_rank') or 0),
+        'tier': str(payload.get('tier') or '').strip(),
+        'bias': str(payload.get('bias') or '').strip(),
+        'setup_template': str(payload.get('setup_template') or '').strip(),
+        'bot_timeframes': sorted({str(item).strip() for item in (payload.get('bot_timeframes') or []) if str(item).strip()}),
+        'exit_template': str(payload.get('exit_template') or '').strip(),
+        'max_hold_hours': int(payload.get('max_hold_hours') or 0),
+        'risk_flags': sorted({str(item).strip() for item in (payload.get('risk_flags') or []) if str(item).strip()}),
+    }
+
+
+def _execution_safe_payload(parsed: ParsedWatchlist) -> dict[str, Any]:
+    symbols = sorted(
+        (_execution_safe_symbol_payload(symbol) for symbol in parsed.bot_payload.symbols),
+        key=lambda item: (item['priority_rank'], item['symbol'], item['quote_currency']),
+    )
+    return {
+        'schema_version': parsed.schema_version,
+        'provider': parsed.provider,
+        'scope': parsed.scope,
+        'market_regime': parsed.bot_payload.market_regime,
+        'symbols': symbols,
+    }
 
 
 class WatchlistValidationError(ValueError):
@@ -340,13 +384,49 @@ class WatchlistService:
         parsed = self.parse_payload(payload)
         freshness = self.validate_freshness(parsed.generated_at_utc)
 
-        payload_hash = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
-        ).hexdigest()
+        payload_hash = _stable_hash(payload)
+        execution_payload = _execution_safe_payload(parsed)
+        execution_payload_hash = _stable_hash(execution_payload)
         upload_id = f'wlu_{uuid.uuid4().hex[:20]}'
         scan_id = f'scan_{uuid.uuid4().hex[:20]}'
         expires_at = freshness['generatedAtUtc'] + timedelta(hours=max(1, int(settings.WATCHLIST_DEFAULT_EXPIRY_HOURS)))
         now = freshness['observedAtUtc']
+
+        replay_conflict = self._detect_replay_conflict(
+            db,
+            scope=parsed.scope,
+            payload_hash=payload_hash,
+            execution_payload_hash=execution_payload_hash,
+            observed_at=now,
+        )
+        if replay_conflict is not None:
+            self._record_rejected_upload(
+                db,
+                upload_id=upload_id,
+                scan_id=scan_id,
+                parsed=parsed,
+                raw_payload=payload,
+                payload_hash=payload_hash,
+                execution_payload_hash=execution_payload_hash,
+                freshness=freshness,
+                source=source,
+                source_user_id=source_user_id,
+                source_channel_id=source_channel_id,
+                source_message_id=source_message_id,
+                rejection_reason=replay_conflict['reason'],
+                rejection_validation={
+                    'freshness': {
+                        'generatedAtUtc': freshness['generatedAtUtc'].isoformat(),
+                        'observedAtUtc': freshness['observedAtUtc'].isoformat(),
+                        'ageSeconds': freshness['ageSeconds'],
+                        'maxAgeSeconds': freshness['maxAgeSeconds'],
+                    },
+                    'selectedCount': len(parsed.bot_payload.symbols),
+                    'primaryFocus': parsed.ui_payload.summary.primary_focus,
+                    'replay': replay_conflict,
+                },
+            )
+            raise WatchlistValidationError(replay_conflict['reason'])
 
         next_symbols = {symbol.symbol.upper() for symbol in parsed.bot_payload.symbols}
         self._deactivate_scope_uploads(db, parsed.scope)
@@ -380,6 +460,12 @@ class WatchlistService:
                 },
                 'selectedCount': len(parsed.bot_payload.symbols),
                 'primaryFocus': parsed.ui_payload.summary.primary_focus,
+                'replay': {
+                    'windowSeconds': max(60, int(settings.WATCHLIST_REPLAY_WINDOW_SECONDS)),
+                    'payloadHash': payload_hash,
+                    'executionPayloadHash': execution_payload_hash,
+                    'status': 'accepted',
+                },
             },
             raw_payload_json=payload,
             bot_payload_json=parsed.bot_payload.model_dump(mode='json'),
@@ -935,6 +1021,141 @@ class WatchlistService:
                 'symbolContext': (ui_context.symbol_context_json if ui_context else {}),
             },
         }
+
+    def _detect_replay_conflict(
+        self,
+        db: Session,
+        *,
+        scope: WATCHLIST_SCOPE,
+        payload_hash: str,
+        execution_payload_hash: str,
+        observed_at: datetime,
+    ) -> dict[str, Any] | None:
+        window_seconds = max(60, int(settings.WATCHLIST_REPLAY_WINDOW_SECONDS))
+        cutoff = observed_at - timedelta(seconds=window_seconds)
+        recent_uploads = (
+            db.query(WatchlistUpload)
+            .filter(
+                WatchlistUpload.scope == scope,
+                WatchlistUpload.received_at_utc >= cutoff,
+            )
+            .order_by(WatchlistUpload.received_at_utc.desc(), WatchlistUpload.id.desc())
+            .all()
+        )
+        for upload in recent_uploads:
+            existing_payload_hash = str(upload.payload_hash or '').strip()
+            existing_execution_payload_hash = self._get_upload_execution_payload_hash(upload)
+            if existing_payload_hash == payload_hash:
+                return self._build_replay_conflict_payload(
+                    upload=upload,
+                    observed_at=observed_at,
+                    window_seconds=window_seconds,
+                    replay_type='exact_duplicate',
+                    reason='Duplicate watchlist payload suppressed within replay window.',
+                )
+            if existing_execution_payload_hash and existing_execution_payload_hash == execution_payload_hash:
+                return self._build_replay_conflict_payload(
+                    upload=upload,
+                    observed_at=observed_at,
+                    window_seconds=window_seconds,
+                    replay_type='execution_duplicate',
+                    reason='Equivalent execution-safe watchlist payload suppressed within replay window.',
+                )
+        return None
+
+    def _record_rejected_upload(
+        self,
+        db: Session,
+        *,
+        upload_id: str,
+        scan_id: str,
+        parsed: ParsedWatchlist,
+        raw_payload: dict[str, Any],
+        payload_hash: str,
+        execution_payload_hash: str,
+        freshness: dict[str, Any],
+        source: str,
+        source_user_id: str | None,
+        source_channel_id: str | None,
+        source_message_id: str | None,
+        rejection_reason: str,
+        rejection_validation: dict[str, Any],
+    ) -> None:
+        upload = WatchlistUpload(
+            upload_id=upload_id,
+            scan_id=scan_id,
+            schema_version=parsed.schema_version,
+            provider=parsed.provider,
+            scope=parsed.scope,
+            source=source,
+            source_user_id=source_user_id,
+            source_channel_id=source_channel_id,
+            source_message_id=source_message_id,
+            payload_hash=payload_hash,
+            generated_at_utc=freshness['generatedAtUtc'],
+            received_at_utc=freshness['observedAtUtc'],
+            watchlist_expires_at_utc=freshness['generatedAtUtc'] + timedelta(hours=max(1, int(settings.WATCHLIST_DEFAULT_EXPIRY_HOURS))),
+            validation_status=REPLAY_REJECTED,
+            rejection_reason=rejection_reason,
+            market_regime=parsed.bot_payload.market_regime,
+            selected_count=len(parsed.bot_payload.symbols),
+            is_active=False,
+            validation_result_json={
+                **(rejection_validation or {}),
+                'replay': {
+                    **((rejection_validation or {}).get('replay') or {}),
+                    'windowSeconds': max(60, int(settings.WATCHLIST_REPLAY_WINDOW_SECONDS)),
+                    'payloadHash': payload_hash,
+                    'executionPayloadHash': execution_payload_hash,
+                    'status': 'rejected',
+                },
+            },
+            raw_payload_json=raw_payload,
+            bot_payload_json=parsed.bot_payload.model_dump(mode='json'),
+        )
+        db.add(upload)
+        db.commit()
+
+    @staticmethod
+    def _build_replay_conflict_payload(
+        *,
+        upload: WatchlistUpload,
+        observed_at: datetime,
+        window_seconds: int,
+        replay_type: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        received_at = _normalize_dt(upload.received_at_utc) if upload.received_at_utc else observed_at
+        return {
+            'status': 'rejected',
+            'reason': reason,
+            'type': replay_type,
+            'windowSeconds': window_seconds,
+            'duplicateOfUploadId': upload.upload_id,
+            'duplicateOfReceivedAtUtc': received_at.isoformat(),
+            'duplicateOfValidationStatus': upload.validation_status,
+            'ageSeconds': max(0, int((observed_at - received_at).total_seconds())),
+        }
+
+    @staticmethod
+    def _get_upload_execution_payload_hash(upload: WatchlistUpload) -> str:
+        validation_payload = upload.validation_result_json or {}
+        replay_payload = validation_payload.get('replay') if isinstance(validation_payload, dict) else {}
+        replay_hash = ''
+        if isinstance(replay_payload, dict):
+            replay_hash = str(replay_payload.get('executionPayloadHash') or '').strip()
+        if replay_hash:
+            return replay_hash
+
+        raw_payload = upload.raw_payload_json if isinstance(upload.raw_payload_json, dict) else {}
+        schema_version = str(raw_payload.get('schema_version') or '').strip()
+        if schema_version not in {'bot_stock_watchlist_v1', 'bot_watchlist_v3'}:
+            return ''
+        try:
+            parsed = watchlist_service.parse_payload(raw_payload)
+        except WatchlistValidationError:
+            return ''
+        return _stable_hash(_execution_safe_payload(parsed))
 
     def _deactivate_scope_uploads(self, db: Session, scope: WATCHLIST_SCOPE) -> None:
         db.query(WatchlistUpload).filter(
@@ -2162,7 +2383,7 @@ class WatchlistService:
     @staticmethod
     def _is_accepted_validation_status(status: str | None) -> bool:
         normalized = str(status or '').strip().lower()
-        return normalized in {'accepted', 'valid'}
+        return normalized in VALIDATION_ACCEPTED_STATUSES
 
     @classmethod
     def _estimate_ai_confidence(cls, row: WatchlistSymbol, *, primary_focus: set[str]) -> float:
