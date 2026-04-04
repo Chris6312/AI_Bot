@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow, format } from 'date-fns'
-import { AlertTriangle, ClipboardList, FileSearch, RotateCcw, Shield, XCircle } from 'lucide-react'
+import { AlertTriangle, ClipboardList, FileSearch, RotateCcw, Search, Shield, X, XCircle } from 'lucide-react'
 
 import { api } from '@/lib/api'
 import {
@@ -81,12 +81,34 @@ function decisionScope(decision: { assetClass?: string | null } | { market?: str
   return null
 }
 
+function canonicalizeSymbol(value?: string | null) {
+  const raw = String(value ?? '').trim().toUpperCase()
+  if (!raw) return ''
+  if (raw.includes('/')) return raw
+  if (/^[A-Z0-9._-]+USD$/.test(raw) && raw.length > 3) {
+    return `${raw.slice(0, -3)}/USD`
+  }
+  return raw
+}
+
+function eventMatchesSymbol(eventSymbol: string | null | undefined, filterSymbol: string) {
+  if (!filterSymbol) return true
+  const rawEvent = String(eventSymbol ?? '').trim().toUpperCase()
+  const canonicalEvent = canonicalizeSymbol(rawEvent)
+  const canonicalFilter = canonicalizeSymbol(filterSymbol)
+  if (!rawEvent && !canonicalEvent) return false
+  return rawEvent === filterSymbol || rawEvent === canonicalFilter || canonicalEvent === filterSymbol || canonicalEvent === canonicalFilter
+}
+
 export default function AuditTrail() {
   const [searchParams, setSearchParams] = useSearchParams()
   const laneParam = searchParams.get('lane')
   const lane = (['all', 'receipt', 'gate', 'stock', 'crypto', 'ai', 'replay', 'error', 'exit'] as AuditLane[]).includes((laneParam as AuditLane) ?? 'all') ? ((laneParam as AuditLane) || 'all') : 'all'
   const symbolFilter = (searchParams.get('symbol') ?? '').trim().toUpperCase()
   const scopeFilter = (searchParams.get('scope') ?? '').trim()
+  const historyLimit = 200
+  const auditLimit = 200
+  const aiLimit = 100
 
   const { data: stockWatchlist } = useQuery<WatchlistUploadRecord | null>({
     queryKey: ['activeWatchlist', 'stocks_only'],
@@ -101,26 +123,26 @@ export default function AuditTrail() {
   })
 
   const { data: runtimeVisibility } = useQuery<RuntimeVisibility>({
-    queryKey: ['runtimeVisibility'],
-    queryFn: () => api.getRuntimeVisibility(12),
+    queryKey: ['runtimeVisibility', auditLimit],
+    queryFn: () => api.getRuntimeVisibility(auditLimit),
     refetchInterval: 10000,
   })
 
   const { data: stockHistory = [] } = useQuery<OrderIntentRecord[]>({
-    queryKey: ['stockHistory'],
-    queryFn: () => api.getStockHistory(30),
+    queryKey: ['stockHistory', historyLimit],
+    queryFn: () => api.getStockHistory(historyLimit),
     refetchInterval: 10000,
   })
 
   const { data: cryptoHistory = [] } = useQuery<TradeHistoryEntry[]>({
-    queryKey: ['cryptoHistory'],
-    queryFn: () => api.getCryptoHistory(30),
+    queryKey: ['cryptoHistory', historyLimit],
+    queryFn: () => api.getCryptoHistory(historyLimit),
     refetchInterval: 10000,
   })
 
   const { data: aiDecisions = [] } = useQuery<AIDecision[]>({
-    queryKey: ['aiDecisions'],
-    queryFn: () => api.getAIDecisions(20),
+    queryKey: ['aiDecisions', aiLimit],
+    queryFn: () => api.getAIDecisions(aiLimit),
     refetchInterval: 15000,
   })
 
@@ -245,12 +267,15 @@ export default function AuditTrail() {
 
   const filteredEvents = events.filter((event) => {
     if (lane !== 'all' && event.lane !== lane) return false
-    if (symbolFilter && String(event.symbol ?? '').toUpperCase() != symbolFilter) return false
-    if (scopeFilter && String(event.scope ?? '') != scopeFilter && event.scope) return false
+    if (symbolFilter && !eventMatchesSymbol(event.symbol, symbolFilter)) return false
+    if (scopeFilter && String(event.scope ?? '') !== scopeFilter && event.scope) return false
     return true
   })
   const latestAllowed = runtimeVisibility?.gate.summary.lastAllowed
   const latestRejected = runtimeVisibility?.gate.summary.lastRejected
+  const symbolMatches = symbolFilter
+    ? events.filter((event) => eventMatchesSymbol(event.symbol, symbolFilter)).length
+    : filteredEvents.length
 
   return (
     <div className="space-y-6">
@@ -277,7 +302,7 @@ export default function AuditTrail() {
         <MetricCard label="Watchlist receipts" value={String([stockWatchlist, cryptoWatchlist].filter(Boolean).length)} detail="Latest stock + crypto uploads" icon={<ClipboardList className="h-5 w-5" />} />
         <MetricCard label="Recent gate decisions" value={String(runtimeVisibility?.gate.summary.total ?? 0)} detail={`${runtimeVisibility?.gate.summary.rejectedCount ?? 0} rejected`} icon={<Shield className="h-5 w-5" />} />
         <MetricCard label="Replay suppressions" value={String(runtimeVisibility?.audit.replayRejections.length ?? 0)} detail={(runtimeVisibility?.audit.replayRejections.length ?? 0) > 0 ? 'Duplicate Discord payloads captured' : 'No duplicate payloads seen'} icon={<RotateCcw className="h-5 w-5" />} />
-        <MetricCard label="System + exit timeline" value={String((runtimeVisibility?.audit.systemErrors.length ?? 0) + (runtimeVisibility?.audit.exitTimeline.length ?? 0))} detail={`${runtimeVisibility?.audit.systemErrors.length ?? 0} errors · ${runtimeVisibility?.audit.exitTimeline.length ?? 0} exit events`} icon={<AlertTriangle className="h-5 w-5" />} />
+        <MetricCard label="Visible event river" value={String(filteredEvents.length)} detail={symbolFilter ? `${symbolMatches} symbol matches found in loaded history` : 'Showing all loaded rows'} icon={<AlertTriangle className="h-5 w-5" />} />
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(340px,0.95fr)]">
@@ -286,27 +311,61 @@ export default function AuditTrail() {
           eyebrow="Evidence stream"
           icon={<FileSearch className="h-4 w-4 text-cyan-300" />}
           actions={
-            (['all', 'receipt', 'gate', 'stock', 'crypto', 'ai', 'replay', 'error', 'exit'] as AuditLane[]).map((option) => (
-              <button
-                key={option}
-                onClick={() => {
-                  const next = new URLSearchParams(searchParams)
-                  if (option === 'all') next.delete('lane')
-                  else next.set('lane', option)
-                  setSearchParams(next)
-                }}
-                className={`rounded-full px-3 py-2 text-sm transition ${lane === option ? 'border border-cyan-700 bg-cyan-500/10 text-cyan-200' : 'border border-slate-700 bg-slate-950/60 text-slate-300 hover:border-slate-600'}`}
-              >
-                {option === 'all' ? 'All lanes' : option}
-              </button>
-            ))
+            <>
+              {( ['all', 'receipt', 'gate', 'stock', 'crypto', 'ai', 'replay', 'error', 'exit'] as AuditLane[]).map((option) => (
+                <button
+                  key={option}
+                  onClick={() => {
+                    const next = new URLSearchParams(searchParams)
+                    if (option === 'all') next.delete('lane')
+                    else next.set('lane', option)
+                    setSearchParams(next)
+                  }}
+                  className={`rounded-full px-3 py-2 text-sm transition ${lane === option ? 'border border-cyan-700 bg-cyan-500/10 text-cyan-200' : 'border border-slate-700 bg-slate-950/60 text-slate-300 hover:border-slate-600'}`}
+                >
+                  {option === 'all' ? 'All lanes' : option}
+                </button>
+              ))}
+              <label className="ml-0 flex min-w-[220px] items-center gap-2 rounded-full border border-slate-700 bg-slate-950/70 px-3 py-2 text-sm text-slate-300">
+                <Search className="h-4 w-4 text-slate-500" />
+                <input
+                  value={symbolFilter}
+                  onChange={(event) => {
+                    const next = new URLSearchParams(searchParams)
+                    const value = event.target.value.trim().toUpperCase()
+                    if (value) next.set('symbol', value)
+                    else next.delete('symbol')
+                    setSearchParams(next)
+                  }}
+                  placeholder="Filter by symbol"
+                  className="w-full border-0 bg-transparent p-0 text-sm text-white outline-none placeholder:text-slate-500"
+                />
+                {symbolFilter ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = new URLSearchParams(searchParams)
+                      next.delete('symbol')
+                      setSearchParams(next)
+                    }}
+                    className="rounded-full p-1 text-slate-400 transition hover:bg-slate-800 hover:text-white"
+                    aria-label="Clear symbol filter"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                ) : null}
+              </label>
+            </>
           }
         >
+          <div className="mb-4 rounded-2xl border border-slate-800 bg-slate-950/50 px-4 py-3 text-sm text-slate-400">
+            Loaded up to {historyLimit} stock rows, {historyLimit} crypto rows, and {auditLimit} gate/runtime rows. Symbol filter matches both plain and slash crypto pairs such as <span className="text-slate-200">TAO</span> and <span className="text-slate-200">TAO/USD</span>.
+          </div>
           <div className="space-y-3">
             {filteredEvents.length === 0 ? (
               <EmptyState message="No audit events match this filter yet." />
             ) : (
-              filteredEvents.slice(0, 24).map((event) => (
+              filteredEvents.map((event) => (
                 <div key={event.id} className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                     <div>

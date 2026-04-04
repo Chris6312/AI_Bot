@@ -5047,3 +5047,56 @@ def test_watchlist_exit_worker_clamps_crypto_exit_quantity_to_db_truth(tmp_path)
         assert truth['dbNetOpenQuantity'] == 32.724183564344
         assert truth['requestedExitQuantity'] == 32.724183564344
         assert truth['reason'] == 'CRYPTO_EXIT_QTY_CLAMPED_TO_DB_NET_OPEN'
+
+
+
+def test_watchlist_exit_worker_blocks_unverified_ledger_quantity_for_crypto(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+
+        truth = watchlist_exit_worker._get_crypto_exit_quantity_truth(
+            db,
+            symbol='TAO/USD',
+            ledger_quantity=129.8022167321036,
+        )
+
+        assert truth['dbTruthAvailable'] is False
+        assert truth['requestedExitQuantity'] == 0.0
+        assert truth['quantitySource'] == 'UNVERIFIED_LEDGER_BLOCKED'
+        assert truth['reason'] == 'CRYPTO_EXIT_QTY_BLOCKED_UNVERIFIED_LEDGER'
+
+
+def test_watchlist_exit_worker_blocks_recent_insufficient_crypto_exit_rejection(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        db.add(
+            OrderIntent(
+                intent_id='crypto-exit-reject-1',
+                account_id='paper-crypto-ledger',
+                asset_class='crypto',
+                symbol='TAO/USD',
+                side='SELL',
+                requested_quantity=129.802216732104,
+                status='REJECTED',
+                execution_source='WATCHLIST_EXIT_WORKER',
+                rejection_reason='Insufficient TAO/USD position',
+                updated_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+
+        row = {
+            'scope': 'crypto_only',
+            'symbol': 'TAO/USD',
+            'managedOnly': False,
+            'monitoringStatus': 'ACTIVE',
+            'positionState': {'positionExpired': True},
+            'exitTemplate': 'first_failed_follow_through',
+        }
+
+        candidate = watchlist_exit_worker._build_crypto_candidate_row(db, row)
+
+        assert candidate['action'] == 'BLOCKED'
+        assert candidate['reason'] == 'RECENT_INSUFFICIENT_POSITION_REJECTION'
+        assert candidate['monitoringStatus'] == 'EXIT_PENDING'
+        assert 'Insufficient TAO/USD position' in str(candidate.get('lastRejectedReason') or '')

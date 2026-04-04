@@ -1,3 +1,7 @@
+from app.models.crypto_paper_position import CryptoPaperPosition
+from app.models.crypto_paper_order import CryptoPaperOrder
+from app.models.crypto_paper_fill import CryptoPaperFill
+from app.models.crypto_paper_account import CryptoPaperAccount
 from app.models.account import Account
 from app.models.order_event import OrderEvent
 from app.models.order_intent import OrderIntent

@@ -12,6 +12,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.models.order_intent import OrderIntent
 from app.models.position import Position
 from app.models.watchlist_monitor_state import MONITOR_ONLY, PENDING_EVALUATION, WatchlistMonitorState
+from app.services.crypto_paper_broker import crypto_paper_broker
 from app.services.kraken_service import crypto_ledger, kraken_service
 from app.services.runtime_state import runtime_state
 from app.services.watchlist_service import watchlist_service
@@ -68,7 +69,7 @@ class PositionReconciliationService:
 
     def _reconcile_crypto(self, db: Session, *, observed_at: datetime) -> dict[str, Any]:
         replay_trades = self._build_replayable_crypto_trades(db)
-        restored = self._restore_crypto_ledger_from_trades(replay_trades)
+        restored = self._restore_crypto_ledger_from_trades(db, replay_trades)
         cleared_guards = self._clear_stale_open_position_guards(
             db,
             scope='crypto_only',
@@ -167,55 +168,14 @@ class PositionReconciliationService:
             )
         return replay_trades
 
-    def _restore_crypto_ledger_from_trades(self, trades: list[ReplayedCryptoTrade]) -> dict[str, Any]:
-        balance = Decimal(str(crypto_ledger.starting_balance))
-        positions: dict[str, dict[str, Any]] = {}
-
+    def _restore_crypto_ledger_from_trades(self, db: Session, trades: list[ReplayedCryptoTrade]) -> dict[str, Any]:
         for trade in trades:
-            pair = trade.pair
-            total = trade.amount * trade.price
-            state = positions.setdefault(
-                pair,
-                {
-                    'amount': Decimal('0'),
-                    'total_cost': Decimal('0'),
-                    'entry_time_utc': None,
-                    'ohlcv_pair': trade.ohlcv_pair or kraken_service.get_ohlcv_pair(pair) or pair.replace('/', ''),
-                },
-            )
-
-            if trade.side == 'BUY':
-                balance -= total
-                if Decimal(str(state['amount'])) <= Decimal('0.0000000001') and trade.amount > 0:
-                    state['entry_time_utc'] = trade.timestamp.isoformat()
-                state['amount'] = Decimal(str(state['amount'])) + trade.amount
-                state['total_cost'] = Decimal(str(state['total_cost'])) + total
-            else:
-                current_amount = Decimal(str(state['amount']))
-                sell_amount = min(trade.amount, current_amount)
-                if sell_amount > 0:
-                    avg_cost = (Decimal(str(state['total_cost'])) / current_amount) if current_amount > 0 else Decimal('0')
-                    closed_cost = avg_cost * sell_amount
-                    state['amount'] = current_amount - sell_amount
-                    state['total_cost'] = Decimal(str(state['total_cost'])) - closed_cost
-                    balance += sell_amount * trade.price
-                if Decimal(str(state['amount'])) <= Decimal('0.0000000001'):
-                    state['amount'] = Decimal('0')
-                    state['total_cost'] = Decimal('0')
-                    state['entry_time_utc'] = None
-
-            if Decimal(str(state['amount'])) <= Decimal('0.0000000001'):
-                positions.pop(pair, None)
-
+            if not trade.ohlcv_pair:
+                trade.ohlcv_pair = kraken_service.get_ohlcv_pair(trade.pair) or trade.pair.replace('/', '')
+        restored = crypto_paper_broker.rebuild_from_replay_trades(db, trades)
+        crypto_ledger._refresh_cache(db=db, include_trades=False)
         crypto_ledger.trades = []
-        crypto_ledger.positions = positions
-        crypto_ledger.balance = balance
-        restored_symbols = sorted(positions.keys())
-        return {
-            'replayedTradeCount': len(trades),
-            'restoredPositionCount': len(restored_symbols),
-            'restoredSymbols': restored_symbols,
-        }
+        return restored
 
 
     def get_stock_quantity_truth(

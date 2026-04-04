@@ -964,7 +964,7 @@ class WatchlistMonitoringOrchestrator:
             db.commit()
             return payload
 
-        crypto_exposure = self._get_open_crypto_exposure()
+        crypto_exposure = self._get_open_crypto_exposure(db)
         positions = self._calculate_crypto_positions_compat(
             pair,
             available_balance,
@@ -1018,6 +1018,9 @@ class WatchlistMonitoringOrchestrator:
             "BUY",
             amount,
             current_price,
+            db=db,
+            intent_id=intent.intent_id,
+            source=ENTRY_EXECUTION_SOURCE,
         )
         trade_status = str(trade.get("status") or "").upper()
         trade_reason = str(trade.get("reason") or "") or None
@@ -1252,8 +1255,8 @@ class WatchlistMonitoringOrchestrator:
         return {"openCount": open_count, "symbolExposure": symbol_exposure}
 
     @staticmethod
-    def _get_open_crypto_exposure() -> dict[str, Any]:
-        ledger = crypto_ledger.get_ledger()
+    def _get_open_crypto_exposure(db: Session | None = None) -> dict[str, Any]:
+        ledger = crypto_ledger.get_ledger(db=db)
         raw_positions = ledger.get('positions') or []
 
         symbol_exposure: dict[str, float] = {}
