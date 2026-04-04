@@ -210,3 +210,55 @@ def test_startup_reconciliation_does_not_resurrect_closed_crypto_trade_history(t
         assert crypto_ledger.get_ledger()['trades'] == []
 
     _reset_crypto_ledger()
+
+
+def test_stock_reconciliation_exposes_quantity_truth_with_pending_exit_reservations(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        db.add(
+            Position(
+                account_id='paper',
+                ticker='AAPL',
+                shares=10,
+                avg_entry_price=180.0,
+                current_price=181.5,
+                strategy='AI_SCREENING',
+                entry_time=datetime.now(UTC).replace(microsecond=0),
+                entry_reasoning={'intentId': 'intent-entry'},
+                is_open=True,
+                execution_id='intent-entry',
+            )
+        )
+        db.commit()
+
+        broker_snapshot = {
+            'AAPL': {
+                'symbol': 'AAPL',
+                'shares': 8,
+                'avgPrice': 180.0,
+                'currentPrice': 181.5,
+                'marketValue': 1452.0,
+                'pnl': 12.0,
+                'pnlPercent': 0.83,
+            }
+        }
+        quantity_truth = position_reconciliation_service.get_stock_quantity_truth(
+            db,
+            symbol='AAPL',
+            broker_positions=broker_snapshot,
+            pending_orders=[{'remaining_quantity': 3}],
+        )
+
+        assert quantity_truth['dbOpenQuantity'] == 10
+        assert quantity_truth['brokerQuantity'] == 8
+        assert quantity_truth['pendingExitQuantity'] == 3
+        assert quantity_truth['sellableQuantity'] == 5
+        assert quantity_truth['quantityDelta'] == -2
+        assert quantity_truth['driftDetected'] is True

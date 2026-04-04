@@ -20,6 +20,7 @@ from app.models.watchlist_symbol import WatchlistSymbol
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.kraken_service import crypto_ledger, kraken_service
 from app.services.market_sessions import get_scope_session_status
+from app.services.position_reconciliation import position_reconciliation_service
 from app.services.runtime_state import runtime_state
 from app.services.trade_validator import trade_validator
 from app.services.tradier_client import tradier_client
@@ -307,12 +308,22 @@ class WatchlistExitWorkerService:
         reserved_quantity = int(candidate.get('brokerReservedQuantity') or 0)
         available_quantity = int(candidate.get('brokerAvailableQuantity') or 0)
         if broker_quantity <= 0 and reserved_quantity <= 0 and available_quantity <= 0 and not pending_orders:
-            broker_state = self._get_broker_exit_state(str(position.ticker or '').upper(), mode=mode)
+            broker_state = self._get_broker_exit_state(str(position.ticker or '').upper(), mode=mode, use_cache=False)
             broker_quantity = int(broker_state.get('brokerQuantity') or 0)
             reserved_quantity = int(broker_state.get('reservedQuantity') or 0)
             available_quantity = int(broker_state.get('availableQuantity') or 0)
             pending_orders = list(broker_state.get('pendingOrders') or [])
         trigger = str(candidate.get('exitTrigger') or EXIT_TRIGGER)
+        quantity_truth = self._build_stock_quantity_truth(
+            db,
+            symbol=str(position.ticker or '').upper(),
+            broker_state={
+                'brokerQuantity': broker_quantity,
+                'reservedQuantity': reserved_quantity,
+                'availableQuantity': available_quantity,
+                'pendingOrders': pending_orders,
+            },
+        )
         requested_quantity = self._determine_requested_quantity(
             trigger=trigger,
             available_quantity=available_quantity,
@@ -324,6 +335,7 @@ class WatchlistExitWorkerService:
         candidate['brokerExitPending'] = bool(pending_orders)
         candidate['brokerPendingOrders'] = pending_orders
         candidate['requestedQuantity'] = requested_quantity
+        candidate['quantityTruth'] = self._format_quantity_truth_payload(quantity_truth)
         if pending_orders:
             candidate['action'] = 'EXIT_ALREADY_IN_PROGRESS'
             candidate['reason'] = 'BROKER_EXIT_PENDING'
@@ -331,7 +343,7 @@ class WatchlistExitWorkerService:
             return candidate
         if requested_quantity <= 0:
             candidate['action'] = 'SKIPPED'
-            candidate['reason'] = 'NO_OPEN_QUANTITY'
+            candidate['reason'] = 'NO_SELLABLE_QUANTITY'
             return candidate
 
         account_id = str(position.account_id or '').strip() or f'{mode.lower()}-watchlist-exit'
@@ -353,6 +365,7 @@ class WatchlistExitWorkerService:
                 'scaleOut': trigger == PROFIT_TARGET_TRIGGER,
                 'fallbackQuantity': fallback_quantity,
                 'brokerQuantity': broker_quantity,
+                'quantityTruth': self._format_quantity_truth_payload(quantity_truth),
             },
         )
         candidate['intentId'] = exit_intent.intent_id
@@ -377,11 +390,18 @@ class WatchlistExitWorkerService:
             if exit_record and trigger == PROFIT_TARGET_TRIGGER and int(exit_record.get('remaining_shares') or 0) > 0:
                 self._arm_profit_target_trailing(db, position_id=position.id, exit_price=float(exit_record.get('exit_price') or 0.0))
         except Exception as exc:
-            refreshed_broker_state = self._get_broker_exit_state(str(position.ticker or '').upper(), mode=mode)
+            refreshed_broker_state = self._get_broker_exit_state(str(position.ticker or '').upper(), mode=mode, use_cache=False)
             reconciliation_payload = {
                 'error': str(exc),
                 'exitTrigger': candidate.get('exitTrigger') or EXIT_TRIGGER,
                 'brokerState': refreshed_broker_state,
+                'quantityTruth': self._format_quantity_truth_payload(
+                    self._build_stock_quantity_truth(
+                        db,
+                        symbol=str(position.ticker or '').upper(),
+                        broker_state=refreshed_broker_state,
+                    )
+                ),
             }
             execution_lifecycle.record_event(
                 db,
@@ -397,6 +417,7 @@ class WatchlistExitWorkerService:
             db.refresh(exit_intent)
             candidate['intentStatus'] = exit_intent.status
             candidate['reconciliation'] = refreshed_broker_state
+            candidate['quantityTruth'] = reconciliation_payload['quantityTruth']
             if refreshed_broker_state.get('pendingOrders'):
                 candidate['action'] = 'EXIT_ALREADY_IN_PROGRESS'
                 candidate['reason'] = 'BROKER_EXIT_PENDING_AFTER_REJECTION'
@@ -505,6 +526,9 @@ class WatchlistExitWorkerService:
             'requestedQuantity': self._determine_requested_quantity(
                 trigger=self._primary_exit_trigger(row),
                 available_quantity=int(broker_state.get('availableQuantity') or 0),
+            ),
+            'quantityTruth': self._format_quantity_truth_payload(
+                self._build_stock_quantity_truth(db, symbol=symbol, broker_state=broker_state)
             ),
         }
         if self._has_active_exit_intent(db, row):
@@ -727,7 +751,7 @@ class WatchlistExitWorkerService:
         amount = self._safe_float(candidate.get('requestedQuantity'))
         if amount <= 0:
             candidate['action'] = 'SKIPPED'
-            candidate['reason'] = 'NO_OPEN_QUANTITY'
+            candidate['reason'] = 'NO_SELLABLE_QUANTITY'
             return candidate
 
         current_price = self._safe_float(candidate.get('currentPrice')) or None
@@ -846,7 +870,7 @@ class WatchlistExitWorkerService:
             return candidate
 
     @staticmethod
-    def _safe_broker_quantity(symbol: str, mode: str) -> int:
+    def _safe_broker_quantity(symbol: str, mode: str, *, use_cache: bool = True) -> int:
         if not tradier_client.is_ready(mode):
             return 0
         try:
@@ -854,7 +878,7 @@ class WatchlistExitWorkerService:
                 symbol,
                 mode=mode,
                 timeout=1.5,
-                use_cache=True,
+                use_cache=use_cache,
             )
         except TypeError:
             try:
@@ -869,7 +893,7 @@ class WatchlistExitWorkerService:
             return 0
 
     @staticmethod
-    def _safe_broker_sell_orders(symbol: str, mode: str) -> list[dict[str, Any]]:
+    def _safe_broker_sell_orders(symbol: str, mode: str, *, use_cache: bool = True) -> list[dict[str, Any]]:
         if not tradier_client.is_ready(mode):
             return []
         try:
@@ -879,7 +903,7 @@ class WatchlistExitWorkerService:
                 side='SELL',
                 statuses=sorted(ACTIVE_BROKER_EXIT_ORDER_STATUSES),
                 timeout=1.5,
-                use_cache=True,
+                use_cache=use_cache,
             )
         except TypeError:
             try:
@@ -910,9 +934,9 @@ class WatchlistExitWorkerService:
             return []
 
     @classmethod
-    def _get_broker_exit_state(cls, symbol: str, *, mode: str) -> dict[str, Any]:
-        broker_quantity = cls._safe_broker_quantity(symbol, mode)
-        pending_orders = cls._safe_broker_sell_orders(symbol, mode)
+    def _get_broker_exit_state(cls, symbol: str, *, mode: str, use_cache: bool = True) -> dict[str, Any]:
+        broker_quantity = cls._safe_broker_quantity(symbol, mode, use_cache=use_cache)
+        pending_orders = cls._safe_broker_sell_orders(symbol, mode, use_cache=use_cache)
         reserved_quantity = int(round(sum(float(order.get('remaining_quantity') or 0.0) for order in pending_orders)))
         available_quantity = max(broker_quantity - reserved_quantity, 0)
         return {
@@ -922,6 +946,30 @@ class WatchlistExitWorkerService:
             'availableQuantity': available_quantity,
             'pendingOrders': pending_orders,
         }
+
+
+    @staticmethod
+    def _format_quantity_truth_payload(quantity_truth: dict[str, Any]) -> dict[str, Any]:
+        return {
+            'expectedPositionQty': int(quantity_truth.get('dbOpenQuantity') or 0),
+            'brokerReportedQty': int(quantity_truth.get('brokerQuantity') or 0),
+            'pendingOpenOrdersQty': int(quantity_truth.get('pendingExitQuantity') or 0),
+            'sellableQty': int(quantity_truth.get('sellableQuantity') or 0),
+            'quantityDelta': int(quantity_truth.get('quantityDelta') or 0),
+            'driftDetected': bool(quantity_truth.get('driftDetected')),
+        }
+
+    @classmethod
+    def _build_stock_quantity_truth(cls, db: Session, *, symbol: str, broker_state: dict[str, Any]) -> dict[str, Any]:
+        broker_quantity = int(broker_state.get('brokerQuantity') or 0)
+        pending_orders = list(broker_state.get('pendingOrders') or [])
+        truth = position_reconciliation_service.get_stock_quantity_truth(
+            db,
+            symbol=symbol,
+            broker_positions={symbol: {'shares': broker_quantity}},
+            pending_orders=pending_orders,
+        )
+        return truth
 
     @staticmethod
     def _build_exit_reasons(row: dict[str, Any]) -> list[str]:

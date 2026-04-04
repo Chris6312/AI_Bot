@@ -120,12 +120,17 @@ class PositionReconciliationService:
             mirror_summary.get('closed', 0),
             cleared_guards,
         )
+        quantity_truth = [
+            self.get_stock_quantity_truth(db, symbol=symbol, broker_positions=broker_positions)
+            for symbol in sorted(open_symbols)
+        ]
         return {
             'assetClass': 'stock',
             'observedAtUtc': observed_at.isoformat(),
             'mirrorSummary': mirror_summary,
             'clearedMonitorGuardCount': cleared_guards,
             'externalOpenSymbols': sorted(open_symbols),
+            'quantityTruth': quantity_truth,
         }
 
     def _build_replayable_crypto_trades(self, db: Session) -> list[ReplayedCryptoTrade]:
@@ -210,6 +215,47 @@ class PositionReconciliationService:
             'replayedTradeCount': len(trades),
             'restoredPositionCount': len(restored_symbols),
             'restoredSymbols': restored_symbols,
+        }
+
+
+    def get_stock_quantity_truth(
+        self,
+        db: Session,
+        *,
+        symbol: str,
+        broker_positions: dict[str, dict[str, Any]] | None = None,
+        pending_orders: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        normalized_symbol = str(symbol or '').upper().strip()
+        open_rows = (
+            db.query(Position)
+            .filter(Position.ticker == normalized_symbol, Position.is_open.is_(True))
+            .order_by(Position.id.desc())
+            .all()
+        )
+        db_open_quantity = sum(max(int(row.shares or 0), 0) for row in open_rows)
+        if broker_positions is None:
+            broker_positions = watchlist_service._get_open_stock_broker_positions()
+        broker_position = broker_positions.get(normalized_symbol) or {}
+        broker_quantity = max(int(round(float(broker_position.get('shares') or 0.0))), 0)
+        normalized_pending_orders = [dict(item) for item in (pending_orders or []) if isinstance(item, dict)]
+        pending_exit_quantity = max(
+            int(round(sum(float(item.get('remaining_quantity') or 0.0) for item in normalized_pending_orders))),
+            0,
+        )
+        sellable_quantity = max(broker_quantity - pending_exit_quantity, 0)
+        quantity_delta = broker_quantity - db_open_quantity
+        return {
+            'symbol': normalized_symbol,
+            'dbOpenQuantity': db_open_quantity,
+            'brokerQuantity': broker_quantity,
+            'pendingExitQuantity': pending_exit_quantity,
+            'sellableQuantity': sellable_quantity,
+            'openRowCount': len(open_rows),
+            'quantityDelta': quantity_delta,
+            'brokerHasPosition': broker_quantity > 0,
+            'dbHasOpenPosition': db_open_quantity > 0,
+            'driftDetected': quantity_delta != 0,
         }
 
     def _clear_stale_open_position_guards(
