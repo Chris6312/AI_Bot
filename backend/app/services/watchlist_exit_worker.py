@@ -16,7 +16,6 @@ from app.models.watchlist_monitor_state import WatchlistMonitorState
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.position import Position
 from app.models.trade import Trade
-from app.models.watchlist_symbol import WatchlistSymbol
 from app.services.execution_lifecycle import execution_lifecycle
 from app.services.kraken_service import crypto_ledger, kraken_service
 from app.services.market_sessions import get_scope_session_status
@@ -28,8 +27,8 @@ from app.services.watchlist_service import FOLLOW_THROUGH_EXIT_TEMPLATES, watchl
 
 logger = logging.getLogger(__name__)
 
-ACTIVE_EXIT_INTENT_STATUSES = {'READY', 'SUBMITTED', 'PARTIALLY_FILLED', 'FILLED'}
-TERMINAL_EXIT_INTENT_STATUSES = {'REJECTED', 'CLOSED', 'CANCELED', 'CANCELLED', 'ERROR', 'FAILED'}
+ACTIVE_EXIT_INTENT_STATUSES = {'READY', 'SUBMITTED', 'PARTIALLY_FILLED'}
+TERMINAL_EXIT_INTENT_STATUSES = {'REJECTED', 'CLOSED', 'CANCELED', 'CANCELLED', 'ERROR', 'FAILED', 'FILLED'}
 ACTIVE_BROKER_EXIT_ORDER_STATUSES = {'OPEN', 'PENDING', 'SUBMITTED', 'ACCEPTED', 'PARTIALLY_FILLED', 'NEW'}
 EXIT_TRIGGER = 'TIME_STOP_EXPIRED'
 STOP_LOSS_TRIGGER = 'STOP_LOSS_BREACH'
@@ -40,6 +39,7 @@ EXECUTION_SOURCE = 'WATCHLIST_EXIT_WORKER'
 SUPPORTED_SCOPES = ('stocks_only', 'crypto_only')
 PRIMARY_SCOPE = 'stocks_only'
 IMPULSE_TRAIL_STOP_FACTOR = 0.5
+CRYPTO_STALE_EXIT_INTENT_MINUTES = 3
 
 
 @dataclass
@@ -103,7 +103,7 @@ class WatchlistExitWorkerService:
                 'eligibleExitCount': eligible_due,
                 'blockedExitCount': blocked_due,
                 'managedOnlyExpiredCount': sum(1 for row in expired_rows if row.get('managedOnly')),
-                'alreadyInProgressCount': sum(1 for row in due_rows if self._has_active_exit_intent(db, row)),
+                'alreadyInProgressCount': sum(1 for row in due_rows if self._has_blocking_exit_intent(db, row)),
             },
             'rows': [
                 self._build_status_row(db, row)
@@ -250,6 +250,7 @@ class WatchlistExitWorkerService:
             self._runtime.poll_seconds,
             settings.WATCHLIST_EXIT_WORKER_BATCH_LIMIT,
         )
+
         def _run_once_blocking() -> dict[str, Any]:
             db = SessionLocal()
             try:
@@ -285,8 +286,6 @@ class WatchlistExitWorkerService:
         if position_id is not None:
             position = db.query(Position).filter(Position.id == position_id).first()
         else:
-            # Broker-sync positions have positionId=None; fall back to open DB row
-            # matching the symbol so protective exits can still be submitted.
             position = (
                 db.query(Position)
                 .filter(
@@ -531,7 +530,7 @@ class WatchlistExitWorkerService:
                 self._build_stock_quantity_truth(db, symbol=symbol, broker_state=broker_state)
             ),
         }
-        if self._has_active_exit_intent(db, row):
+        if self._has_blocking_exit_intent(db, row):
             payload['action'] = 'EXIT_ALREADY_IN_PROGRESS'
             payload['reason'] = 'ACTIVE_EXIT_INTENT_EXISTS'
             payload['monitoringStatus'] = 'EXIT_PENDING'
@@ -542,13 +541,13 @@ class WatchlistExitWorkerService:
             payload['monitoringStatus'] = 'EXIT_PENDING'
         return payload
 
-    def _has_active_exit_intent(self, db: Session, row: dict[str, Any]) -> bool:
+    def _get_latest_exit_intent(self, db: Session, row: dict[str, Any]) -> OrderIntent | None:
         position_id = row.get('positionState', {}).get('positionId')
         scope = str(row.get('scope') or '')
         symbol = str(row.get('symbol') or '').upper().strip()
+
         query = db.query(OrderIntent).filter(
             OrderIntent.side == 'SELL',
-            OrderIntent.status.in_(ACTIVE_EXIT_INTENT_STATUSES),
             OrderIntent.execution_source == EXECUTION_SOURCE,
         )
         if position_id is not None:
@@ -557,8 +556,69 @@ class WatchlistExitWorkerService:
             aliases = sorted(self._crypto_symbol_aliases(symbol))
             query = query.filter(OrderIntent.asset_class == 'crypto', OrderIntent.symbol.in_(aliases))
         else:
+            return None
+
+        return query.order_by(OrderIntent.created_at.desc(), OrderIntent.id.desc()).first()
+
+    def _should_retry_stale_crypto_exit_intent(self, intent: OrderIntent) -> bool:
+        if intent is None:
             return False
-        return query.first() is not None
+        status = str(intent.status or '').upper()
+        if status not in ACTIVE_EXIT_INTENT_STATUSES:
+            return False
+        if str(intent.asset_class or '').lower() != 'crypto':
+            return False
+        if str(intent.execution_source or '') != EXECUTION_SOURCE:
+            return False
+        if str(intent.submitted_order_id or '').strip():
+            return False
+
+        reference_time = (
+            intent.last_fill_at
+            or intent.first_fill_at
+            or intent.submitted_at
+            or intent.updated_at
+            or intent.created_at
+        )
+        if reference_time is None:
+            return True
+        if reference_time.tzinfo is None:
+            reference_time = reference_time.replace(tzinfo=UTC)
+        age_seconds = max((datetime.now(UTC) - reference_time).total_seconds(), 0.0)
+        return age_seconds >= (CRYPTO_STALE_EXIT_INTENT_MINUTES * 60)
+
+    def _mark_stale_crypto_exit_intent_for_retry(self, db: Session, intent: OrderIntent, *, symbol: str) -> None:
+        message = f'Clearing stale crypto exit intent for retry: {symbol}'
+        execution_lifecycle.record_event(
+            db,
+            intent,
+            event_type='EXIT_RETRY_UNSTICKED',
+            status='FAILED',
+            message=message,
+            payload={
+                'symbol': symbol,
+                'reason': 'STALE_CRYPTO_EXIT_INTENT_WITHOUT_SUBMITTED_ORDER',
+            },
+        )
+        intent.status = 'FAILED'
+        intent.rejection_reason = 'Stale crypto exit intent cleared for retry'
+        db.flush()
+
+    def _has_blocking_exit_intent(self, db: Session, row: dict[str, Any]) -> bool:
+        latest_intent = self._get_latest_exit_intent(db, row)
+        if latest_intent is None:
+            return False
+
+        scope = str(row.get('scope') or '')
+        symbol = str(row.get('symbol') or '').upper().strip()
+        status = str(latest_intent.status or '').upper()
+
+        if scope == 'crypto_only' and self._should_retry_stale_crypto_exit_intent(latest_intent):
+            self._mark_stale_crypto_exit_intent_for_retry(db, latest_intent, symbol=symbol)
+            db.commit()
+            return False
+
+        return status in ACTIVE_EXIT_INTENT_STATUSES
 
     @staticmethod
     def _resolve_trade_id_for_position(db: Session, position: Position) -> int | None:
@@ -603,7 +663,7 @@ class WatchlistExitWorkerService:
             'currentPrice': self._safe_float((ledger_position or {}).get('currentPrice') or position_state.get('currentPrice')),
             'avgEntryPrice': self._safe_float((ledger_position or {}).get('avgPrice') or position_state.get('avgEntryPrice')),
         }
-        if self._has_active_exit_intent(db, row):
+        if self._has_blocking_exit_intent(db, row):
             payload['action'] = 'EXIT_ALREADY_IN_PROGRESS'
             payload['reason'] = 'EXIT_INTENT_ALREADY_ACTIVE'
             payload['monitoringStatus'] = 'EXIT_PENDING'
@@ -947,7 +1007,6 @@ class WatchlistExitWorkerService:
             'pendingOrders': pending_orders,
         }
 
-
     @staticmethod
     def _format_quantity_truth_payload(quantity_truth: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1025,7 +1084,6 @@ class WatchlistExitWorkerService:
             changed = True
         if changed:
             db.commit()
-
 
     @staticmethod
     def _resolve_watchlist_row(db: Session, *, symbol: str) -> WatchlistSymbol | None:

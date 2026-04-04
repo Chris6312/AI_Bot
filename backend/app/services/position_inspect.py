@@ -203,6 +203,7 @@ class PositionInspectService:
             timeframe_items.append({'timeframe': timeframe, 'status': status, 'reason': reason})
 
         events = self._load_events(db, intent)
+        cooldown_active = bool(base_monitor_context.get('cooldownActive') or base_monitor_context.get('reentryBlockedUntilUtc'))
         signal_snapshot = {
             'marketRegime': upload.market_regime if upload is not None else watchlist_context.get('marketRegime'),
             'tradeDirection': watch_symbol.trade_direction if watch_symbol is not None else watchlist_context.get('tradeDirection'),
@@ -211,8 +212,15 @@ class PositionInspectService:
             'priorityRank': watch_symbol.priority_rank if watch_symbol is not None else watchlist_context.get('priorityRank'),
             'tier': watch_symbol.tier if watch_symbol is not None else watchlist_context.get('tier') or base_monitor_context.get('tier'),
             'riskFlags': watch_symbol.risk_flags if watch_symbol is not None else watchlist_context.get('riskFlags') or base_monitor_context.get('riskFlags') or [],
+            'executionSource': intent.execution_source if intent is not None else None,
+            'displayPair': intent_context.get('displayPair') or current_position.get('pair') or symbol,
+            'ohlcvPair': intent_context.get('ohlcvPair') or current_position.get('ohlcvPair'),
             'latestDecisionState': monitor_state.latest_decision_state if monitor_state is not None else latest_eval.get('state'),
             'latestDecisionReason': monitor_state.latest_decision_reason if monitor_state is not None else latest_eval.get('reason'),
+            'monitoringStatus': monitor_state.monitoring_status if monitor_state is not None else None,
+            'cooldownActive': cooldown_active,
+            'reentryBlockedUntilUtc': base_monitor_context.get('reentryBlockedUntilUtc'),
+            'lastExitAtUtc': base_monitor_context.get('lastExitAtUtc'),
             'details': details,
         }
         sizing = {
@@ -226,6 +234,22 @@ class PositionInspectService:
             'displayPair': intent_context.get('displayPair') or current_position.get('pair'),
             'ohlcvPair': intent_context.get('ohlcvPair') or current_position.get('ohlcvPair'),
         }
+        stop_loss = self._maybe_float(current_position.get('stopLoss') or (
+            round(float(current_position['avgPrice']) * (1.0 - float(settings.STOP_LOSS_PCT)), 8)
+            if current_position.get('avgPrice') else None
+        ))
+        profit_target = self._maybe_float(current_position.get('profitTarget') or (
+            round(float(current_position['avgPrice']) * (1.0 + float(settings.PROFIT_TARGET_PCT)), 8)
+            if current_position.get('avgPrice') else None
+        ))
+        trailing_stop = self._maybe_float(current_position.get('trailingStop') or (
+            round(float(current_position['avgPrice']) * (1.0 - float(settings.TRAILING_STOP_PCT)), 8)
+            if current_position.get('avgPrice') else None
+        ))
+        current_price = self._maybe_float(current_position.get('currentPrice'))
+        stop_distance = (current_price - stop_loss) if current_price is not None and stop_loss is not None else None
+        target_distance = (profit_target - current_price) if current_price is not None and profit_target is not None else None
+        trailing_distance = (current_price - trailing_stop) if current_price is not None and trailing_stop is not None else None
         exit_plan = {
             'template': watch_symbol.exit_template if watch_symbol is not None else watchlist_context.get('exitTemplate') or base_monitor_context.get('exitTemplate'),
             'maxHoldHours': watch_symbol.max_hold_hours if watch_symbol is not None else watchlist_context.get('maxHoldHours') or base_monitor_context.get('maxHoldHours'),
@@ -237,23 +261,22 @@ class PositionInspectService:
             'continuityOk': details.get('continuityOk'),
             'continuityGapSeconds': self._maybe_float(details.get('continuityGapSeconds')),
             'marketDataAtUtc': latest_eval.get('marketDataAtUtc') or base_monitor_context.get('marketDataAtUtc'),
-            'stopLoss': self._maybe_float(current_position.get('stopLoss') or (
-                round(float(current_position['avgPrice']) * (1.0 - float(settings.STOP_LOSS_PCT)), 8)
-                if current_position.get('avgPrice') else None
-            )),
-            'profitTarget': self._maybe_float(current_position.get('profitTarget') or (
-                round(float(current_position['avgPrice']) * (1.0 + float(settings.PROFIT_TARGET_PCT)), 8)
-                if current_position.get('avgPrice') else None
-            )),
-            'trailingStop': self._maybe_float(current_position.get('trailingStop') or (
-                round(float(current_position['avgPrice']) * (1.0 - float(settings.TRAILING_STOP_PCT)), 8)
-                if current_position.get('avgPrice') else None
-            )),
+            'stopLoss': stop_loss,
+            'profitTarget': profit_target,
+            'trailingStop': trailing_stop,
+            'stopDistance': stop_distance,
+            'targetDistance': target_distance,
+            'trailingDistance': trailing_distance,
+            'expectedExitThresholds': {
+                'stopLoss': stop_loss,
+                'profitTarget': profit_target,
+                'trailingStop': trailing_stop,
+                'triggerLevel': self._maybe_float(details.get('triggerLevel')),
+                'bounceFloor': self._maybe_float(details.get('bounceFloor')),
+                'breakoutLevel': self._maybe_float(details.get('breakoutLevel')),
+            },
         }
 
-        current_price = self._maybe_float(current_position.get('currentPrice'))
-        stop_loss = exit_plan['stopLoss']
-        trailing_stop = exit_plan['trailingStop']
         protective_reasons: list[str] = []
         if current_price is not None and stop_loss is not None and current_price <= stop_loss:
             protective_reasons.append('STOP_LOSS_BREACH')
@@ -301,7 +324,16 @@ class PositionInspectService:
                 ),
             },
             'exitPlan': exit_plan,
-            'latestEvaluation': latest_eval or None,
+            'latestEvaluation': {
+                **(latest_eval or {}),
+                'details': {
+                    **dict((latest_eval or {}).get('details') or {}),
+                    'cooldownActive': cooldown_active,
+                    'reentryBlockedUntilUtc': base_monitor_context.get('reentryBlockedUntilUtc'),
+                    'lastExitAtUtc': base_monitor_context.get('lastExitAtUtc'),
+                    'monitoringStatus': monitor_state.monitoring_status if monitor_state is not None else None,
+                },
+            } if latest_eval or cooldown_active or monitor_state is not None else None,
             'lifecycle': events,
             'rawContext': {
                 'intentContext': intent_context,
@@ -311,6 +343,7 @@ class PositionInspectService:
                     'symbolAliases': sorted(aliases),
                 },
                 'monitorContext': base_monitor_context,
+                'currentPosition': current_position,
             },
         }
 
@@ -339,6 +372,7 @@ class PositionInspectService:
                 'cooldownActive': True,
                 'reentryBlockedUntilUtc': base_monitor_context.get('reentryBlockedUntilUtc'),
                 'lastExitAtUtc': base_monitor_context.get('lastExitAtUtc'),
+                'monitoringStatus': monitor_state.monitoring_status,
             },
         }
         configured_timeframes = list(
@@ -377,6 +411,7 @@ class PositionInspectService:
                 'riskFlags': watch_symbol.risk_flags if watch_symbol is not None else base_monitor_context.get('riskFlags') or [],
                 'latestDecisionState': monitor_state.latest_decision_state,
                 'latestDecisionReason': monitor_state.latest_decision_reason,
+                'monitoringStatus': monitor_state.monitoring_status or (watch_symbol.monitoring_status if watch_symbol is not None else None) or base_monitor_context.get('monitoringStatus') or '',
                 'lastExitAtUtc': base_monitor_context.get('lastExitAtUtc'),
                 'lastExitReason': base_monitor_context.get('lastExitReason'),
                 'reentryBlockedUntilUtc': base_monitor_context.get('reentryBlockedUntilUtc'),
@@ -405,6 +440,7 @@ class PositionInspectService:
                 'stopLoss': None,
                 'profitTarget': None,
                 'trailingStop': None,
+                'expectedExitThresholds': {},
             },
             'latestEvaluation': latest_eval,
             'lifecycle': [],

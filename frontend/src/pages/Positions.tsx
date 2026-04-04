@@ -62,6 +62,14 @@ function formatMoney(value: number) {
   return `$${value.toFixed(2)}`
 }
 
+function formatPrice(value: number) {
+  const absolute = Math.abs(value)
+  if (absolute === 0) return '$0.00'
+  if (absolute < 1) return `$${value.toFixed(5)}`
+  if (absolute < 100) return `$${value.toFixed(4)}`
+  return `$${value.toFixed(2)}`
+}
+
 function formatPercent(value: number) {
   const prefix = value >= 0 ? '+' : ''
   return `${prefix}${value.toFixed(2)}%`
@@ -758,11 +766,18 @@ function displayValue(label: string, value: unknown): string {
     if (normalized.includes('pct') || normalized.includes('percent')) return formatPercent(value)
     if (
       normalized.includes('price') ||
+      normalized.includes('target') ||
+      normalized.includes('stop') ||
+      normalized.includes('trigger') ||
+      normalized.includes('breakout') ||
+      normalized.includes('bounce')
+    ) {
+      return formatPrice(value)
+    }
+    if (
       normalized.includes('value') ||
       normalized.includes('pnl') ||
       normalized.includes('basis') ||
-      normalized.includes('target') ||
-      normalized.includes('stop') ||
       normalized.includes('notional')
     ) {
       return formatMoney(value)
@@ -807,9 +822,10 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
   const snapshot = inspect.positionSnapshot ?? {}
   const signal = inspect.signalSnapshot ?? {}
   const entryReasoning = asRecord(signal.entryReasoning)
-  const watchlist = asRecord(entryReasoning.watchlist)
+  const watchlist = Object.keys(asRecord(entryReasoning.watchlist)).length > 0 ? asRecord(entryReasoning.watchlist) : asRecord(signal)
   const reconciliation = asRecord(entryReasoning.reconciliation)
   const brokerSnapshot = asRecord(entryReasoning.brokerSnapshot)
+  const signalDetails = asRecord(signal.details)
   const sizing = inspect.sizing ?? {}
   const exitPlan = inspect.exitPlan ?? {}
   const latestEvaluation = inspect.latestEvaluation ?? {}
@@ -830,14 +846,31 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
     { label: 'Strategy', value: displayValue('strategy', signal.strategy), tone: 'info' },
     { label: 'Execution source', value: displayValue('executionSource', signal.executionSource), tone: 'muted' },
     { label: 'Setup template', value: displayValue('setupTemplate', watchlist.setupTemplate), tone: 'muted' },
-    { label: 'Exit template', value: displayValue('exitTemplate', watchlist.exitTemplate), tone: 'muted' },
-    { label: 'Max hold hours', value: displayValue('maxHoldHours', watchlist.maxHoldHours), tone: 'muted' },
+    { label: 'Exit template', value: displayValue('exitTemplate', watchlist.exitTemplate ?? inspect.exitPlan?.template), tone: 'muted' },
+    { label: 'Max hold hours', value: displayValue('maxHoldHours', watchlist.maxHoldHours ?? inspect.exitPlan?.maxHoldHours), tone: 'muted' },
+    { label: 'Market regime', value: displayValue('marketRegime', signal.marketRegime), tone: 'muted' },
+    { label: 'Trade direction', value: displayValue('tradeDirection', signal.tradeDirection), tone: 'muted' },
+    { label: 'Bias', value: displayValue('bias', signal.bias), tone: 'muted' },
+    { label: 'Tier', value: displayValue('tier', signal.tier), tone: 'muted' },
+    { label: 'Priority rank', value: displayValue('priorityRank', signal.priorityRank), tone: 'muted' },
+    { label: 'Risk flags', value: displayValue('riskFlags', signal.riskFlags), tone: 'warn' },
+    { label: 'Monitoring status', value: displayValue('monitoringStatus', signal.monitoringStatus), tone: 'muted' },
+    { label: 'Cooldown active', value: displayValue('cooldownActive', signal.cooldownActive), tone: 'warn' },
+    { label: 'Re-entry blocked until', value: displayValue('reentryBlockedUntilUtc', signal.reentryBlockedUntilUtc), tone: 'warn' },
+    { label: 'Last exit at', value: displayValue('lastExitAtUtc', signal.lastExitAtUtc), tone: 'muted' },
     { label: 'Seed intent status', value: displayValue('seedIntentStatus', entryReasoning.seedIntentStatus), tone: 'muted' },
     { label: 'Sync source', value: displayValue('syncSource', entryReasoning.syncSource), tone: 'muted' },
     { label: 'Broker shares', value: displayValue('shares', brokerSnapshot.shares), tone: 'muted' },
     { label: 'Broker avg price', value: displayValue('avgPrice', brokerSnapshot.avgPrice), tone: 'muted' },
     { label: 'Reconciliation event', value: displayValue('event', reconciliation.event), tone: 'warn' },
     { label: 'Observed at', value: displayValue('observedAtUtc', reconciliation.observedAtUtc), tone: 'muted' },
+    { label: 'Trigger level', value: displayValue('triggerLevel', signalDetails.triggerLevel), tone: 'info' },
+    { label: 'Breakout level', value: displayValue('breakoutLevel', signalDetails.breakoutLevel), tone: 'info' },
+    { label: 'Bounce floor', value: displayValue('bounceFloor', signalDetails.bounceFloor), tone: 'info' },
+    { label: 'Recent high', value: displayValue('recentHigh', signalDetails.recentHigh), tone: 'muted' },
+    { label: 'Recent low', value: displayValue('recentLow', signalDetails.recentLow), tone: 'muted' },
+    { label: 'Continuity OK', value: displayValue('continuityOk', signalDetails.continuityOk), tone: 'muted' },
+    { label: 'Continuity gap seconds', value: displayValue('continuityGapSeconds', signalDetails.continuityGapSeconds), tone: 'muted' },
   ]
 
   const requestedQuantity = asNumber(sizing.requestedQuantity)
@@ -856,22 +889,38 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
     { label: 'Requested notional', value: displayValue('requestedNotional', requestedNotional), tone: 'muted' },
     { label: 'Actual fill notional', value: displayValue('actualNotional', actualNotional), tone: 'muted' },
     { label: 'Slippage', value: displayValue('slippage', slippage), tone: toneFromPnl(-(slippage ?? 0)) },
+    { label: 'Estimated value', value: displayValue('estimatedValue', sizing.estimatedValue), tone: 'muted' },
+    { label: 'Position %', value: displayValue('positionPct', sizing.positionPct), tone: 'muted' },
+    { label: 'Display pair', value: displayValue('displayPair', sizing.displayPair), tone: 'muted' },
+    { label: 'OHLCV pair', value: displayValue('ohlcvPair', sizing.ohlcvPair), tone: 'muted' },
     { label: 'Account ID', value: displayValue('accountId', sizing.accountId), tone: 'muted' },
   ]
 
+  const expectedExitThresholds = asRecord(exitPlan.expectedExitThresholds)
   const exitRows: LabeledStat[] = [
     { label: 'Exit template', value: displayValue('template', exitPlan.template), tone: 'info' },
     { label: 'Stop loss', value: displayValue('stopLoss', exitPlan.stopLoss), tone: 'danger' },
     { label: 'Profit target', value: displayValue('profitTarget', exitPlan.profitTarget), tone: 'good' },
     { label: 'Trailing stop', value: displayValue('trailingStop', exitPlan.trailingStop), tone: 'warn' },
+    { label: 'Stop distance', value: displayValue('stopDistance', exitPlan.stopDistance), tone: 'warn' },
+    { label: 'Target distance', value: displayValue('targetDistance', exitPlan.targetDistance), tone: 'good' },
+    { label: 'Trailing distance', value: displayValue('trailingDistance', exitPlan.trailingDistance), tone: 'warn' },
+    { label: 'Trigger level', value: displayValue('triggerLevel', expectedExitThresholds.triggerLevel ?? exitPlan.triggerLevel), tone: 'info' },
+    { label: 'Breakout level', value: displayValue('breakoutLevel', expectedExitThresholds.breakoutLevel ?? exitPlan.breakoutLevel), tone: 'info' },
+    { label: 'Bounce floor', value: displayValue('bounceFloor', expectedExitThresholds.bounceFloor ?? exitPlan.bounceFloor), tone: 'info' },
     { label: 'Peak price', value: displayValue('peakPrice', exitPlan.peakPrice), tone: 'muted' },
     { label: 'Exit trigger', value: displayValue('tradeExitTrigger', exitPlan.tradeExitTrigger), tone: 'muted' },
   ]
 
+  const latestDetails = asRecord(latestEvaluation.details)
   const latestEvaluationRows: LabeledStat[] = [
     { label: 'State', value: displayValue('state', latestEvaluation.state), tone: getStatusMeta(String(latestEvaluation.state ?? '')).tone },
     { label: 'Worker time', value: displayValue('evaluatedAtUtc', latestEvaluation.evaluatedAtUtc), tone: 'muted' },
     { label: 'Broker exit pending', value: displayValue('brokerExitPending', signal.brokerExitPending), tone: 'warn' },
+    { label: 'Monitoring status', value: displayValue('monitoringStatus', latestDetails.monitoringStatus ?? signal.monitoringStatus), tone: 'muted' },
+    { label: 'Cooldown active', value: displayValue('cooldownActive', latestDetails.cooldownActive ?? signal.cooldownActive), tone: 'warn' },
+    { label: 'Re-entry blocked until', value: displayValue('reentryBlockedUntilUtc', latestDetails.reentryBlockedUntilUtc ?? signal.reentryBlockedUntilUtc), tone: 'warn' },
+    { label: 'Last exit at', value: displayValue('lastExitAtUtc', latestDetails.lastExitAtUtc ?? signal.lastExitAtUtc), tone: 'muted' },
   ]
 
   const rawSections = [

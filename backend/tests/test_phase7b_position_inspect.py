@@ -198,16 +198,26 @@ def test_crypto_position_inspect_returns_signal_sizing_and_lifecycle(tmp_path, m
         assert payload['displaySymbol'] == 'TAO/USD'
         assert payload['signalSnapshot']['setupTemplate'] == 'trend_continuation'
         assert payload['signalSnapshot']['marketRegime'] == 'mixed'
+        assert payload['signalSnapshot']['executionSource'] == 'WATCHLIST_MONITOR_ENTRY'
+        assert payload['signalSnapshot']['priorityRank'] == 1
+        assert payload['signalSnapshot']['riskFlags'] == ['high_beta']
+        assert payload['signalSnapshot']['cooldownActive'] is False
         assert payload['sizing']['filledQuantity'] == 0.5
+        assert payload['sizing']['displayPair'] == 'TAO/USD'
+        assert payload['sizing']['ohlcvPair'] == 'TAOUSD'
         assert payload['timeframeAlignment']['configured'] == ['15m', '1h', '4h']
         assert payload['timeframeAlignment']['confirmed'] == ['15m']
         assert payload['exitPlan']['template'] == 'scale_out_then_trail'
+        assert payload['exitPlan']['expectedExitThresholds']['stopLoss'] is not None
+        assert payload['exitPlan']['expectedExitThresholds']['profitTarget'] is not None
+        assert payload['exitPlan']['stopDistance'] is not None
         assert [event['eventType'] for event in payload['lifecycle']] == [
             'INTENT_CREATED',
             'ORDER_SUBMITTED',
             'ORDER_STATUS_UPDATED',
         ]
         assert payload['latestEvaluation']['state'] == 'ENTRY_CANDIDATE'
+        assert payload['latestEvaluation']['details']['cooldownActive'] is False
 
 
 def test_crypto_position_inspect_uses_symbol_aliases_and_intent_watchlist_fallback(tmp_path, monkeypatch) -> None:
@@ -536,3 +546,92 @@ def test_crypto_inspect_returns_cooldown_payload_after_exit(tmp_path) -> None:
         assert payload['signalSnapshot']['cooldownActive'] is True
         assert payload['signalSnapshot']['reentryBlockedUntilUtc']
         assert payload['latestEvaluation']['details']['cooldownActive'] is True
+
+
+
+def test_crypto_position_inspect_cooldown_payload_surfaces_guard_state(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        upload = WatchlistUpload(
+            upload_id='upl-cooldown-1',
+            scan_id='scan-cooldown-1',
+            schema_version='bot_watchlist_v3',
+            provider='claude_tradier_mcp',
+            scope='crypto_only',
+            source='test',
+            payload_hash='hash-cooldown-1',
+            generated_at_utc=datetime(2026, 4, 1, 13, 0, tzinfo=UTC),
+            received_at_utc=datetime(2026, 4, 1, 13, 1, tzinfo=UTC),
+            watchlist_expires_at_utc=datetime(2026, 4, 2, 13, 0, tzinfo=UTC),
+            validation_status='ACCEPTED',
+            market_regime='mixed',
+            selected_count=1,
+            is_active=True,
+            validation_result_json={},
+            raw_payload_json={},
+            bot_payload_json={},
+        )
+        db.add(upload)
+        db.flush()
+
+        row = WatchlistSymbol(
+            upload_id=upload.upload_id,
+            scope='crypto_only',
+            symbol='SEI/USD',
+            quote_currency='USD',
+            asset_class='crypto',
+            enabled=True,
+            trade_direction='long',
+            priority_rank=3,
+            tier='tier_2',
+            bias='bullish',
+            setup_template='pullback_reclaim',
+            bot_timeframes=['5m', '15m', '1h'],
+            exit_template='trail_after_impulse',
+            max_hold_hours=48,
+            risk_flags=['high_beta'],
+            monitoring_status='COOLDOWN',
+        )
+        db.add(row)
+        db.flush()
+
+        monitor_state = WatchlistMonitorState(
+            watchlist_symbol_id=row.id,
+            upload_id=upload.upload_id,
+            scope='crypto_only',
+            symbol='SEI/USD',
+            monitoring_status='COOLDOWN',
+            latest_decision_state='COOLDOWN_ACTIVE',
+            latest_decision_reason='Re-entry cooldown still active after recent exit.',
+            decision_context_json={
+                'executionSource': 'WATCHLIST_MONITOR',
+                'reentryBlockedUntilUtc': '2026-04-01T14:00:00+00:00',
+                'lastExitAtUtc': '2026-04-01T13:32:00+00:00',
+                'exitExecution': {
+                    'displayPair': 'SEI/USD',
+                    'lastExitPrice': 0.551,
+                },
+                'riskFlags': ['high_beta'],
+                'botTimeframes': ['5m', '15m', '1h'],
+            },
+            required_timeframes_json=['5m', '15m', '1h'],
+            evaluation_interval_seconds=300,
+            last_decision_at_utc=datetime(2026, 4, 1, 13, 35, tzinfo=UTC),
+            last_evaluated_at_utc=datetime(2026, 4, 1, 13, 35, tzinfo=UTC),
+            next_evaluation_at_utc=datetime(2026, 4, 1, 13, 40, tzinfo=UTC),
+            last_market_data_at_utc=datetime(2026, 4, 1, 13, 34, 30, tzinfo=UTC),
+        )
+        db.add(monitor_state)
+        db.commit()
+
+        payload = position_inspect_service.get_inspect_payload(db, asset_class='crypto', symbol='SEI/USD')
+        db.close()
+
+        assert payload['inspectSource'] == 'watchlist_monitor_state'
+        assert payload['signalSnapshot']['cooldownActive'] is True
+        assert payload['signalSnapshot']['reentryBlockedUntilUtc'] == '2026-04-01T14:00:00+00:00'
+        assert payload['signalSnapshot']['monitoringStatus'] == 'COOLDOWN'
+        assert payload['latestEvaluation']['details']['cooldownActive'] is True
+        assert payload['latestEvaluation']['details']['lastExitAtUtc'] == '2026-04-01T13:32:00+00:00'
+        assert payload['exitPlan']['template'] == 'trail_after_impulse'
+        assert payload['timeframeAlignment']['configured'] == ['5m', '15m', '1h']
