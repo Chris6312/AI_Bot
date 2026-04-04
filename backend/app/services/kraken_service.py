@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from app.services.discord_notifications import discord_notifications
-from app.services.crypto_paper_broker import crypto_paper_broker
 
 logger = logging.getLogger(__name__)
 
@@ -439,178 +438,365 @@ class KrakenAPIService:
         return prices
 
 
-
 class CryptoPaperLedger:
-    """Compatibility wrapper around the persisted crypto paper broker service."""
+    """Paper crypto ledger with in-memory runtime state and best-effort DB persistence."""
 
     def __init__(self, starting_balance: float = 100000.0):
+        self.account_key = 'paper-crypto-ledger'
         self.starting_balance = Decimal(str(starting_balance))
         self.balance = Decimal(str(starting_balance))
         self.trades: List[Dict] = []
         self.positions: Dict[str, Dict] = {}
         self.kraken = KrakenAPIService()
         self._ledger_lock = RLock()
+        self._hydrate_from_db_best_effort()
 
-    def _price_lookup(self, pair: str, ohlcv_pair: str | None, fallback_price: float) -> float:
-        resolved_pair = ohlcv_pair or self._resolve_position_ohlcv_pair(pair)
-        prices = self.kraken.get_prices([resolved_pair] if resolved_pair else [pair])
-        price = self._get_price_for_pair(pair, prices, resolved_pair)
-        return price if price > 0 else fallback_price
+    @staticmethod
+    def _coerce_datetime(value: Any) -> datetime:
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            raw = str(value or '').strip()
+            if not raw:
+                return datetime.now(UTC)
+            normalized = raw.replace('Z', '+00:00')
+            dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
 
-    def _refresh_cache(self, db=None, *, include_trades: bool = True) -> None:
+    def _hydrate_from_db_best_effort(self) -> None:
         try:
-            ledger = crypto_paper_broker.get_ledger(db=db, price_lookup=self._price_lookup)
+            from app.core.database import SessionLocal
+            from app.models.crypto_paper_account import CryptoPaperAccount
+            from app.models.crypto_paper_fill import CryptoPaperFill
+            from app.models.crypto_paper_position import CryptoPaperPosition
         except Exception:
             return
-        self.balance = Decimal(str(ledger.get('balance') or self.starting_balance))
-        if include_trades:
-            self.trades = list(ledger.get('trades') or [])
-        self.positions = {
-            str(row.get('pair') or ''): {
-                'amount': Decimal(str(row.get('amount') or 0)),
-                'total_cost': Decimal(str(row.get('costBasis') or 0)),
-                'entry_time_utc': row.get('entryTimeUtc'),
-                'ohlcv_pair': row.get('ohlcvPair'),
-            }
-            for row in (ledger.get('positions') or [])
-            if str(row.get('pair') or '').strip()
-        }
 
-    def _build_positions_from_cache(self) -> List[Dict]:
-        rows: List[Dict] = []
-        snapshot = [(str(pair), dict(pos or {})) for pair, pos in dict(self.positions or {}).items()]
-        raw_pair_mappings: dict[str, str] = getattr(self, 'pair_mappings', {}) or {}
-        reverse_pair_map: dict[str, str] = {str(v): str(k) for k, v in raw_pair_mappings.items()}
-        for pair, pos in snapshot:
-            amount_dec = Decimal(str(pos.get('amount') or 0))
-            if amount_dec <= 0:
-                continue
-            total_cost_dec = Decimal(str(pos.get('total_cost') or 0))
-            avg_price = float(total_cost_dec / amount_dec) if amount_dec > 0 else 0.0
-            display_pair = reverse_pair_map.get(pair, pair)
-            ohlcv_pair = pos.get('ohlcv_pair') or self._resolve_position_ohlcv_pair(display_pair)
-            current_price = self._price_lookup(display_pair, ohlcv_pair, avg_price)
-            market_value = float(amount_dec) * current_price
-            cost_basis = float(total_cost_dec)
-            pnl = market_value - cost_basis
-            pnl_percent = (pnl / cost_basis) * 100 if cost_basis > 0 else 0.0
-            rows.append({
-                'pair': display_pair,
-                'ohlcvPair': ohlcv_pair,
-                'amount': float(amount_dec),
-                'avgPrice': avg_price,
-                'currentPrice': current_price,
-                'marketValue': market_value,
-                'costBasis': cost_basis,
-                'pnl': pnl,
-                'pnlPercent': pnl_percent,
-                'entryTimeUtc': pos.get('entry_time_utc'),
-                'realizedPnl': 0.0,
-            })
-        return rows
+        try:
+            with SessionLocal() as db:
+                account = (
+                    db.query(CryptoPaperAccount)
+                    .filter(CryptoPaperAccount.account_key == self.account_key)
+                    .one_or_none()
+                )
+                if account is not None:
+                    self.starting_balance = Decimal(str(account.starting_balance or self.starting_balance))
+                    self.balance = Decimal(str(account.cash_balance or self.balance))
 
-    def _execute_trade_in_memory(self, pair: str, ohlcv_pair: str, side: str, amount: float, price: float) -> Dict:
-        amount_dec = Decimal(str(amount or 0))
-        price_dec = Decimal(str(price or 0))
-        if amount_dec <= 0 or price_dec <= 0:
-            return {'status': 'REJECTED', 'reason': 'Invalid crypto paper trade request'}
-        pair = str(pair or '').upper().strip()
-        total = amount_dec * price_dec
-        event_time = datetime.now(UTC).isoformat()
-        if str(side or '').upper().strip() == 'BUY':
-            if self.balance < total:
-                return {'status': 'REJECTED', 'reason': f'Insufficient balance: {self.balance} < {total}'}
-            self.balance -= total
-            pos = dict(self.positions.get(pair) or {})
-            old_amount = Decimal(str(pos.get('amount') or 0))
-            old_cost = Decimal(str(pos.get('total_cost') or 0))
-            pos['amount'] = old_amount + amount_dec
-            pos['total_cost'] = old_cost + total
-            pos['entry_time_utc'] = pos.get('entry_time_utc') or event_time
-            pos['ohlcv_pair'] = ohlcv_pair
-            self.positions[pair] = pos
-        else:
-            pos = dict(self.positions.get(pair) or {})
-            available = Decimal(str(pos.get('amount') or 0))
-            if available < amount_dec:
-                return {'status': 'REJECTED', 'reason': f'Insufficient {pair} position'}
-            cost = Decimal(str(pos.get('total_cost') or 0))
-            avg_cost = (cost / available) if available > 0 else Decimal('0')
-            closed_cost = avg_cost * amount_dec
-            remaining = available - amount_dec
-            self.balance += total
-            if remaining <= 0:
-                self.positions.pop(pair, None)
-            else:
-                pos['amount'] = remaining
-                pos['total_cost'] = cost - closed_cost
-                self.positions[pair] = pos
-        trade_id = f'paper_{datetime.now(UTC).timestamp():.6f}'.replace('.', '')
-        trade = {
-            'id': trade_id,
-            'timestamp': event_time,
-            'market': 'CRYPTO',
-            'pair': pair,
-            'ohlcvPair': ohlcv_pair,
-            'side': str(side).upper(),
-            'amount': float(amount_dec),
-            'price': float(price_dec),
-            'total': float(total),
-            'status': 'FILLED',
-            'balance': float(self.balance),
-        }
-        self.trades.append(trade)
-        return trade
+                rows = (
+                    db.query(CryptoPaperPosition)
+                    .filter(CryptoPaperPosition.is_open.is_(True))
+                    .all()
+                )
+                hydrated_positions: Dict[str, Dict] = {}
+                for row in rows:
+                    quantity = Decimal(str(row.quantity or 0.0))
+                    if quantity <= 0:
+                        continue
+                    hydrated_positions[str(row.symbol)] = {
+                        'amount': quantity,
+                        'total_cost': Decimal(str(row.total_cost or 0.0)),
+                        'entry_time_utc': row.entry_time_utc.isoformat() if row.entry_time_utc else None,
+                        'ohlcv_pair': row.ohlcv_pair,
+                    }
+                self.positions = hydrated_positions
 
-    def execute_trade(self, pair: str, ohlcv_pair: str, side: str, amount: float, price: Optional[float] = None, db=None, intent_id: str | None = None, source: str | None = None) -> Dict:
+                fills = db.query(CryptoPaperFill).order_by(CryptoPaperFill.filled_at.asc(), CryptoPaperFill.id.asc()).all()
+                self.trades = [
+                    {
+                        'id': fill.fill_id,
+                        'timestamp': self._coerce_datetime(fill.filled_at).isoformat(),
+                        'market': 'CRYPTO',
+                        'pair': str(fill.symbol or '').upper().strip(),
+                        'ohlcvPair': fill.ohlcv_pair,
+                        'side': str(fill.side or '').upper().strip(),
+                        'amount': float(fill.quantity or 0.0),
+                        'price': float(fill.price or 0.0),
+                        'total': float(fill.notional or 0.0),
+                        'balance': None,
+                    }
+                    for fill in fills
+                ]
+        except Exception:
+            return
+
+    def _persist_state_best_effort(self) -> None:
+        try:
+            from app.core.database import SessionLocal
+            from app.models.crypto_paper_account import CryptoPaperAccount
+            from app.models.crypto_paper_fill import CryptoPaperFill
+            from app.models.crypto_paper_position import CryptoPaperPosition
+        except Exception:
+            return
+
+        try:
+            with SessionLocal() as db:
+                account = (
+                    db.query(CryptoPaperAccount)
+                    .filter(CryptoPaperAccount.account_key == self.account_key)
+                    .one_or_none()
+                )
+                if account is None:
+                    account = CryptoPaperAccount(
+                        account_key=self.account_key,
+                        base_currency='USD',
+                    )
+                    db.add(account)
+                    db.flush()
+
+                account.base_currency = 'USD'
+                account.cash_balance = float(self.balance)
+                account.starting_balance = float(self.starting_balance)
+
+                db.query(CryptoPaperFill).delete()
+                for trade in self.trades:
+                    db.add(
+                        CryptoPaperFill(
+                            fill_id=str(trade.get('id') or ''),
+                            order_id=str(trade.get('id') or ''),
+                            account_key=self.account_key,
+                            symbol=str(trade.get('pair') or '').upper().strip(),
+                            ohlcv_pair=str(trade.get('ohlcvPair') or '').strip() or None,
+                            side=str(trade.get('side') or '').upper().strip(),
+                            quantity=float(trade.get('amount') or 0.0),
+                            price=float(trade.get('price') or 0.0),
+                            notional=float(trade.get('total') or 0.0),
+                            fee=0.0,
+                            filled_at=self._coerce_datetime(trade.get('timestamp')),
+                        )
+                    )
+
+                db.query(CryptoPaperPosition).delete()
+                for pair, position in (self.positions or {}).items():
+                    quantity = Decimal(str(position.get('amount') or 0.0))
+                    if quantity <= 0:
+                        continue
+                    total_cost = Decimal(str(position.get('total_cost') or 0.0))
+                    entry_time_raw = position.get('entry_time_utc')
+                    entry_time = self._coerce_datetime(entry_time_raw) if entry_time_raw else None
+                    ohlcv_pair = str(position.get('ohlcv_pair') or '').strip() or None
+                    db.add(
+                        CryptoPaperPosition(
+                            account_key=self.account_key,
+                            symbol=str(pair or '').upper().strip(),
+                            ohlcv_pair=ohlcv_pair,
+                            quantity=float(quantity),
+                            total_cost=float(total_cost),
+                            avg_price=float(total_cost / quantity) if quantity > 0 else 0.0,
+                            entry_time_utc=entry_time,
+                            realized_pnl=0.0,
+                            closed_at=None,
+                            is_open=True,
+                        )
+                    )
+
+                db.commit()
+        except Exception:
+            logger.debug('Crypto paper ledger persistence skipped.', exc_info=True)
+
+    def execute_trade(
+        self,
+        pair: str,
+        ohlcv_pair: str,
+        side: str,
+        amount: float,
+        price: Optional[float] = None,
+        db=None,
+        intent_id: str | None = None,
+        source: str | None = None,
+    ) -> Dict:
+        """Execute a paper trade."""
         if price is None:
             ticker = self.kraken.get_ticker(ohlcv_pair)
             if not ticker or 'c' not in ticker:
                 return {'status': 'REJECTED', 'reason': 'Failed to fetch current price'}
             price = float(ticker['c'][0])
-        if db is None:
-            trade = self._execute_trade_in_memory(pair, ohlcv_pair, side, amount, price)
-        else:
-            trade = crypto_paper_broker.execute_trade(
-                db=db,
-                pair=pair,
-                ohlcv_pair=ohlcv_pair,
-                side=side,
-                amount=amount,
-                price=price,
-                source=source,
-                intent_id=intent_id,
-            )
-        if str(trade.get('status') or '').upper() == 'FILLED':
-            if db is not None:
-                self._refresh_cache(db=db)
-            discord_notifications.send_trade_alert(
-                asset_class='crypto',
-                side=side,
-                symbol=pair,
-                quantity=float(Decimal(str(amount or 0))),
-                price=float(Decimal(str(price or 0))),
-                execution_source='CRYPTO_PAPER_LEDGER',
-                account_id='paper-crypto-ledger',
-                status='FILLED',
-                extra={'mode': 'PAPER'},
-            )
-            logger.info('Paper trade executed: %s %s %s @ %s', side, amount, pair, price)
+
+        pair = str(pair or '').upper().strip()
+        ohlcv_pair = str(ohlcv_pair or '').upper().strip() or None
+        side = str(side or '').upper().strip()
+        amount_dec = Decimal(str(amount))
+        price_dec = Decimal(str(price))
+        total = amount_dec * price_dec
+        trade_timestamp = datetime.now(UTC).isoformat()
+
+        with self._ledger_lock:
+            if side == 'BUY':
+                if total > self.balance:
+                    return {
+                        'status': 'REJECTED',
+                        'reason': f'Insufficient balance: ${self.balance:.2f} < ${total:.2f}',
+                    }
+                self.balance -= total
+                if pair not in self.positions:
+                    self.positions[pair] = {
+                        'amount': Decimal('0'),
+                        'total_cost': Decimal('0'),
+                        'entry_time_utc': trade_timestamp,
+                        'ohlcv_pair': ohlcv_pair,
+                    }
+                if Decimal(str(self.positions[pair].get('amount') or 0)) <= Decimal('0'):
+                    self.positions[pair]['entry_time_utc'] = trade_timestamp
+                self.positions[pair]['amount'] += amount_dec
+                self.positions[pair]['total_cost'] += total
+                self.positions[pair]['ohlcv_pair'] = ohlcv_pair or self.positions[pair].get('ohlcv_pair')
+            elif side == 'SELL':
+                if pair not in self.positions or self.positions[pair]['amount'] < amount_dec:
+                    return {'status': 'REJECTED', 'reason': f'Insufficient {pair} position'}
+
+                self.balance += total
+                self.positions[pair]['amount'] -= amount_dec
+                if self.positions[pair]['amount'] > 0:
+                    ratio = amount_dec / (self.positions[pair]['amount'] + amount_dec)
+                    self.positions[pair]['total_cost'] -= self.positions[pair]['total_cost'] * ratio
+                else:
+                    self.positions[pair]['total_cost'] = Decimal('0')
+                if self.positions[pair]['amount'] == 0:
+                    del self.positions[pair]
+            else:
+                return {'status': 'REJECTED', 'reason': f'Unsupported side: {side}'}
+
+            trade = {
+                'id': f'paper_{len(self.trades) + 1}',
+                'timestamp': trade_timestamp,
+                'market': 'CRYPTO',
+                'pair': pair,
+                'ohlcvPair': ohlcv_pair,
+                'side': side,
+                'amount': float(amount_dec),
+                'price': float(price_dec),
+                'total': float(total),
+                'status': 'FILLED',
+                'balance': float(self.balance),
+            }
+            self.trades.append(trade)
+            self._persist_state_best_effort()
+
+        discord_notifications.send_trade_alert(
+            asset_class='crypto',
+            side=side,
+            symbol=pair,
+            quantity=float(amount_dec),
+            price=float(price_dec),
+            execution_source='CRYPTO_PAPER_LEDGER',
+            account_id=self.account_key,
+            status=str(trade.get('status') or 'FILLED').upper(),
+            extra={
+                'mode': 'PAPER',
+            },
+        )
+
+        logger.info('Paper trade executed: %s %s %s @ $%.2f', side, amount, pair, price)
         return trade
+
+
+    def _snapshot_state(self) -> tuple[Decimal, Decimal, list[dict[str, Any]], dict[str, dict[str, Decimal | str | None]]]:
+        with self._ledger_lock:
+            balance = Decimal(str(self.balance))
+            starting_balance = Decimal(str(self.starting_balance))
+            trades = [dict(trade) for trade in self.trades]
+            positions = {
+                pair: {
+                    key: (Decimal(str(value)) if isinstance(value, Decimal) else value)
+                    for key, value in position.items()
+                }
+                for pair, position in self.positions.items()
+            }
+        return balance, starting_balance, trades, positions
+
+    def _build_position_analytics(self, trades: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        analytics: dict[str, Any] = {
+            'entry_times': {},
+            'realized_pnl_by_pair': {},
+            'realized_pnl_total': 0.0,
+        }
+        running_positions: dict[str, dict[str, Decimal | str | None]] = {}
+
+        trade_rows = trades if trades is not None else self._snapshot_state()[2]
+
+        for trade in trade_rows:
+            pair = str(trade.get('pair') or '').strip()
+            if not pair:
+                continue
+            side = str(trade.get('side') or '').upper().strip()
+            amount_dec = Decimal(str(trade.get('amount') or 0.0))
+            price_dec = Decimal(str(trade.get('price') or 0.0))
+            total_dec = Decimal(str(trade.get('total') or 0.0))
+            timestamp = str(trade.get('timestamp') or '').strip() or None
+            state = running_positions.setdefault(
+                pair,
+                {'amount': Decimal('0'), 'total_cost': Decimal('0'), 'opened_at': None},
+            )
+            current_amount = Decimal(str(state['amount']))
+            current_cost = Decimal(str(state['total_cost']))
+            opened_at = state['opened_at']
+
+            if side == 'BUY':
+                if current_amount <= 0 and amount_dec > 0:
+                    opened_at = timestamp
+                current_amount += amount_dec
+                current_cost += total_dec
+            elif side == 'SELL' and amount_dec > 0 and current_amount > 0:
+                sell_amount = min(amount_dec, current_amount)
+                avg_cost = (current_cost / current_amount) if current_amount > 0 else Decimal('0')
+                closed_cost = avg_cost * sell_amount
+                realized = (price_dec * sell_amount) - closed_cost
+                analytics['realized_pnl_by_pair'][pair] = float(
+                    Decimal(str(analytics['realized_pnl_by_pair'].get(pair, 0.0))) + realized
+                )
+                current_amount -= sell_amount
+                current_cost -= closed_cost
+                if current_amount <= Decimal('0.0000000001'):
+                    current_amount = Decimal('0')
+                    current_cost = Decimal('0')
+                    opened_at = None
+
+            state['amount'] = current_amount
+            state['total_cost'] = current_cost
+            state['opened_at'] = opened_at
+
+        analytics['entry_times'] = {
+            pair: state.get('opened_at')
+            for pair, state in running_positions.items()
+            if Decimal(str(state.get('amount') or 0)) > 0
+        }
+        analytics['realized_pnl_total'] = round(sum(analytics['realized_pnl_by_pair'].values()), 8)
+        return analytics
 
     def _get_price_for_pair(self, pair: str, prices: Dict[str, float], ohlcv_pair: str | None = None) -> float:
         metadata = self.kraken.resolve_pair(pair)
-        aliases = [pair, ohlcv_pair, metadata.rest_pair if metadata is not None else None, metadata.pair_key if metadata is not None else None, metadata.altname if metadata is not None else None, metadata.ws_pair if metadata is not None else None, metadata.display_pair if metadata is not None else None]
+        aliases = [
+            pair,
+            ohlcv_pair,
+            metadata.rest_pair if metadata is not None else None,
+            metadata.pair_key if metadata is not None else None,
+            metadata.altname if metadata is not None else None,
+            metadata.ws_pair if metadata is not None else None,
+            metadata.display_pair if metadata is not None else None,
+        ]
+
         for alias in aliases:
             if alias in prices and prices.get(alias) is not None:
                 try:
                     return float(prices[alias])
                 except (TypeError, ValueError):
                     continue
-        normalized_aliases = {self.kraken._normalize_pair_alias(variant) for alias in aliases for variant in self.kraken._pair_alias_variants(alias) if str(alias or '').strip()}
+
+        normalized_aliases = {
+            self.kraken._normalize_pair_alias(variant)
+            for alias in aliases
+            for variant in self.kraken._pair_alias_variants(alias)
+            if str(alias or '').strip()
+        }
         normalized_aliases.discard('')
+
         for price_key, price_value in prices.items():
-            price_variants = {self.kraken._normalize_pair_alias(variant) for variant in self.kraken._pair_alias_variants(price_key)}
+            price_variants = {
+                self.kraken._normalize_pair_alias(variant)
+                for variant in self.kraken._pair_alias_variants(price_key)
+            }
             components = self.kraken._split_pair_components(price_key)
             if components is not None:
                 base, quote = components
@@ -623,19 +809,66 @@ class CryptoPaperLedger:
                 return float(price_value)
             except (TypeError, ValueError):
                 continue
+
         return 0.0
 
     def get_positions(self, db=None) -> List[Dict]:
-        if db is not None:
-            positions = crypto_paper_broker.get_positions(db=db, price_lookup=self._price_lookup)
-            self._refresh_cache(db=db)
+        """Get current positions with P&L and paper-equity context."""
+        positions = []
+        balance, starting_balance, trades_snapshot, positions_snapshot = self._snapshot_state()
+        if not positions_snapshot:
             return positions
-        return self._build_positions_from_cache()
+
+        raw_pair_mappings: dict[str, str] = getattr(self, 'pair_mappings', {}) or {}
+        reverse_pair_map: dict[str, str] = {v: k for k, v in raw_pair_mappings.items()}
+
+        pairs_to_check = list(positions_snapshot.keys())
+        ohlcv_pairs = [self._resolve_position_ohlcv_pair(pair) for pair in pairs_to_check]
+        ohlcv_pairs = [pair for pair in ohlcv_pairs if pair]
+        prices = self.kraken.get_prices(ohlcv_pairs)
+        analytics = self._build_position_analytics(trades_snapshot)
+
+        for pair, pos in positions_snapshot.items():
+            ohlcv_pair = self._resolve_position_ohlcv_pair(pair)
+            current_price = self._get_price_for_pair(pair, prices, ohlcv_pair)
+
+            amount_dec = Decimal(str(pos.get('amount') or 0))
+            total_cost_dec = Decimal(str(pos.get('total_cost') or 0))
+            if amount_dec <= 0:
+                continue
+
+            avg_price = float(total_cost_dec / amount_dec) if amount_dec > 0 else 0.0
+
+            if current_price <= 0:
+                current_price = avg_price
+
+            market_value = float(amount_dec) * current_price
+            cost_basis = float(total_cost_dec)
+            pnl = market_value - cost_basis if current_price != avg_price else 0.0
+            pnl_percent = (pnl / cost_basis) * 100 if cost_basis > 0 else 0.0
+            display_pair = reverse_pair_map.get(pair, pair)
+
+            positions.append({
+                'pair': display_pair,
+                'ohlcvPair': ohlcv_pair,
+                'amount': float(amount_dec),
+                'avgPrice': avg_price,
+                'currentPrice': current_price,
+                'marketValue': market_value,
+                'costBasis': cost_basis,
+                'pnl': pnl,
+                'pnlPercent': pnl_percent,
+                'entryTimeUtc': analytics['entry_times'].get(pair) or pos.get('entry_time_utc'),
+                'realizedPnl': float(analytics['realized_pnl_by_pair'].get(pair, 0.0)),
+            })
+
+        return positions
 
     def _resolve_position_ohlcv_pair(self, pair: str) -> str | None:
         resolved_pair = self.kraken.get_ohlcv_pair(pair)
         if resolved_pair:
             return resolved_pair
+
         raw_pair = str(pair or '').strip().upper()
         if not raw_pair:
             return None
@@ -644,26 +877,27 @@ class CryptoPaperLedger:
         return raw_pair
 
     def get_ledger(self, db=None) -> Dict:
-        if db is not None:
-            ledger = crypto_paper_broker.get_ledger(db=db, price_lookup=self._price_lookup)
-            self._refresh_cache(db=db)
-            return ledger
-        positions = self._build_positions_from_cache()
+        """Get full ledger including balance, market value, equity, and P&L."""
+        balance_snapshot, starting_balance_snapshot, trades_snapshot, _ = self._snapshot_state()
+        positions = self.get_positions()
         market_value = round(sum(float(position.get('marketValue') or 0.0) for position in positions), 8)
-        equity = round(float(self.balance) + market_value, 8)
-        net_pnl = round(equity - float(self.starting_balance), 8)
-        total_unrealized = round(sum(float(position.get('pnl') or 0.0) for position in positions), 8)
-        realized_pnl = round(net_pnl - total_unrealized, 8)
+        total_pnl = round(sum(float(position.get('pnl') or 0.0) for position in positions), 8)
+        analytics = self._build_position_analytics(trades_snapshot)
+        realized_pnl = round(float(analytics.get('realized_pnl_total') or 0.0), 8)
+        equity = round(float(balance_snapshot) + market_value, 8)
+        net_pnl = round(equity - float(starting_balance_snapshot), 8)
+        return_pct = round((net_pnl / float(starting_balance_snapshot)) * 100, 8) if float(starting_balance_snapshot) > 0 else 0.0
+
         return {
-            'balance': float(self.balance),
-            'startingBalance': float(self.starting_balance),
+            'balance': float(balance_snapshot),
+            'startingBalance': float(starting_balance_snapshot),
             'marketValue': market_value,
             'equity': equity,
-            'totalPnL': total_unrealized,
+            'totalPnL': total_pnl,
             'realizedPnL': realized_pnl,
             'netPnL': net_pnl,
-            'returnPct': round((net_pnl / float(self.starting_balance)) * 100, 8) if float(self.starting_balance) > 0 else 0.0,
-            'trades': list(self.trades),
+            'returnPct': return_pct,
+            'trades': trades_snapshot,
             'positions': positions,
         }
 

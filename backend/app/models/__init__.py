@@ -1,7 +1,3 @@
-from app.models.crypto_paper_position import CryptoPaperPosition
-from app.models.crypto_paper_order import CryptoPaperOrder
-from app.models.crypto_paper_fill import CryptoPaperFill
-from app.models.crypto_paper_account import CryptoPaperAccount
 from app.models.account import Account
 from app.models.order_event import OrderEvent
 from app.models.order_intent import OrderIntent
@@ -11,3 +7,7 @@ from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
 from app.models.watchlist_monitor_state import WatchlistMonitorState
+from app.models.crypto_paper_account import CryptoPaperAccount
+from app.models.crypto_paper_position import CryptoPaperPosition
+from app.models.crypto_paper_order import CryptoPaperOrder
+from app.models.crypto_paper_fill import CryptoPaperFill
