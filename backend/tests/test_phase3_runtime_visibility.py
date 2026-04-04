@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.control_plane import discord_decision_guard
 from app.services.pre_trade_gate import PreTradeGateDecision
 from app.services.runtime_visibility import runtime_visibility_service
 
@@ -284,3 +285,106 @@ def test_runtime_visibility_watchlist_probe_surfaces_scope_truth_issues(monkeypa
     assert payload['ready'] is True
     assert payload['details']['scopeTruth']['stocks_only']['state'] == 'STALE'
     assert payload['details']['scopeIssues'] == ['stocks_only: Latest stock watchlist expired.']
+
+
+def test_runtime_visibility_endpoint_includes_audit_holes_payload(monkeypatch) -> None:
+    runtime_visibility_service.reset_for_tests()
+    discord_decision_guard.reset_for_tests()
+
+    discord_decision_guard._record_replay_rejection(
+        type('Message', (), {'id': 99, 'author': type('Author', (), {'id': 7})(), 'channel': type('Channel', (), {'id': 11})()})(),
+        {'schema_version': 'bot_watchlist_v3', 'scope': 'crypto_only', 'provider': 'pytest'},
+        reason='Duplicate Discord payload suppressed.',
+        payload_hash='abc123',
+    )
+
+    monkeypatch.setattr(runtime_visibility_service, 'get_dependency_status', lambda force_refresh=False: _mock_dependencies())
+    monkeypatch.setattr(
+        runtime_visibility_service,
+        'get_system_error_timeline',
+        lambda limit=10: [
+            {
+                'id': 'system-1',
+                'timestamp': '2026-03-29T14:31:00+00:00',
+                'source': 'dependency_probe',
+                'component': 'Tradier Live',
+                'severity': 'error',
+                'state': 'DEGRADED',
+                'message': 'Live credentials missing for probe',
+                'symbol': None,
+                'details': {},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        runtime_visibility_service,
+        'get_exit_timeline',
+        lambda limit=10: [
+            {
+                'id': 'exit-1',
+                'timestamp': '2026-03-29T14:32:00+00:00',
+                'symbol': 'AAPL',
+                'assetClass': 'stock',
+                'status': 'CLOSED',
+                'eventType': 'EXIT_FILLED',
+                'executionSource': 'WATCHLIST_EXIT_WORKER',
+                'trigger': 'TIME_STOP_EXPIRED',
+                'message': 'Exit completed',
+                'details': {},
+            }
+        ],
+    )
+
+    with TestClient(app) as client:
+        response = client.get('/api/runtime-visibility?limit=5')
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['audit']['replayRejections'][0]['reason'] == 'Duplicate Discord payload suppressed.'
+    assert payload['audit']['systemErrors'][0]['component'] == 'Tradier Live'
+    assert payload['audit']['exitTimeline'][0]['eventType'] == 'EXIT_FILLED'
+
+
+def test_runtime_visibility_system_error_timeline_includes_dependency_and_order_failures(monkeypatch) -> None:
+    runtime_visibility_service.reset_for_tests()
+
+    monkeypatch.setattr(runtime_visibility_service, 'get_dependency_status', lambda force_refresh=False: _mock_dependencies())
+
+    class DummyEvent:
+        id = 1
+        event_time = datetime(2026, 3, 29, 14, 40, tzinfo=UTC)
+        status = 'REJECTED'
+        event_type = 'ORDER_SUBMISSION_FAILED'
+        message = 'Synthetic broker timeout'
+        payload_json = {'stage': 'submit'}
+
+    class DummyIntent:
+        execution_source = 'WATCHLIST_MONITOR'
+        symbol = 'MSFT'
+        asset_class = 'stock'
+        intent_id = 'intent_1'
+
+    class DummyQuery:
+        def join(self, *args, **kwargs):
+            return self
+        def filter(self, *args, **kwargs):
+            return self
+        def order_by(self, *args, **kwargs):
+            return self
+        def limit(self, *args, **kwargs):
+            return self
+        def all(self):
+            return [(DummyEvent(), DummyIntent())]
+
+    class DummyDb:
+        def query(self, *args, **kwargs):
+            return DummyQuery()
+        def close(self):
+            return None
+
+    monkeypatch.setattr('app.services.runtime_visibility.SessionLocal', lambda: DummyDb())
+
+    rows = runtime_visibility_service.get_system_error_timeline(limit=5)
+
+    assert any(row['component'] == 'Tradier Live' for row in rows)
+    assert any(row['component'] == 'WATCHLIST_MONITOR' and row['symbol'] == 'MSFT' for row in rows)

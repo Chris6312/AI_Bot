@@ -4,6 +4,8 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
+from collections import deque
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Optional
@@ -65,6 +67,33 @@ class DiscordReplayGuard:
 class DiscordDecisionGuard:
     def __init__(self) -> None:
         self._replay_guard = DiscordReplayGuard()
+        self._history_lock = Lock()
+        self._replay_rejections: deque[dict[str, Any]] = deque(maxlen=100)
+
+    def reset_for_tests(self) -> None:
+        with self._history_lock:
+            self._replay_rejections.clear()
+
+    def get_replay_rejections(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        with self._history_lock:
+            return [deepcopy(item) for item in list(self._replay_rejections)[:limit]]
+
+    def _record_replay_rejection(self, message: Any, payload: dict[str, Any], *, reason: str, payload_hash: str) -> None:
+        author = getattr(message, 'author', None)
+        channel = getattr(message, 'channel', None)
+        record = {
+            'recordedAtUtc': datetime.now(timezone.utc).isoformat(),
+            'reason': reason,
+            'messageId': str(getattr(message, 'id', '') or ''),
+            'authorId': str(getattr(author, 'id', '') or ''),
+            'channelId': str(getattr(channel, 'id', '') or ''),
+            'schemaVersion': str(payload.get('schema_version') or payload.get('type') or ''),
+            'scope': str(payload.get('scope') or ''),
+            'provider': str(payload.get('provider') or ''),
+            'payloadHash': payload_hash,
+        }
+        with self._history_lock:
+            self._replay_rejections.appendleft(record)
 
     def authorize_message(self, message: Any) -> DiscordAuthorizationResult:
         if not settings.DISCORD_TRADING_CHANNEL_ID:
@@ -112,7 +141,14 @@ class DiscordDecisionGuard:
             keys.append(f'message:{message_id}')
 
         if not self._replay_guard.register(*keys):
-            return False, 'Duplicate Discord payload suppressed.'
+            reason = 'Duplicate Discord payload suppressed.'
+            self._record_replay_rejection(
+                message,
+                payload,
+                reason=reason,
+                payload_hash=payload_hash,
+            )
+            return False, reason
         return True, 'accepted'
 
     @staticmethod
