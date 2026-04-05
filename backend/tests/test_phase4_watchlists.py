@@ -41,7 +41,7 @@ from app.services.template_evaluator import (
 )
 from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
 from app.services.watchlist_exit_worker import watchlist_exit_worker
-from app.services.watchlist_service import INACTIVE, MANAGED_ONLY, WatchlistValidationError, watchlist_service
+from app.services.watchlist_service import ACTIVE, INACTIVE, MANAGED_ONLY, WatchlistValidationError, watchlist_service
 
 
 @contextmanager
@@ -4660,6 +4660,265 @@ def test_due_run_executes_crypto_watchlist_entry_into_paper_ledger(tmp_path, mon
             crypto_ledger.trades = original_trades
 
 
+def test_due_run_skips_crypto_entry_when_open_position_exists_under_kraken_alias(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'BTC').one()
+        monitor_row.next_evaluation_at_utc = datetime.now(UTC) - timedelta(minutes=1)
+        db.commit()
+
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(**{
+                'session_open': True,
+                'to_dict': lambda: {
+                    'scope': scope,
+                    'observedAtUtc': observed_at.isoformat(),
+                    'sessionOpen': True,
+                    'reason': 'patched open session',
+                    'nextSessionStartUtc': None,
+                    'nextSessionStartEt': None,
+                    'sessionCloseUtc': None,
+                    'sessionCloseEt': None,
+                },
+            }),
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_service.kraken_service.resolve_pair',
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD',
+                rest_pair='XBTUSD',
+                pair_key='XXBTZUSD',
+                ws_pair='XBT/USD',
+                altname='XBTUSD',
+            ),
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.resolve_pair',
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD',
+                rest_pair='XBTUSD',
+                pair_key='XXBTZUSD',
+                ws_pair='XBT/USD',
+                altname='XBTUSD',
+            ),
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.get_ticker',
+            lambda pair: {
+                'c': ['70000.0', '1'],
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.get_ohlc',
+            lambda pair, interval=15, limit=25: build_trend_candles(
+                count=50,
+                interval_minutes=interval,
+                start_price=68000.0,
+                drift=90.0,
+                close_offset=55.0,
+                wick=30.0,
+                base_volume=10.0,
+                last_volume_multiplier=1.4,
+            ),
+        )
+
+        original_balance = crypto_ledger.balance
+        original_positions = dict(crypto_ledger.positions)
+        original_trades = list(crypto_ledger.trades)
+        try:
+            crypto_ledger.balance = type(original_balance)('100000')
+            crypto_ledger.positions = {'XXBTZUSD': {'amount': 0.25}}
+            crypto_ledger.trades = []
+
+            result = watchlist_monitoring_orchestrator.run_due_once(db, scope='crypto_only', limit_per_scope=10)
+
+            monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'BTC').one()
+
+            assert result['scope'] == 'crypto_only'
+            assert result['dueCountBefore'] == 1
+            assert result['summary']['entryCandidateCount'] == 0
+            assert result['summary']['skippedCount'] == 1
+            assert result['entryExecution']['candidateCount'] == 0
+            assert result['entryExecution']['skippedCount'] == 0
+            assert result['entryExecution']['intentCount'] == 0
+            assert crypto_ledger.trades == []
+            assert monitor_row.monitoring_status == ACTIVE
+            assert monitor_row.latest_decision_state == 'SKIPPED'
+            assert monitor_row.latest_decision_reason == 'OPEN_POSITION_EXISTS'
+        finally:
+            crypto_ledger.balance = original_balance
+            crypto_ledger.positions = original_positions
+            crypto_ledger.trades = original_trades
+
+
+def test_crypto_active_watchlist_row_with_open_alias_position_stays_active_and_skipped(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monkeypatch.setattr(
+            'app.services.watchlist_service.kraken_service.resolve_pair',
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD',
+                rest_pair='XBTUSD',
+                pair_key='XXBTZUSD',
+                ws_pair='XBT/USD',
+                altname='XBTUSD',
+            ),
+        )
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda db=None: [
+                {
+                    'pair': 'XXBTZUSD',
+                    'amount': 0.25,
+                    'avgPrice': 70000.0,
+                    'currentPrice': 70500.0,
+                }
+            ],
+        )
+
+        watchlist_service.reconcile_scope_statuses(db, scope='crypto_only')
+        snapshot = watchlist_service.get_monitoring_snapshot(db, scope='crypto_only')
+        btc_row = next(row for row in snapshot['rows'] if row['symbol'] == 'BTC')
+
+        assert snapshot['summary']['activeCount'] == 1
+        assert snapshot['summary']['managedOnlyCount'] == 0
+        assert snapshot['summary']['skippedCount'] == 1
+        assert btc_row['monitoringStatus'] == ACTIVE
+        assert btc_row['managedOnly'] is False
+        assert btc_row['monitoring']['latestDecisionState'] == 'SKIPPED'
+        assert btc_row['monitoring']['latestDecisionReason'] == 'OPEN_POSITION_EXISTS'
+        assert btc_row['positionState']['hasOpenPosition'] is True
+        assert btc_row['positionState']['pair'] == 'XXBTZUSD'
+
+
+def test_removed_crypto_symbol_with_open_alias_position_becomes_managed_only(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        first_payload = build_crypto_payload()
+        second_payload = deepcopy(first_payload)
+        second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][1]]
+        second_payload['bot_payload']['symbols'][0]['priority_rank'] = 1
+        second_payload['ui_payload']['summary']['selected_count'] = 1
+        second_payload['ui_payload']['summary']['primary_focus'] = ['ETH']
+        second_payload['ui_payload']['symbol_context'] = {'ETH': second_payload['ui_payload']['symbol_context']['ETH']}
+
+        monkeypatch.setattr(
+            'app.services.watchlist_service.kraken_service.resolve_pair',
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD' if 'BTC' in str(pair).upper() or 'XBT' in str(pair).upper() else 'ETH/USD',
+                rest_pair='XBTUSD' if 'BTC' in str(pair).upper() or 'XBT' in str(pair).upper() else 'ETHUSD',
+                pair_key='XXBTZUSD' if 'BTC' in str(pair).upper() or 'XBT' in str(pair).upper() else 'XETHZUSD',
+                ws_pair='XBT/USD' if 'BTC' in str(pair).upper() or 'XBT' in str(pair).upper() else 'ETH/USD',
+                altname='XBTUSD' if 'BTC' in str(pair).upper() or 'XBT' in str(pair).upper() else 'ETHUSD',
+            ),
+        )
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda db=None: [
+                {'pair': 'XXBTZUSD', 'amount': 0.25, 'avgPrice': 70000.0, 'currentPrice': 70500.0},
+            ],
+        )
+
+        watchlist_service.ingest_watchlist(db, first_payload, source='api')
+        watchlist_service.ingest_watchlist(db, second_payload, source='api')
+
+        watchlist_service.reconcile_scope_statuses(db, scope='crypto_only')
+        snapshot = watchlist_service.get_monitoring_snapshot(db, scope='crypto_only')
+
+        btc_rows = [row for row in snapshot['rows'] if row['symbol'] == 'BTC']
+        assert len(btc_rows) == 1
+        assert snapshot['summary']['activeCount'] == 1
+        assert snapshot['summary']['managedOnlyCount'] == 1
+        assert btc_rows[0]['monitoringStatus'] == MANAGED_ONLY
+        assert btc_rows[0]['managedOnly'] is True
+        assert btc_rows[0]['monitoring']['latestDecisionState'] == MONITOR_ONLY
+
+
+def test_crypto_monitoring_snapshot_prefers_active_row_over_managed_alias_duplicate(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        first_payload = build_crypto_payload()
+        second_payload = deepcopy(first_payload)
+        second_payload['generated_at_utc'] = datetime.now(UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        second_payload['bot_payload']['symbols'] = [second_payload['bot_payload']['symbols'][0]]
+        second_payload['ui_payload']['summary']['selected_count'] = 1
+        second_payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        second_payload['ui_payload']['symbol_context'] = {'BTC': second_payload['ui_payload']['symbol_context']['BTC']}
+
+        monkeypatch.setattr(
+            'app.services.watchlist_service.kraken_service.resolve_pair',
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD',
+                rest_pair='XBTUSD',
+                pair_key='XXBTZUSD',
+                ws_pair='XBT/USD',
+                altname='XBTUSD',
+            ),
+        )
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda db=None: [
+                {'pair': 'XXBTZUSD', 'amount': 0.25, 'avgPrice': 70000.0, 'currentPrice': 70500.0},
+            ],
+        )
+
+        watchlist_service.ingest_watchlist(db, first_payload, source='api')
+        active_payload = watchlist_service.ingest_watchlist(db, second_payload, source='api')
+
+        db.add(
+            WatchlistSymbol(
+                upload_id='legacy-upload',
+                scope='crypto_only',
+                symbol='XBT/USD',
+                quote_currency='USD',
+                asset_class='crypto',
+                enabled=True,
+                trade_direction='long',
+                priority_rank=99,
+                tier='tier_1',
+                bias='bullish',
+                setup_template='trend_continuation',
+                bot_timeframes=['15m'],
+                exit_template='trail_after_impulse',
+                max_hold_hours=72,
+                risk_flags=[],
+                monitoring_status=MANAGED_ONLY,
+            )
+        )
+        db.commit()
+        watchlist_service._backfill_missing_monitor_states(db, scope='crypto_only', observed_at=datetime.now(UTC))
+
+        snapshot = watchlist_service.get_monitoring_snapshot(db, scope='crypto_only')
+        btc_rows = [row for row in snapshot['rows'] if row['symbol'] == 'BTC']
+
+        assert active_payload['uploadId'] == snapshot['activeUploadId']
+        assert len(btc_rows) == 1
+        assert snapshot['summary']['activeCount'] == 1
+        assert snapshot['summary']['managedOnlyCount'] == 0
+        assert btc_rows[0]['monitoringStatus'] == ACTIVE
+        assert btc_rows[0]['monitoring']['latestDecisionState'] == 'SKIPPED'
+
+
 def test_crypto_active_watchlist_status_summary_uses_normalized_symbol_universe(tmp_path) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
         db = SessionFactory()
@@ -5555,6 +5814,53 @@ def test_active_entry_intent_guard_is_scoped_to_account_id_and_mode(tmp_path) ->
             'AAPL',
             asset_class='stock',
             account_id='paper-account',
+            mode='LIVE',
+        ) is False
+
+
+def test_crypto_active_entry_intent_guard_matches_kraken_alias_family(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        db.add(
+            OrderIntent(
+                intent_id='intent_crypto_xbtusd',
+                account_id='paper-crypto-ledger',
+                asset_class='crypto',
+                symbol='XBTUSD',
+                side='BUY',
+                requested_quantity=0.1,
+                requested_price=70000.0,
+                filled_quantity=0.0,
+                status='SUBMITTED',
+                execution_source='WATCHLIST_MONITOR_ENTRY',
+                context_json={'mode': 'PAPER'},
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            'app.services.watchlist_monitoring.kraken_service.resolve_pair',
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD',
+                rest_pair='XBTUSD',
+                pair_key='XXBTZUSD',
+                ws_pair='XBT/USD',
+                altname='XBTUSD',
+            ),
+        )
+
+        assert watchlist_monitoring_orchestrator._has_active_entry_intent(
+            db,
+            'BTC/USD',
+            asset_class='crypto',
+            account_id='paper-crypto-ledger',
+            mode='PAPER',
+        ) is True
+        assert watchlist_monitoring_orchestrator._has_active_entry_intent(
+            db,
+            'BTC/USD',
+            asset_class='crypto',
+            account_id='paper-crypto-ledger',
             mode='LIVE',
         ) is False
 

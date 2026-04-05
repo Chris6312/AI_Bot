@@ -30,6 +30,7 @@ WAITING_FOR_SETUP = 'WAITING_FOR_SETUP'
 ENTRY_CANDIDATE = 'ENTRY_CANDIDATE'
 BIAS_CONFLICT = 'BIAS_CONFLICT'
 EVALUATION_BLOCKED = 'EVALUATION_BLOCKED'
+SKIPPED = 'SKIPPED'
 
 TIMEFRAME_TO_KRAKEN_INTERVAL = {
     '5m': 5,
@@ -279,6 +280,7 @@ class TemplateEvaluationService:
             INACTIVE: 0,
             BIAS_CONFLICT: 0,
             EVALUATION_BLOCKED: 0,
+            SKIPPED: 0,
         }
         rows: list[dict[str, Any]] = []
         changed = False
@@ -318,6 +320,7 @@ class TemplateEvaluationService:
                 'inactiveCount': summary_counts.get(INACTIVE, 0),
                 'biasConflictCount': summary_counts.get(BIAS_CONFLICT, 0),
                 'evaluationBlockedCount': summary_counts.get(EVALUATION_BLOCKED, 0),
+                'skippedCount': summary_counts.get(SKIPPED, 0),
             },
             'rows': rows,
             'monitoringSnapshot': active_snapshot,
@@ -358,6 +361,15 @@ class TemplateEvaluationService:
                 reason='Bearish bias does not arm long entries in the initial runner.',
                 market_data_at_utc=None,
                 details={'bias': row.bias},
+            )
+
+        if row.scope == 'crypto_only' and watchlist_service._has_open_crypto_position(row.symbol, row.quote_currency):
+            pair = f"{str(row.symbol).upper()}/{str(row.quote_currency).upper()}"
+            return TemplateEvaluationResult(
+                state=SKIPPED,
+                reason='OPEN_POSITION_EXISTS',
+                market_data_at_utc=None,
+                details={'pair': pair, 'template': row.setup_template},
             )
 
         if row.scope == 'stocks_only':

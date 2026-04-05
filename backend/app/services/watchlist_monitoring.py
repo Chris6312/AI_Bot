@@ -463,6 +463,80 @@ class WatchlistMonitoringOrchestrator:
         actual_mode = str(context.get("mode") or "").upper().strip()
         return not actual_mode or actual_mode == str(expected_mode).upper().strip()
 
+    def _crypto_symbol_aliases(self, symbol: str | None) -> set[str]:
+        raw = str(symbol or "").upper().strip()
+        if not raw:
+            return set()
+
+        aliases: set[str] = set()
+        resolver_candidates: set[str] = set()
+
+        def add_alias(value: str | None, *, assume_usd_pair: bool = False) -> None:
+            normalized = str(value or "").upper().strip()
+            if not normalized:
+                return
+
+            aliases.add(normalized)
+            compact = "".join(char for char in normalized if char.isalnum())
+            if compact:
+                aliases.add(compact)
+                resolver_candidates.add(compact)
+
+            resolver_candidates.add(normalized)
+
+            if "/" in normalized:
+                base, _, quote = normalized.partition("/")
+                if base:
+                    aliases.add(base)
+                if base and quote:
+                    aliases.add(f"{base}/{quote}")
+                    aliases.add(f"{base}{quote}")
+                    resolver_candidates.add(f"{base}/{quote}")
+                    resolver_candidates.add(f"{base}{quote}")
+            elif normalized.endswith("USD") and len(normalized) > 3:
+                base = normalized[:-3]
+                if base:
+                    aliases.add(base)
+                    aliases.add(f"{base}/USD")
+                    aliases.add(f"{base}USD")
+                    resolver_candidates.add(f"{base}/USD")
+                    resolver_candidates.add(f"{base}USD")
+            elif assume_usd_pair and compact:
+                aliases.add(f"{compact}/USD")
+                aliases.add(f"{compact}USD")
+                resolver_candidates.add(f"{compact}/USD")
+                resolver_candidates.add(f"{compact}USD")
+
+        add_alias(raw, assume_usd_pair=True)
+
+        resolved_fields: set[str] = set()
+        for candidate in list(resolver_candidates):
+            resolved = kraken_service.resolve_pair(candidate)
+            if resolved is None:
+                continue
+            resolved_fields.update(
+                value
+                for value in (
+                    resolved.display_pair,
+                    resolved.ws_pair,
+                    resolved.altname,
+                    resolved.rest_pair,
+                    resolved.pair_key,
+                )
+                if value
+            )
+
+        for value in resolved_fields:
+            add_alias(value)
+
+        return {alias for alias in aliases if alias}
+
+    def _crypto_symbols_match(self, left: str | None, right: str | None) -> bool:
+        left_aliases = self._crypto_symbol_aliases(left)
+        if not left_aliases:
+            return False
+        return bool(left_aliases.intersection(self._crypto_symbol_aliases(right)))
+
     @staticmethod
     def _entry_block_payload(*, monitor_state: WatchlistMonitorState, symbol_row: WatchlistSymbol, reason: str) -> dict[str, Any]:
         lifecycle = describe_lifecycle(getattr(monitor_state, "monitoring_status", None))
@@ -1113,8 +1187,8 @@ class WatchlistMonitoringOrchestrator:
         if reason is not None:
             monitor_state.latest_decision_reason = str(reason)
         if action == "SKIPPED" and str(reason or "").strip() == "OPEN_POSITION_EXISTS":
-            monitor_state.latest_decision_state = MONITOR_ONLY
-            monitor_state.latest_decision_reason = "Open position exists; symbol is now managed under exit rules."
+            monitor_state.latest_decision_state = "SKIPPED"
+            monitor_state.latest_decision_reason = "OPEN_POSITION_EXISTS"
         elif action in {"ENTRY_FILLED", "ENTRY_SUBMITTED", "GATE_REJECTED", "SUBMISSION_REJECTED", "SUBMISSION_PENDING"}:
             monitor_state.latest_decision_state = action if action != "SUBMISSION_PENDING" else SUBMISSION_PENDING_DECISION_STATE
         elif action == "SKIPPED" and str(reason or "").strip() in {"CRYPTO_REENTRY_COOLDOWN_ACTIVE", "CRYPTO_EXIT_JUST_FILLED"}:
@@ -1362,24 +1436,30 @@ class WatchlistMonitoringOrchestrator:
             db.query(OrderIntent)
             .filter(
                 OrderIntent.asset_class == asset_class,
-                OrderIntent.symbol == symbol,
                 OrderIntent.side == "BUY",
                 OrderIntent.execution_source == ENTRY_EXECUTION_SOURCE,
                 OrderIntent.status.in_(ACTIVE_ENTRY_INTENT_STATUSES),
             )
             .order_by(OrderIntent.created_at.desc(), OrderIntent.id.desc())
         )
+        if asset_class != "crypto":
+            query = query.filter(OrderIntent.symbol == symbol)
         if account_id:
             query = query.filter(OrderIntent.account_id == account_id)
         for intent in query.all():
-            if self._intent_mode_matches(intent, mode):
+            if not self._intent_mode_matches(intent, mode):
+                continue
+            if asset_class == "crypto":
+                if self._crypto_symbols_match(intent.symbol, symbol):
+                    return True
+                continue
+            if intent.symbol == symbol:
                 return True
         return False
 
-    @staticmethod
-    def _has_open_crypto_position(pair: str) -> bool:
+    def _has_open_crypto_position(self, pair: str) -> bool:
         positions = getattr(crypto_ledger, "positions", {}) or {}
-        return str(pair or "").upper().strip() in {str(key).upper().strip() for key in positions.keys()}
+        return any(self._crypto_symbols_match(pair, key) for key in positions.keys())
 
     @staticmethod
     def _confirm_stock_order_sync(order_snapshot: dict[str, Any], *, mode: str) -> dict[str, Any]:

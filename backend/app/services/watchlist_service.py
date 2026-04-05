@@ -18,7 +18,7 @@ from app.models.watchlist_monitor_state import WatchlistMonitorState
 from app.models.watchlist_symbol import WatchlistSymbol
 from app.models.watchlist_ui_context import WatchlistUiContext
 from app.models.watchlist_upload import WatchlistUpload
-from app.services.kraken_service import crypto_ledger
+from app.services.kraken_service import crypto_ledger, kraken_service
 from app.services.market_sessions import calculate_next_scope_evaluation_at, get_scope_session_status
 from app.services.runtime_state import runtime_state
 from app.services.tradier_client import tradier_client
@@ -428,7 +428,15 @@ class WatchlistService:
             )
             raise WatchlistValidationError(replay_conflict['reason'])
 
-        next_symbols = {symbol.symbol.upper() for symbol in parsed.bot_payload.symbols}
+        next_symbols = {
+            self._normalize_scope_symbol(
+                scope=parsed.scope,
+                symbol=symbol.symbol,
+                quote_currency=symbol.quote_currency,
+            )
+            for symbol in parsed.bot_payload.symbols
+        }
+        next_symbols.discard('')
         self._deactivate_scope_uploads(db, parsed.scope)
         self._reconcile_rows_before_new_upload(db, parsed.scope, next_symbols, observed_at=now)
 
@@ -520,9 +528,14 @@ class WatchlistService:
         active_symbols: set[str] = set()
         if active_upload is not None:
             active_symbols = {
-                row.symbol.upper()
+                self._normalize_scope_symbol(
+                    scope=scope,
+                    symbol=row.symbol,
+                    quote_currency=row.quote_currency,
+                )
                 for row in db.query(WatchlistSymbol).filter(WatchlistSymbol.upload_id == active_upload.upload_id).all()
             }
+            active_symbols.discard('')
 
         broker_positions: dict[str, dict[str, Any]] | None = None
         if scope == 'stocks_only':
@@ -536,9 +549,11 @@ class WatchlistService:
         changed = 0
         for row in candidate_rows:
             next_status = self._resolve_row_status(
+                scope=scope,
                 row_upload_id=row.upload_id,
                 active_upload_id=active_upload.upload_id if active_upload else None,
                 symbol=row.symbol,
+                quote_currency=row.quote_currency,
                 active_symbols=active_symbols,
                 open_symbols=open_symbols,
             )
@@ -708,6 +723,7 @@ class WatchlistService:
                     'biasConflictCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'BIAS_CONFLICT'),
                     'evaluationBlockedCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'EVALUATION_BLOCKED'),
                     'monitorOnlyCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == MONITOR_ONLY),
+                    'skippedCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'SKIPPED'),
                     'inactiveDecisionCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == INACTIVE_DECISION),
                     'openPositionCount': sum(1 for row in rows if row.get('positionState', {}).get('hasOpenPosition')),
                     'expiredPositionCount': sum(1 for row in rows if row.get('positionState', {}).get('positionExpired')),
@@ -883,21 +899,111 @@ class WatchlistService:
             deduped.append(row)
         return deduped
 
-    @staticmethod
-    def _normalize_scope_symbol(*, scope: WATCHLIST_SCOPE, symbol: str | None, quote_currency: str | None = None) -> str:
+    def _crypto_symbol_aliases(self, symbol: str | None, quote_currency: str | None = None) -> set[str]:
+        raw = str(symbol or '').upper().strip()
+        if not raw:
+            return set()
+
+        normalized_quote = ''.join(char for char in str(quote_currency or 'USD').upper().strip() if char.isalnum()) or 'USD'
+        aliases: set[str] = set()
+        resolver_candidates: set[str] = set()
+
+        def add_alias(value: str | None, *, assume_quote_pair: bool = False) -> None:
+            normalized = str(value or '').upper().strip()
+            if not normalized:
+                return
+
+            aliases.add(normalized)
+            compact = ''.join(char for char in normalized if char.isalnum())
+            if compact:
+                aliases.add(compact)
+                resolver_candidates.add(compact)
+
+            resolver_candidates.add(normalized)
+
+            if '/' in normalized:
+                base, _, quote = normalized.partition('/')
+                if base:
+                    aliases.add(base)
+                if base and quote:
+                    aliases.add(f'{base}/{quote}')
+                    aliases.add(f'{base}{quote}')
+                    resolver_candidates.add(f'{base}/{quote}')
+                    resolver_candidates.add(f'{base}{quote}')
+            elif normalized.endswith(normalized_quote) and len(normalized) > len(normalized_quote):
+                base = normalized[:-len(normalized_quote)]
+                if base:
+                    aliases.add(base)
+                    aliases.add(f'{base}/{normalized_quote}')
+                    aliases.add(f'{base}{normalized_quote}')
+                    resolver_candidates.add(f'{base}/{normalized_quote}')
+                    resolver_candidates.add(f'{base}{normalized_quote}')
+            elif assume_quote_pair and compact:
+                aliases.add(f'{compact}/{normalized_quote}')
+                aliases.add(f'{compact}{normalized_quote}')
+                resolver_candidates.add(f'{compact}/{normalized_quote}')
+                resolver_candidates.add(f'{compact}{normalized_quote}')
+
+        add_alias(raw, assume_quote_pair=True)
+
+        resolved_fields: set[str] = set()
+        for candidate in list(resolver_candidates):
+            resolved = kraken_service.resolve_pair(candidate)
+            if resolved is None:
+                continue
+            resolved_fields.update(
+                value
+                for value in (
+                    resolved.display_pair,
+                    resolved.ws_pair,
+                    resolved.altname,
+                    resolved.rest_pair,
+                    resolved.pair_key,
+                )
+                if value
+            )
+
+        for value in resolved_fields:
+            add_alias(value)
+
+        return {alias for alias in aliases if alias}
+
+    def _normalize_crypto_symbol_key(self, symbol: str | None, quote_currency: str | None = None) -> str:
+        raw = str(symbol or '').upper().strip()
+        if not raw:
+            return ''
+
+        normalized_quote = ''.join(char for char in str(quote_currency or 'USD').upper().strip() if char.isalnum()) or 'USD'
+        compact = ''.join(char for char in raw if char.isalnum())
+        resolver_candidates = [raw]
+        if compact:
+            resolver_candidates.append(compact)
+            resolver_candidates.append(f'{compact}/{normalized_quote}')
+            resolver_candidates.append(f'{compact}{normalized_quote}')
+
+        for candidate in resolver_candidates:
+            resolved = kraken_service.resolve_pair(candidate)
+            if resolved is None:
+                continue
+            display_pair = str(resolved.display_pair or '').upper().strip()
+            if '/' in display_pair:
+                return display_pair.split('/', 1)[0]
+            if display_pair:
+                return ''.join(char for char in display_pair if char.isalnum())
+
+        if '/' in raw:
+            return raw.split('/', 1)[0]
+        if compact.endswith(normalized_quote) and len(compact) > len(normalized_quote):
+            return compact[:-len(normalized_quote)]
+        return compact
+
+    def _normalize_scope_symbol(self, *, scope: WATCHLIST_SCOPE, symbol: str | None, quote_currency: str | None = None) -> str:
         raw = str(symbol or '').upper().strip()
         if not raw:
             return ''
         if scope != 'crypto_only':
             return ''.join(char for char in raw if char.isalnum())
-
-        quote = ''.join(char for char in str(quote_currency or 'USD').upper().strip() if char.isalnum())
-        compact = ''.join(char for char in raw if char.isalnum())
-        if not compact:
-            return ''
-        if quote and compact.endswith(quote) and len(compact) > len(quote):
-            return compact[: -len(quote)]
-        return compact
+        return self._normalize_crypto_symbol_key(raw, quote_currency)
 
     def _build_status_summary(
         self,
@@ -1180,7 +1286,7 @@ class WatchlistService:
         )
         managed_only_assigned: set[str] = set()
         for row in candidate_rows:
-            symbol = str(row.symbol or '').upper()
+            symbol = self._normalize_scope_symbol(scope=scope, symbol=row.symbol, quote_currency=row.quote_currency)
             if symbol in next_symbols:
                 row.monitoring_status = INACTIVE
             elif symbol in open_symbols and symbol not in managed_only_assigned:
@@ -1200,7 +1306,11 @@ class WatchlistService:
     ) -> list[dict[str, Any]]:
         selected: dict[str, tuple[WatchlistMonitorState, WatchlistSymbol]] = {}
         for monitor_row, symbol_row in pairs:
-            symbol_key = str(symbol_row.symbol or '').upper()
+            symbol_key = self._normalize_scope_symbol(
+                scope=symbol_row.scope,
+                symbol=symbol_row.symbol,
+                quote_currency=symbol_row.quote_currency,
+            )
             if not symbol_key:
                 continue
             current = selected.get(symbol_key)
@@ -1223,7 +1333,13 @@ class WatchlistService:
             self._serialize_monitor_row(
                 symbol_row,
                 monitor_row,
-                position_state=position_state_map.get(str(symbol_row.symbol or '').upper()),
+                position_state=position_state_map.get(
+                    self._normalize_scope_symbol(
+                        scope=symbol_row.scope,
+                        symbol=symbol_row.symbol,
+                        quote_currency=symbol_row.quote_currency,
+                    )
+                ),
                 broker_enrichment=broker_enrichment,
             )
             for monitor_row, symbol_row in ordered_pairs
@@ -1610,21 +1726,27 @@ class WatchlistService:
             raw_pair = str(position.get('pair') or position.get('symbol') or '').upper().strip()
             if not raw_pair:
                 continue
-            open_symbols.add(raw_pair)
-            if '/' in raw_pair:
-                open_symbols.add(raw_pair.split('/', 1)[0])
+            normalized = self._normalize_crypto_symbol_key(raw_pair)
+            if normalized:
+                open_symbols.add(normalized)
         return open_symbols
+
+    def _has_open_crypto_position(self, symbol: str | None, quote_currency: str | None = None) -> bool:
+        normalized = self._normalize_crypto_symbol_key(symbol, quote_currency)
+        return bool(normalized and normalized in self._get_open_crypto_symbols())
 
     def _resolve_row_status(
         self,
         *,
+        scope: WATCHLIST_SCOPE,
         row_upload_id: str,
         active_upload_id: str | None,
         symbol: str,
+        quote_currency: str | None,
         active_symbols: set[str],
         open_symbols: set[str],
     ) -> str:
-        symbol_value = str(symbol or '').upper()
+        symbol_value = self._normalize_scope_symbol(scope=scope, symbol=symbol, quote_currency=quote_currency)
         if active_upload_id and row_upload_id == active_upload_id:
             return ACTIVE
         if symbol_value in open_symbols and symbol_value not in active_symbols:
@@ -1761,6 +1883,9 @@ class WatchlistService:
                 symbol_payload['monitoringStatus'] = 'EXIT_PENDING'
                 monitoring_payload['latestDecisionState'] = 'EXIT_PENDING'
                 monitoring_payload['latestDecisionReason'] = 'First failed follow-through exit condition triggered for the open position.'
+            elif row.scope == 'crypto_only' and row.monitoring_status == ACTIVE:
+                monitoring_payload['latestDecisionState'] = 'SKIPPED'
+                monitoring_payload['latestDecisionReason'] = 'OPEN_POSITION_EXISTS'
         derived_monitoring_status = self._derive_runtime_monitoring_status(row, position_state) if broker_enrichment else None
         if derived_monitoring_status is not None:
             symbol_payload['monitoringStatus'] = derived_monitoring_status
@@ -2148,21 +2273,19 @@ class WatchlistService:
             if not raw_symbol:
                 continue
 
-            candidates = {raw_symbol}
-            if '/' in raw_symbol:
-                candidates.add(raw_symbol.split('/', 1)[0])
-            if raw_symbol.endswith('USD') and len(raw_symbol) > 3:
-                candidates.add(raw_symbol[:-3])
+            normalized_symbol = self._normalize_crypto_symbol_key(raw_symbol)
+            if not normalized_symbol:
+                continue
 
             latest_row = None
-            for candidate in candidates:
-                latest_row = (
-                    db.query(WatchlistSymbol)
-                    .filter(WatchlistSymbol.scope == 'crypto_only', WatchlistSymbol.symbol == candidate)
-                    .order_by(WatchlistSymbol.id.desc())
-                    .first()
+            for row_candidate in db.query(WatchlistSymbol).filter(WatchlistSymbol.scope == 'crypto_only').order_by(WatchlistSymbol.id.desc()).all():
+                candidate_key = self._normalize_scope_symbol(
+                    scope='crypto_only',
+                    symbol=row_candidate.symbol,
+                    quote_currency=row_candidate.quote_currency,
                 )
-                if latest_row is not None:
+                if candidate_key == normalized_symbol:
+                    latest_row = row_candidate
                     break
 
             max_hold_hours = int(latest_row.max_hold_hours) if latest_row is not None and latest_row.max_hold_hours is not None else None
@@ -2315,8 +2438,7 @@ class WatchlistService:
                 'impulseTrailingStop': impulse_trailing_stop,
                 'observedAtUtc': observed_at.isoformat(),
             }
-            for candidate in candidates:
-                state_map.setdefault(candidate, payload)
+            state_map[normalized_symbol] = payload
         return state_map
 
     def _derive_runtime_monitoring_status(self, row: WatchlistSymbol, position_state: dict[str, Any]) -> str | None:
