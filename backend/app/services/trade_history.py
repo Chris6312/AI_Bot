@@ -5,8 +5,11 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.models.crypto_paper_fill import CryptoPaperFill
+from app.models.crypto_paper_order import CryptoPaperOrder
 from app.models.order_intent import OrderIntent
 from app.models.trade import Trade
 
@@ -128,35 +131,38 @@ class TradeHistoryService:
         return rows
 
     def _build_crypto_rows(self, db: Session, filters: TradeHistoryFilters) -> list[dict[str, Any]]:
-        intents = (
-            db.query(OrderIntent)
-            .filter(OrderIntent.asset_class == 'crypto')
-            .filter(OrderIntent.status.in_(['FILLED', 'CLOSED']))
-            .order_by(OrderIntent.last_fill_at.asc(), OrderIntent.first_fill_at.asc(), OrderIntent.created_at.asc(), OrderIntent.id.asc())
-            .all()
+        events = [
+            *self._build_crypto_intent_events(db),
+            *self._build_crypto_fill_events(db),
+        ]
+        events.sort(
+            key=lambda event: (
+                event['fillTime'] or datetime.min.replace(tzinfo=UTC),
+                str(event['id']),
+            )
         )
         open_lots: dict[str, list[dict[str, Any]]] = {}
         rows: list[dict[str, Any]] = []
-        for intent in intents:
-            symbol = str(intent.symbol or '').upper().strip()
+        for event in events:
+            symbol = str(event['symbol'] or '').upper().strip()
             if not symbol:
                 continue
-            context = intent.context_json if isinstance(intent.context_json, dict) else {}
-            mode = self._normalize_mode(context.get('mode') or intent.account_id)
-            fill_quantity = float(intent.filled_quantity or intent.requested_quantity or 0.0)
-            fill_price = float(intent.avg_fill_price or intent.requested_price or 0.0)
-            fill_time = self._ensure_utc(intent.last_fill_at or intent.first_fill_at or intent.submitted_at or intent.created_at)
+            context = event['context']
+            mode = self._normalize_mode(event['mode'])
+            fill_quantity = float(event['fillQuantity'] or 0.0)
+            fill_price = float(event['fillPrice'] or 0.0)
+            fill_time = self._ensure_utc(event['fillTime'])
             if fill_quantity <= 0 or fill_price <= 0 or fill_time is None:
                 continue
 
-            if str(intent.side or '').upper() == 'BUY':
+            if event['side'] == 'BUY':
                 open_lots.setdefault(symbol, []).append(
                     {
-                        'intentId': intent.intent_id,
+                        'intentId': event['id'],
                         'symbol': symbol,
-                        'displaySymbol': context.get('displayPair') or symbol,
+                        'displaySymbol': event['displaySymbol'],
                         'mode': mode,
-                        'source': intent.execution_source,
+                        'source': event['source'],
                         'remainingQuantity': fill_quantity,
                         'buyQuantity': fill_quantity,
                         'buyPrice': fill_price,
@@ -169,7 +175,7 @@ class TradeHistoryService:
                 )
                 continue
 
-            if str(intent.side or '').upper() != 'SELL':
+            if event['side'] != 'SELL':
                 continue
 
             remaining_sell = fill_quantity
@@ -189,14 +195,14 @@ class TradeHistoryService:
                 )
                 technical_snapshot = self._extract_technical_snapshot(buy_context)
                 row = {
-                    'id': f"crypto-{lot['intentId']}-{intent.intent_id}-{len(rows) + 1}",
+                    'id': f"crypto-{lot['intentId']}-{event['id']}-{len(rows) + 1}",
                     'tradeId': None,
                     'assetClass': 'crypto',
                     'mode': mode,
                     'symbol': lot.get('displaySymbol') or symbol,
                     'buyIntentId': lot['intentId'],
-                    'sellIntentId': intent.intent_id,
-                    'source': intent.execution_source,
+                    'sellIntentId': event['id'],
+                    'source': event['source'],
                     'boughtAtUtc': lot['boughtAtUtc'],
                     'boughtAtEt': lot['boughtAtEt'],
                     'buyPrice': buy_price,
@@ -223,6 +229,65 @@ class TradeHistoryService:
                 if float(lot['remainingQuantity']) <= 1e-12:
                     symbol_lots.pop(0)
         return rows
+
+    def _build_crypto_intent_events(self, db: Session) -> list[dict[str, Any]]:
+        intents = (
+            db.query(OrderIntent)
+            .filter(OrderIntent.asset_class == 'crypto')
+            .filter(OrderIntent.status.in_(['FILLED', 'CLOSED']))
+            .order_by(OrderIntent.last_fill_at.asc(), OrderIntent.first_fill_at.asc(), OrderIntent.created_at.asc(), OrderIntent.id.asc())
+            .all()
+        )
+        events: list[dict[str, Any]] = []
+        for intent in intents:
+            context = intent.context_json if isinstance(intent.context_json, dict) else {}
+            events.append(
+                {
+                    'id': intent.intent_id,
+                    'symbol': str(intent.symbol or '').upper().strip(),
+                    'displaySymbol': context.get('displayPair') or str(intent.symbol or '').upper().strip(),
+                    'side': str(intent.side or '').upper().strip(),
+                    'mode': context.get('mode') or intent.account_id,
+                    'source': intent.execution_source,
+                    'fillQuantity': float(intent.filled_quantity or intent.requested_quantity or 0.0),
+                    'fillPrice': float(intent.avg_fill_price or intent.requested_price or 0.0),
+                    'fillTime': self._ensure_utc(intent.last_fill_at or intent.first_fill_at or intent.submitted_at or intent.created_at),
+                    'context': context,
+                }
+            )
+        return events
+
+    def _build_crypto_fill_events(self, db: Session) -> list[dict[str, Any]]:
+        fill_rows = (
+            db.query(CryptoPaperFill, CryptoPaperOrder)
+            .join(CryptoPaperOrder, CryptoPaperOrder.order_id == CryptoPaperFill.order_id)
+            .filter(CryptoPaperFill.account_key == 'paper-crypto-ledger')
+            .filter(or_(CryptoPaperOrder.intent_id.is_(None), CryptoPaperOrder.intent_id == ''))
+            .order_by(CryptoPaperFill.filled_at.asc(), CryptoPaperFill.id.asc())
+            .all()
+        )
+        events: list[dict[str, Any]] = []
+        for fill, order in fill_rows:
+            symbol = str(fill.symbol or order.symbol or '').upper().strip()
+            display_symbol = symbol if '/' in symbol else f'{symbol[:-3]}/USD' if symbol.endswith('USD') and len(symbol) > 3 else symbol
+            events.append(
+                {
+                    'id': str(fill.fill_id or order.order_id),
+                    'symbol': symbol,
+                    'displaySymbol': display_symbol,
+                    'side': str(fill.side or order.side or '').upper().strip(),
+                    'mode': 'PAPER',
+                    'source': order.source or 'CRYPTO_PAPER_BROKER',
+                    'fillQuantity': float(fill.quantity or order.filled_quantity or order.requested_quantity or 0.0),
+                    'fillPrice': float(fill.price or order.avg_fill_price or order.requested_price or 0.0),
+                    'fillTime': self._ensure_utc(fill.filled_at or order.submitted_at or order.created_at),
+                    'context': {
+                        'displayPair': display_symbol,
+                        'ohlcvPair': fill.ohlcv_pair or order.ohlcv_pair,
+                    },
+                }
+            )
+        return events
 
     @staticmethod
     def _dict_or_empty(value: Any) -> dict[str, Any]:

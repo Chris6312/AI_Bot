@@ -11,6 +11,7 @@ Use ONLY information available through this Kraken app right now:
 - top losers
 - trending crypto assets
 - latest news, narratives, and market insight for specific crypto symbols
+- Always include BTC/USD, ETH/USD, and SOL/USD in watchlist
 
 Do NOT use or invent:
 - OHLCV or candle data

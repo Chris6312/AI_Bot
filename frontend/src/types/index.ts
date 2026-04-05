@@ -378,6 +378,31 @@ export interface CryptoLedger {
   positions: CryptoPosition[]
 }
 
+export interface CryptoPaperAdminActionResponse {
+  success: boolean
+  message: string
+  assetClass: 'crypto' | string
+  mode: 'PAPER' | string
+  oldCashBalance?: number
+  newCashBalance?: number
+  oldStartingBalance?: number
+  newStartingBalance?: number
+  oldRealizedPnl?: number
+  newRealizedPnl?: number
+  canceledPendingOrders?: number
+  canceledPendingIntents?: number
+  flattenedPositions?: number
+  flattenedQuantity?: number
+  clearedMonitorStates?: number
+  deletedTrades?: number
+  deletedOrders?: number
+  deletedIntents?: number
+  deletedEvents?: number
+  cancelPending?: CryptoPaperAdminActionResponse
+  flattenPositions?: CryptoPaperAdminActionResponse
+  deleteHistory?: CryptoPaperAdminActionResponse
+}
+
 export interface MarketStatus {
   stock: {
     isOpen: boolean

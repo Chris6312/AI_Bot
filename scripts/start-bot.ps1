@@ -450,13 +450,48 @@ if (-not $SkipFrontend) {
             }
         }
 
+        $frontendPrelude = ""
+        if (-not $SkipBackend) {
+            $frontendPrelude = @'
+$apiBaseUrl = [System.Environment]::GetEnvironmentVariable('VITE_API_BASE_URL', 'Process')
+if ([string]::IsNullOrWhiteSpace($apiBaseUrl)) {
+    $apiBaseUrl = 'http://127.0.0.1:8000'
+}
+
+$apiBaseUrl = $apiBaseUrl.TrimEnd('/')
+$healthUrl = "$apiBaseUrl/health"
+$backendReady = $false
+
+Write-Host "Waiting for backend readiness at $healthUrl ..." -ForegroundColor Gray
+
+for ($attempt = 1; $attempt -le 60; $attempt++) {
+    try {
+        Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 2 | Out-Null
+        $backendReady = $true
+        break
+    }
+    catch {
+        Start-Sleep -Seconds 2
+    }
+}
+
+if ($backendReady) {
+    Write-Host "Backend is responding. Starting frontend..." -ForegroundColor Green
+} else {
+    Write-Warning "Backend did not become ready before frontend startup. Starting frontend anyway."
+}
+'@
+        }
+
         $frontendScript = @'
 Set-Location "__FRONTEND_PATH__"
 Write-Host "AI Bot Frontend" -ForegroundColor Cyan
+__BACKEND_WAIT__
 npm run dev
 '@
 
         $frontendScript = $frontendScript.Replace("__FRONTEND_PATH__", $frontendPath)
+        $frontendScript = $frontendScript.Replace("__BACKEND_WAIT__", $frontendPrelude)
 
         Add-WtTab -Title "AI Bot - Frontend" -ScriptText $frontendScript -WorkingDirectory $frontendPath
         Write-Host "✓ Frontend queued (http://localhost:5173)" -ForegroundColor Green

@@ -4,13 +4,18 @@ Handles all crypto-related endpoints (Kraken integration)
 """
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.models.order_intent import OrderIntent
 from app.services.control_plane import ensure_execution_armed, require_admin_token
+from app.services.crypto_paper_ledger_admin import (
+    CryptoPaperLedgerAdminConflict,
+    CryptoPaperLedgerAdminValidationError,
+    crypto_paper_ledger_admin,
+)
 from app.services.kraken_service import crypto_ledger, kraken_service
 from app.services.pre_trade_gate import pre_trade_gate
 
@@ -24,11 +29,19 @@ class CryptoTradeRequest(BaseModel):
     price: Optional[float] = None
 
 
+class CryptoPaperSetCashRequest(BaseModel):
+    cashBalance: float
+
+
+class CryptoPaperFreshStartRequest(BaseModel):
+    cashBalance: float
+
+
 @router.get("/positions")
-async def get_crypto_positions():
+async def get_crypto_positions(db: Session = Depends(get_db)):
     """Get current crypto positions (paper)"""
     try:
-        return crypto_ledger.get_positions()
+        return crypto_ledger.get_positions(db=db)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -43,6 +56,7 @@ async def get_crypto_history(
         intents = (
             db.query(OrderIntent)
             .filter(OrderIntent.asset_class == 'crypto')
+            .filter(OrderIntent.side.in_(['BUY', 'SELL']))
             .order_by(OrderIntent.last_fill_at.desc(), OrderIntent.created_at.desc(), OrderIntent.id.desc())
             .limit(limit)
             .all()
@@ -79,12 +93,63 @@ async def get_crypto_history(
 
 
 @router.get("/paper-ledger")
-async def get_paper_ledger():
+async def get_paper_ledger(db: Session = Depends(get_db)):
     """Get full paper trading ledger"""
     try:
-        return crypto_ledger.get_ledger()
+        return crypto_ledger.get_ledger(db=db)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/paper-ledger/admin/set-cash")
+async def set_crypto_paper_cash_balance(
+    request: CryptoPaperSetCashRequest,
+    _: bool = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+):
+    try:
+        return crypto_paper_ledger_admin.set_cash_balance(db, cash_balance=request.cashBalance)
+    except CryptoPaperLedgerAdminValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.post("/paper-ledger/admin/delete-history")
+async def delete_crypto_paper_history(
+    _: bool = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+):
+    try:
+        return crypto_paper_ledger_admin.delete_history(db)
+    except CryptoPaperLedgerAdminConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
+@router.post("/paper-ledger/admin/cancel-pending")
+async def cancel_pending_crypto_paper_orders(
+    _: bool = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+):
+    return crypto_paper_ledger_admin.cancel_pending(db)
+
+
+@router.post("/paper-ledger/admin/flatten-positions")
+async def flatten_crypto_paper_positions(
+    _: bool = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+):
+    return crypto_paper_ledger_admin.flatten_positions(db)
+
+
+@router.post("/paper-ledger/admin/fresh-start")
+async def fresh_start_crypto_paper_account(
+    request: CryptoPaperFreshStartRequest,
+    _: bool = Depends(require_admin_token),
+    db: Session = Depends(get_db),
+):
+    try:
+        return crypto_paper_ledger_admin.fresh_start(db, cash_balance=request.cashBalance)
+    except CryptoPaperLedgerAdminValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/prices")

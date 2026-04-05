@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 
 from app.core.database import get_db
 from app.main import app
+from app.models.crypto_paper_fill import CryptoPaperFill
+from app.models.crypto_paper_order import CryptoPaperOrder
 from app.models.order_intent import OrderIntent
 from app.models.trade import Trade
 from tests.test_phase4_watchlists import build_session_factory
@@ -280,3 +282,99 @@ def test_trade_history_preserves_normalized_signal_fields(tmp_path) -> None:
         assert row['technicalSnapshot']['signalStrength'] == 0.7
         assert row['technicalSnapshot']['distanceFromSma10Pct'] == 2.0202
         assert row['technicalSnapshot']['breakoutDistancePct'] == 1.0
+
+
+def test_trade_history_includes_crypto_paper_fills_without_order_intents(tmp_path) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        bought_at = datetime(2026, 4, 4, 14, 0, tzinfo=UTC)
+        sold_at = bought_at + timedelta(hours=1)
+        db.add_all(
+            [
+                CryptoPaperOrder(
+                    order_id='paper_buy_1',
+                    account_key='paper-crypto-ledger',
+                    symbol='BTC/USD',
+                    ohlcv_pair='XBTUSD',
+                    side='BUY',
+                    status='FILLED',
+                    requested_quantity=0.1,
+                    requested_price=60000.0,
+                    filled_quantity=0.1,
+                    avg_fill_price=60000.0,
+                    intent_id=None,
+                    source='HTTP_ADMIN_CRYPTO',
+                    submitted_at=bought_at,
+                ),
+                CryptoPaperOrder(
+                    order_id='paper_sell_1',
+                    account_key='paper-crypto-ledger',
+                    symbol='BTC/USD',
+                    ohlcv_pair='XBTUSD',
+                    side='SELL',
+                    status='FILLED',
+                    requested_quantity=0.1,
+                    requested_price=63000.0,
+                    filled_quantity=0.1,
+                    avg_fill_price=63000.0,
+                    intent_id=None,
+                    source='HTTP_ADMIN_CRYPTO',
+                    submitted_at=sold_at,
+                ),
+                CryptoPaperFill(
+                    fill_id='fill_buy_1',
+                    order_id='paper_buy_1',
+                    account_key='paper-crypto-ledger',
+                    symbol='BTC/USD',
+                    ohlcv_pair='XBTUSD',
+                    side='BUY',
+                    quantity=0.1,
+                    price=60000.0,
+                    notional=6000.0,
+                    fee=0.0,
+                    filled_at=bought_at,
+                ),
+                CryptoPaperFill(
+                    fill_id='fill_sell_1',
+                    order_id='paper_sell_1',
+                    account_key='paper-crypto-ledger',
+                    symbol='BTC/USD',
+                    ohlcv_pair='XBTUSD',
+                    side='SELL',
+                    quantity=0.1,
+                    price=63000.0,
+                    notional=6300.0,
+                    fee=0.0,
+                    filled_at=sold_at,
+                ),
+            ]
+        )
+        db.commit()
+
+        def override_get_db():
+            local_db = SessionFactory()
+            try:
+                yield local_db
+            finally:
+                local_db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        try:
+            client = TestClient(app)
+            response = client.get('/api/trade-history', params={'asset_class': 'crypto'})
+        finally:
+            app.dependency_overrides.clear()
+            db.close()
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload['summary']['totalCount'] == 1
+        row = payload['rows'][0]
+        assert row['symbol'] == 'BTC/USD'
+        assert row['mode'] == 'PAPER'
+        assert row['source'] == 'HTTP_ADMIN_CRYPTO'
+        assert row['buyQuantity'] == 0.1
+        assert row['sellQuantity'] == 0.1
+        assert row['buyTotal'] == 6000.0
+        assert row['sellTotal'] == 6300.0
+        assert row['realizedPnl'] == 300.0

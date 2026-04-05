@@ -1161,6 +1161,29 @@ class WatchlistExitWorkerService:
                 trade.exit_reasoning = context
         db.flush()
 
+    async def run_cycle(self) -> dict[str, Any]:
+        session = SessionLocal()
+        try:
+            return self.run_once(session)
+        finally:
+            session.close()
+
+    async def run_loop(self):
+        """
+        Backwards-compatible wrapper so existing startup orchestration
+        in app.main can call run_loop() safely.
+        """
+        while True:
+            try:
+                await self.run_cycle()
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "watchlist_exit_worker loop error", exc_info=e
+                )
+
+            await asyncio.sleep(20)
+
     async def run_forever(self) -> None:
         while True:
             if not self._runtime.enabled:
