@@ -35,6 +35,8 @@ from app.services.template_evaluator import (
     DATA_STALE,
     ENTRY_CANDIDATE,
     MONITOR_ONLY,
+    WAITING_FOR_SETUP,
+    build_candle_metrics,
     template_evaluation_service,
 )
 from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
@@ -125,6 +127,337 @@ def build_stock_payload() -> dict:
             },
         },
     }
+
+
+def build_trend_candles(
+    *,
+    count: int = 40,
+    interval_minutes: int = 5,
+    start_price: float = 100.0,
+    drift: float = 0.18,
+    close_offset: float = 0.08,
+    wick: float = 0.12,
+    base_volume: float = 1000.0,
+    last_volume_multiplier: float = 1.3,
+    start_at: datetime | None = None,
+) -> list[dict[str, float | int]]:
+    started_at = start_at or (datetime.now(UTC) - timedelta(minutes=interval_minutes * (count + 6)))
+    candles: list[dict[str, float | int]] = []
+    price = start_price
+    for index in range(count):
+        open_price = price
+        close_price = open_price + close_offset
+        candles.append(
+            {
+                'timestamp': int((started_at + timedelta(minutes=interval_minutes * index)).timestamp()),
+                'open': round(open_price, 6),
+                'high': round(close_price + wick, 6),
+                'low': round(open_price - wick, 6),
+                'close': round(close_price, 6),
+                'volume': round(base_volume * (last_volume_multiplier if index == count - 1 else 1.0), 6),
+            }
+        )
+        price += drift
+    return candles
+
+
+def build_range_breakout_candles(
+    *,
+    count: int = 40,
+    interval_minutes: int = 5,
+    base_volume: float = 1000.0,
+    breakout: str = 'confirmed',
+    start_at: datetime | None = None,
+) -> list[dict[str, float | int]]:
+    started_at = start_at or (datetime.now(UTC) - timedelta(minutes=interval_minutes * (count + 6)))
+    candles: list[dict[str, float | int]] = []
+
+    price = 97.0
+    for index in range(count - 6):
+        open_price = price
+        close_price = open_price + 0.1
+        candles.append(
+            {
+                'timestamp': int((started_at + timedelta(minutes=interval_minutes * index)).timestamp()),
+                'open': round(open_price, 6),
+                'high': round(close_price + 0.15, 6),
+                'low': round(open_price - 0.15, 6),
+                'close': round(close_price, 6),
+                'volume': base_volume,
+            }
+        )
+        price += 0.08
+
+    consolidation = [
+        (99.68, 99.92, 99.58, 99.84),
+        (99.72, 99.96, 99.62, 99.86),
+        (99.74, 100.0, 99.66, 99.88),
+        (99.76, 99.98, 99.68, 99.9),
+        (99.78, 99.99, 99.7, 99.91),
+    ]
+    base_index = len(candles)
+    for offset, (open_price, high_price, low_price, close_price) in enumerate(consolidation):
+        candles.append(
+            {
+                'timestamp': int((started_at + timedelta(minutes=interval_minutes * (base_index + offset))).timestamp()),
+                'open': open_price,
+                'high': high_price,
+                'low': low_price,
+                'close': close_price,
+                'volume': base_volume,
+            }
+        )
+
+    if breakout == 'confirmed':
+        signal = {'open': 99.96, 'high': 100.42, 'low': 99.88, 'close': 100.28, 'volume': base_volume * 1.5}
+    elif breakout == 'near':
+        signal = {'open': 99.92, 'high': 100.0, 'low': 99.84, 'close': 99.99, 'volume': base_volume * 1.25}
+    else:
+        signal = {'open': 99.95, 'high': 100.34, 'low': 99.87, 'close': 99.97, 'volume': base_volume * 1.4}
+
+    candles.append(
+        {
+            'timestamp': int((started_at + timedelta(minutes=interval_minutes * (count - 1))).timestamp()),
+            **signal,
+        }
+    )
+    return candles
+
+
+def _append_test_candle(
+    candles: list[dict[str, float | int]],
+    *,
+    started_at: datetime,
+    interval_minutes: int,
+    index: int,
+    open_price: float,
+    high_price: float,
+    low_price: float,
+    close_price: float,
+    volume: float,
+) -> None:
+    candles.append(
+        {
+            'timestamp': int((started_at + timedelta(minutes=interval_minutes * index)).timestamp()),
+            'open': round(open_price, 6),
+            'high': round(high_price, 6),
+            'low': round(low_price, 6),
+            'close': round(close_price, 6),
+            'volume': round(volume, 6),
+        }
+    )
+
+
+def build_pullback_reclaim_candles(
+    *,
+    count: int = 40,
+    interval_minutes: int = 15,
+    start_price: float = 100.0,
+    pullback_depth_below_breakout: float = 0.08,
+    base_volume: float = 1000.0,
+    last_volume_multiplier: float = 1.12,
+) -> list[dict[str, float | int]]:
+    started_at = datetime.now(UTC) - timedelta(minutes=interval_minutes * (count + 6))
+    candles: list[dict[str, float | int]] = []
+    price = start_price
+
+    for index in range(count - 5):
+        open_price = price
+        close_price = open_price + 0.1
+        _append_test_candle(
+            candles,
+            started_at=started_at,
+            interval_minutes=interval_minutes,
+            index=index,
+            open_price=open_price,
+            high_price=close_price + 0.12,
+            low_price=open_price - 0.12,
+            close_price=close_price,
+            volume=base_volume,
+        )
+        price += 0.08
+
+    breakout_level = max(float(candle['high']) for candle in candles[-5:])
+    base_index = len(candles)
+    breakout_close = breakout_level + 0.22
+    breakout_high = breakout_close + 0.12
+    _append_test_candle(
+        candles,
+        started_at=started_at,
+        interval_minutes=interval_minutes,
+        index=base_index,
+        open_price=breakout_level - 0.08,
+        high_price=breakout_high,
+        low_price=breakout_level - 0.18,
+        close_price=breakout_close,
+        volume=base_volume,
+    )
+    swing_close = breakout_close + 0.1
+    swing_high = swing_close + 0.12
+    _append_test_candle(
+        candles,
+        started_at=started_at,
+        interval_minutes=interval_minutes,
+        index=base_index + 1,
+        open_price=breakout_close + 0.02,
+        high_price=swing_high,
+        low_price=breakout_close - 0.06,
+        close_price=swing_close,
+        volume=base_volume,
+    )
+    pullback_low = breakout_level - pullback_depth_below_breakout
+    _append_test_candle(
+        candles,
+        started_at=started_at,
+        interval_minutes=interval_minutes,
+        index=base_index + 2,
+        open_price=swing_close - 0.02,
+        high_price=swing_close + 0.02,
+        low_price=pullback_low,
+        close_price=breakout_level + 0.03,
+        volume=base_volume,
+    )
+    _append_test_candle(
+        candles,
+        started_at=started_at,
+        interval_minutes=interval_minutes,
+        index=base_index + 3,
+        open_price=breakout_level + 0.05,
+        high_price=breakout_level + 0.09,
+        low_price=pullback_low + 0.03,
+        close_price=breakout_level + 0.01,
+        volume=base_volume,
+    )
+    _append_test_candle(
+        candles,
+        started_at=started_at,
+        interval_minutes=interval_minutes,
+        index=base_index + 4,
+        open_price=breakout_level + 0.04,
+        high_price=breakout_level + 0.32,
+        low_price=breakout_level + 0.01,
+        close_price=breakout_level + 0.26,
+        volume=base_volume * last_volume_multiplier,
+    )
+    return candles
+
+
+def build_breakout_retest_candles(
+    *,
+    count: int = 40,
+    interval_minutes: int = 60,
+    breakout_close_offset: float = 0.24,
+    retest_low_below_breakout: float = 0.05,
+    retest_close_offset: float = 0.03,
+    signal_close_offset: float = 0.28,
+    base_volume: float = 1000.0,
+    last_volume_multiplier: float = 1.12,
+) -> list[dict[str, float | int]]:
+    started_at = datetime.now(UTC) - timedelta(minutes=interval_minutes * (count + 6))
+    candles: list[dict[str, float | int]] = []
+
+    for index in range(count - 3):
+        open_price = 99.2 + ((index % 4) * 0.05)
+        close_price = 99.58 + ((index % 3) * 0.03)
+        _append_test_candle(
+            candles,
+            started_at=started_at,
+            interval_minutes=interval_minutes,
+            index=index,
+            open_price=open_price,
+            high_price=99.86 + ((index % 2) * 0.04),
+            low_price=min(open_price, close_price) - 0.12,
+            close_price=close_price,
+            volume=base_volume,
+        )
+
+    breakout_level = max(float(candle['high']) for candle in candles[-5:])
+    base_index = len(candles)
+    _append_test_candle(
+        candles,
+        started_at=started_at,
+        interval_minutes=interval_minutes,
+        index=base_index,
+        open_price=breakout_level - 0.06,
+        high_price=breakout_level + breakout_close_offset + 0.12,
+        low_price=breakout_level - 0.14,
+        close_price=breakout_level + breakout_close_offset,
+        volume=base_volume,
+    )
+    _append_test_candle(
+        candles,
+        started_at=started_at,
+        interval_minutes=interval_minutes,
+        index=base_index + 1,
+        open_price=breakout_level + breakout_close_offset - 0.03,
+        high_price=breakout_level + breakout_close_offset + 0.05,
+        low_price=breakout_level - retest_low_below_breakout,
+        close_price=breakout_level + retest_close_offset,
+        volume=base_volume,
+    )
+    _append_test_candle(
+        candles,
+        started_at=started_at,
+        interval_minutes=interval_minutes,
+        index=base_index + 2,
+        open_price=breakout_level + max(0.02, retest_close_offset - 0.01),
+        high_price=breakout_level + signal_close_offset + 0.12,
+        low_price=breakout_level + 0.01,
+        close_price=breakout_level + signal_close_offset,
+        volume=base_volume * last_volume_multiplier,
+    )
+    return candles
+
+
+def build_stock_orb_candles(*, breakout: str = 'confirmed') -> list[dict[str, float | int]]:
+    et = ZoneInfo('America/New_York')
+    session_start_et = (datetime.now(et) - timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
+    candles: list[dict[str, float | int]] = []
+    opening_range = [
+        (99.92, 100.0, 99.9, 99.96),
+        (99.96, 100.02, 99.92, 99.98),
+        (99.98, 100.01, 99.94, 99.97),
+    ]
+    for index, (open_price, high_price, low_price, close_price) in enumerate(opening_range):
+        candles.append(
+            {
+                'timestamp': int((session_start_et + timedelta(minutes=5 * index)).astimezone(UTC).timestamp()),
+                'open': open_price,
+                'high': high_price,
+                'low': low_price,
+                'close': close_price,
+                'volume': 1000.0,
+            }
+        )
+
+    for index in range(3, 39):
+        open_price = 99.9 + ((index - 3) * 0.003)
+        close_price = open_price + 0.01
+        candles.append(
+            {
+                'timestamp': int((session_start_et + timedelta(minutes=5 * index)).astimezone(UTC).timestamp()),
+                'open': round(open_price, 6),
+                'high': round(max(close_price, min(100.01, close_price + 0.05)), 6),
+                'low': round(open_price - 0.08, 6),
+                'close': round(close_price, 6),
+                'volume': 1000.0,
+            }
+        )
+
+    if breakout == 'confirmed':
+        signal = {'open': 100.0, 'high': 100.18, 'low': 99.96, 'close': 100.12, 'volume': 1500.0}
+    elif breakout == 'near':
+        signal = {'open': 99.99, 'high': 100.02, 'low': 99.95, 'close': 100.01, 'volume': 1300.0}
+    else:
+        signal = {'open': 99.99, 'high': 100.12, 'low': 99.95, 'close': 100.0, 'volume': 1500.0}
+
+    candles.append(
+        {
+            'timestamp': int((session_start_et + timedelta(minutes=5 * 39)).astimezone(UTC).timestamp()),
+            **signal,
+        }
+    )
+    return candles
 
 
 def build_crypto_payload() -> dict:
@@ -977,6 +1310,22 @@ def test_template_evaluator_promotes_stock_symbol_to_entry_candidate(tmp_path, m
                 '_fetched_at_utc': datetime.now(UTC).isoformat(),
             },
         )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=15, start=None, end=None, session_filter='open', timeout=None: build_pullback_reclaim_candles(
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=15, start=None, end=None, session_filter='open', timeout=None: build_pullback_reclaim_candles(
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
+        )
 
         result = template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
         snapshot = watchlist_service.get_monitoring_snapshot(db, scope='stocks_only')
@@ -1007,6 +1356,14 @@ def test_template_evaluator_marks_stale_stock_quote(tmp_path, monkeypatch) -> No
                 'volume': 2_500_000,
                 '_fetched_at_utc': (datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
             },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=15, start=None, end=None, session_filter='open', timeout=None: build_trend_candles(
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
         )
 
         template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
@@ -1050,40 +1407,444 @@ def test_template_evaluator_promotes_crypto_symbol_to_entry_candidate(tmp_path, 
                 '_fetched_at_utc': now.isoformat(),
             },
         )
-        monkeypatch.setattr(
-            'app.services.watchlist_monitoring.kraken_service.get_ohlc',
-            lambda pair, interval=15, limit=25: [
-                {'open': '68000.0', 'high': '69000.0', 'low': '67500.0', 'close': '68500.0', 'time': 1},
-                {'open': '68500.0', 'high': '69500.0', 'low': '68000.0', 'close': '69000.0', 'time': 2},
-                {'open': '69000.0', 'high': '70000.0', 'low': '68800.0', 'close': '69500.0', 'time': 3},
-                {'open': '69500.0', 'high': '70500.0', 'low': '69200.0', 'close': '69800.0', 'time': 4},
-                {'open': '69800.0', 'high': '71000.0', 'low': '69700.0', 'close': '70000.0', 'time': 5},
-                {'open': '70000.0', 'high': '71200.0', 'low': '69900.0', 'close': '70500.0', 'time': 6},
-            ],
-        )
-        candles = []
-        base_ts = int((now - timedelta(minutes=75)).timestamp())
-        price = 100.0
-        for idx in range(6):
-            open_price = price + idx * 0.7
-            close_price = open_price + 1.2
-            candles.append({
-                'timestamp': base_ts + idx * 900,
-                'open': open_price,
-                'high': close_price + 0.2,
-                'low': open_price - 0.2,
-                'close': close_price,
-                'vwap': close_price,
-                'volume': 10 + idx,
-                'count': 1,
-            })
-        monkeypatch.setattr(kraken_service, 'get_ohlc', lambda pair, interval=15, limit=25: candles)
+        candles = build_trend_candles(interval_minutes=15, start_price=100.0)
+        monkeypatch.setattr(kraken_service, 'get_ohlc', lambda pair, interval=15, limit=60: candles)
 
         result = template_evaluation_service.evaluate_scope(db, scope='crypto_only', force=True)
         snapshot = watchlist_service.get_monitoring_snapshot(db, scope='crypto_only')
 
         assert result['summary']['entryCandidateCount'] == 1
         assert snapshot['rows'][0]['monitoring']['latestDecisionState'] == ENTRY_CANDIDATE
+
+
+def test_stock_template_evaluator_uses_candle_metrics_not_quote_proxies(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][1]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        payload['ui_payload']['symbol_context'] = {'MSFT': payload['ui_payload']['symbol_context']['MSFT']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        candles = build_trend_candles(interval_minutes=5, start_price=100.0)
+        expected = build_candle_metrics(candles)
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 9999.0,
+                'prevclose': 1.0,
+                'open': 1.0,
+                'volume': 1.0,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=15, start=None, end=None, session_filter='open', timeout=None: build_trend_candles(
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=5, start=None, end=None, session_filter='open', timeout=None: candles,
+        )
+
+        template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'MSFT').one()
+        details = monitor_row.decision_context_json['latestEvaluation']['details']
+
+        assert monitor_row.latest_decision_state == ENTRY_CANDIDATE
+        assert details['currentPrice'] == round(float(expected['last_price']), 6)
+        assert details['currentPrice'] != 9999.0
+        assert details['recentHigh'] == round(float(expected['recent_high']), 6)
+        assert details['recentLow'] == round(float(expected['recent_low']), 6)
+        assert details['sma5'] == round(float(expected['sma5']), 6)
+        assert details['sma10'] == round(float(expected['sma10']), 6)
+        assert details['rangeHigh'] == round(float(expected['range_high']), 6)
+        assert details['atr14'] == round(float(expected['atr14']), 6)
+
+
+def test_trend_continuation_rejects_when_trend_alignment_missing(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][1]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        payload['ui_payload']['symbol_context'] = {'MSFT': payload['ui_payload']['symbol_context']['MSFT']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        candles = build_trend_candles(interval_minutes=5, start_price=100.0, drift=-0.12, close_offset=-0.05)
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 100.0,
+                'prevclose': 100.0,
+                'open': 100.0,
+                'volume': 1_000_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=5, start=None, end=None, session_filter='open', timeout=None: candles,
+        )
+
+        template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'MSFT').one()
+
+        assert monitor_row.latest_decision_state == WAITING_FOR_SETUP
+        assert 'SMA5 is not above SMA10' in monitor_row.latest_decision_reason
+
+
+def test_pullback_reclaim_fails_when_no_trend() -> None:
+    candles = build_trend_candles(interval_minutes=15, drift=-0.08, close_offset=-0.04)
+    metrics = build_candle_metrics(candles)
+    details: dict[str, object] = {}
+
+    is_ready, reason = template_evaluation_service._evaluate_pullback_reclaim(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        interval_minutes=15,
+        details=details,
+    )
+
+    assert is_ready is False
+    assert 'trend structure is not aligned' in reason
+    assert details['atr14'] if 'atr14' in details else True
+
+
+def test_pullback_reclaim_fails_when_pullback_breaks_structure() -> None:
+    candles = build_pullback_reclaim_candles(interval_minutes=15, pullback_depth_below_breakout=0.7)
+    metrics = build_candle_metrics(candles)
+    details: dict[str, object] = {}
+
+    is_ready, reason = template_evaluation_service._evaluate_pullback_reclaim(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        interval_minutes=15,
+        details=details,
+    )
+
+    assert is_ready is False
+    assert 'pullback' in reason.lower()
+
+
+def test_pullback_reclaim_passes_when_reclaim_occurs_with_valid_depth() -> None:
+    candles = build_pullback_reclaim_candles(interval_minutes=15, pullback_depth_below_breakout=0.08)
+    metrics = build_candle_metrics(candles)
+    details: dict[str, object] = {}
+
+    is_ready, reason = template_evaluation_service._evaluate_pullback_reclaim(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        interval_minutes=15,
+        details=details,
+    )
+
+    assert metrics['atr14'] is not None
+    assert is_ready is True
+    assert 'confirmed' in reason.lower()
+    assert details['pullbackDepthRatio'] <= details['pullbackDepthRatioLimit']
+
+
+def test_pullback_reclaim_uses_tighter_stock_thresholds_than_crypto() -> None:
+    candles = build_pullback_reclaim_candles(interval_minutes=15, pullback_depth_below_breakout=0.2)
+    metrics = build_candle_metrics(candles)
+    stock_details: dict[str, object] = {}
+    crypto_details: dict[str, object] = {}
+
+    stock_ready, _ = template_evaluation_service._evaluate_pullback_reclaim(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        interval_minutes=15,
+        details=stock_details,
+    )
+    crypto_ready, _ = template_evaluation_service._evaluate_pullback_reclaim(
+        metrics=metrics,
+        scope='crypto_only',
+        candles=candles,
+        interval_minutes=15,
+        details=crypto_details,
+    )
+
+    assert stock_ready is False
+    assert crypto_ready is True
+    assert stock_details['pullbackDepthRatioLimit'] < crypto_details['pullbackDepthRatioLimit']
+
+
+def test_breakout_retest_fails_when_breakout_never_occurred() -> None:
+    candles = build_breakout_retest_candles(breakout_close_offset=-0.01, signal_close_offset=0.02)
+    metrics = build_candle_metrics(candles)
+    details: dict[str, object] = {}
+
+    is_ready, reason = template_evaluation_service._evaluate_breakout_retest(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        interval_minutes=60,
+        details=details,
+    )
+
+    assert is_ready is False
+    assert 'prior breakout' in reason.lower()
+
+
+def test_breakout_retest_fails_when_price_collapses_below_breakout_level() -> None:
+    candles = build_breakout_retest_candles(
+        breakout_close_offset=0.24,
+        retest_low_below_breakout=1.35,
+        retest_close_offset=-1.1,
+        signal_close_offset=0.2,
+    )
+    metrics = build_candle_metrics(candles)
+    details: dict[str, object] = {}
+
+    is_ready, reason = template_evaluation_service._evaluate_breakout_retest(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        interval_minutes=60,
+        details=details,
+    )
+
+    assert is_ready is False
+    assert 'collapsed below the breakout level' in reason.lower()
+
+
+def test_breakout_retest_passes_when_retest_holds_above_breakout_level() -> None:
+    candles = build_breakout_retest_candles()
+    metrics = build_candle_metrics(candles)
+    details: dict[str, object] = {}
+
+    is_ready, reason = template_evaluation_service._evaluate_breakout_retest(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        interval_minutes=60,
+        details=details,
+    )
+
+    assert metrics['atr14'] is not None
+    assert is_ready is True
+    assert 'confirmed' in reason.lower()
+    assert details['retestDistance'] <= details['retestDistanceLimit']
+
+
+def test_breakout_retest_allows_deeper_crypto_retests_than_stocks() -> None:
+    candles = build_breakout_retest_candles(retest_low_below_breakout=0.8, retest_close_offset=0.02, signal_close_offset=0.24)
+    metrics = build_candle_metrics(candles)
+    stock_details: dict[str, object] = {}
+    crypto_details: dict[str, object] = {}
+
+    stock_ready, _ = template_evaluation_service._evaluate_breakout_retest(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        interval_minutes=60,
+        details=stock_details,
+    )
+    crypto_ready, _ = template_evaluation_service._evaluate_breakout_retest(
+        metrics=metrics,
+        scope='crypto_only',
+        candles=candles,
+        interval_minutes=60,
+        details=crypto_details,
+    )
+
+    assert stock_ready is False
+    assert crypto_ready is True
+    assert stock_details['retestDistanceLimit'] < crypto_details['retestDistanceLimit']
+
+
+def test_stock_range_breakout_uses_orb_and_requires_close_confirmation(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['setup_template'] = 'range_breakout'
+        payload['bot_payload']['symbols'][0]['bot_timeframes'] = ['5m', '15m']
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 100.2,
+                'prevclose': 99.8,
+                'open': 99.9,
+                'volume': 1_500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+
+        wick_only = build_stock_orb_candles(breakout='wick_only')
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=5, start=None, end=None, session_filter='open', timeout=None: wick_only,
+        )
+        template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+        assert monitor_row.latest_decision_state == WAITING_FOR_SETUP
+        assert 'not closed above' in monitor_row.latest_decision_reason
+
+        confirmed = build_stock_orb_candles(breakout='confirmed')
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=5, start=None, end=None, session_filter='open', timeout=None: confirmed,
+        )
+        template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
+        db.refresh(monitor_row)
+        details = monitor_row.decision_context_json['latestEvaluation']['details']
+
+        assert monitor_row.latest_decision_state == ENTRY_CANDIDATE
+        assert details['openingRangeAvailable'] is True
+        assert details['openingRangeHigh'] is not None
+
+
+def test_stock_range_breakout_rejects_when_only_near_resistance(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['setup_template'] = 'range_breakout'
+        payload['bot_payload']['symbols'][0]['bot_timeframes'] = ['1h']
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 100.0,
+                'prevclose': 99.8,
+                'open': 99.9,
+                'volume': 1_500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=60, start=None, end=None, session_filter='open', timeout=None: build_range_breakout_candles(
+                interval_minutes=interval_minutes,
+                breakout='near',
+            ),
+        )
+
+        template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+
+        assert monitor_row.latest_decision_state == WAITING_FOR_SETUP
+        assert 'not above consolidation resistance' in monitor_row.latest_decision_reason
+
+
+def test_crypto_range_breakout_uses_consolidation_not_orb(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_crypto_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['setup_template'] = 'range_breakout'
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['BTC']
+        payload['ui_payload']['symbol_context'] = {'BTC': payload['ui_payload']['symbol_context']['BTC']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        now = datetime.now(UTC)
+        monkeypatch.setattr(
+            kraken_service,
+            'resolve_pair',
+            lambda pair: KrakenPairMetadata(
+                display_pair='BTC/USD',
+                rest_pair='XBTUSD',
+                pair_key='XBTUSD',
+                ws_pair='XBT/USD',
+                altname='XBTUSD',
+            ),
+        )
+        monkeypatch.setattr(
+            kraken_service,
+            'get_ticker',
+            lambda pair: {
+                'c': ['105.0'],
+                '_fetched_at_utc': now.isoformat(),
+            },
+        )
+        monkeypatch.setattr(
+            kraken_service,
+            'get_ohlc',
+            lambda pair, interval=15, limit=60: build_range_breakout_candles(interval_minutes=interval, breakout='confirmed'),
+        )
+
+        template_evaluation_service.evaluate_scope(db, scope='crypto_only', force=True)
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'BTC').one()
+        details = monitor_row.decision_context_json['latestEvaluation']['details']
+
+        assert monitor_row.latest_decision_state == ENTRY_CANDIDATE
+        assert details.get('openingRangeAvailable') in {None, False}
+        assert details['atr14'] is not None
+        assert 'consolidation breakout confirmed' in monitor_row.latest_decision_reason.lower()
+
+
+def test_template_evaluator_rejects_when_completed_candle_history_is_insufficient(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][1]]
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['MSFT']
+        payload['ui_payload']['symbol_context'] = {'MSFT': payload['ui_payload']['symbol_context']['MSFT']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 100.0,
+                'prevclose': 99.0,
+                'open': 99.5,
+                'volume': 500_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=5, start=None, end=None, session_filter='open', timeout=None: build_trend_candles(
+                count=12,
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
+        )
+
+        template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'MSFT').one()
+
+        assert monitor_row.latest_decision_state == WAITING_FOR_SETUP
+        assert 'below the required minimum' in monitor_row.latest_decision_reason
 
 
 def test_template_evaluator_keeps_managed_only_rows_in_monitor_only(tmp_path, monkeypatch) -> None:
@@ -1129,6 +1890,14 @@ def test_template_evaluator_keeps_managed_only_rows_in_monitor_only(tmp_path, mo
                 '_fetched_at_utc': datetime.now(UTC).isoformat(),
             },
         )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=5, start=None, end=None, session_filter='open', timeout=None: build_trend_candles(
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
+        )
 
         template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
         managed_row = next(row for row in watchlist_service.get_monitoring_snapshot(db, scope='stocks_only')['rows'] if row['symbol'] == 'AAPL')
@@ -1158,6 +1927,14 @@ def test_watchlist_evaluate_endpoint_returns_runner_summary(tmp_path, monkeypatc
                 'volume': 2_500_000,
                 '_fetched_at_utc': datetime.now(UTC).isoformat(),
             },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=15, start=None, end=None, session_filter='open', timeout=None: build_pullback_reclaim_candles(
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
         )
         monkeypatch.setattr(settings, 'ADMIN_API_TOKEN', 'phase44-token', raising=False)
 
@@ -1246,6 +2023,14 @@ def test_due_run_orchestrator_evaluates_only_due_active_rows(tmp_path, monkeypat
                 '_fetched_at_utc': datetime.now(UTC).isoformat(),
             },
         )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=5, start=None, end=None, session_filter='open', timeout=None: build_trend_candles(
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
+        )
 
         result = watchlist_monitoring_orchestrator.run_due_once(db, scope='stocks_only', limit_per_scope=10)
         db.refresh(active_msft)
@@ -1315,6 +2100,14 @@ def test_watchlist_orchestration_endpoint_reports_due_counts_and_runtime_state(t
                 'volume': 2_500_000,
                 '_fetched_at_utc': datetime.now(UTC).isoformat(),
             },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=15, start=None, end=None, session_filter='open', timeout=None: build_trend_candles(
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
         )
 
         with TestClient(app) as client:
@@ -3353,6 +4146,14 @@ def test_due_run_submits_watchlist_entry_candidates_into_order_intents(tmp_path,
         )
         monkeypatch.setattr(
             tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=15, start=None, end=None, session_filter='open', timeout=None: build_pullback_reclaim_candles(
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
+        )
+        monkeypatch.setattr(
+            tradier_client,
             'place_order_sync',
             lambda ticker, qty, side, mode=None, order_type='market', duration='day': {
                 'order': {'id': 'watch-ord-1', 'status': 'open', 'quantity': qty},
@@ -3459,6 +4260,14 @@ def test_due_run_skips_watchlist_entry_when_open_position_exists(tmp_path, monke
                 'volume': 2_500_000,
                 '_fetched_at_utc': datetime.now(UTC).isoformat(),
             },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=15, start=None, end=None, session_filter='open', timeout=None: build_pullback_reclaim_candles(
+                interval_minutes=interval_minutes,
+                start_price=100.0,
+            ),
         )
 
         result = watchlist_monitoring_orchestrator.run_due_once(db, scope='stocks_only', limit_per_scope=10)
@@ -3586,14 +4395,16 @@ def test_due_run_executes_crypto_watchlist_entry_into_paper_ledger(tmp_path, mon
         )
         monkeypatch.setattr(
             'app.services.watchlist_monitoring.kraken_service.get_ohlc',
-            lambda pair, interval=15, limit=25: [
-                {'timestamp': 1, 'open': 68000.0, 'high': 69000.0, 'low': 67500.0, 'close': 68500.0, 'vwap': 68500.0, 'volume': 10.0, 'count': 1},
-                {'timestamp': 2, 'open': 68500.0, 'high': 69500.0, 'low': 68000.0, 'close': 69000.0, 'vwap': 69000.0, 'volume': 11.0, 'count': 1},
-                {'timestamp': 3, 'open': 69000.0, 'high': 70000.0, 'low': 68800.0, 'close': 69500.0, 'vwap': 69500.0, 'volume': 12.0, 'count': 1},
-                {'timestamp': 4, 'open': 69500.0, 'high': 70500.0, 'low': 69200.0, 'close': 69800.0, 'vwap': 69800.0, 'volume': 13.0, 'count': 1},
-                {'timestamp': 5, 'open': 69800.0, 'high': 71000.0, 'low': 69700.0, 'close': 70000.0, 'vwap': 70000.0, 'volume': 14.0, 'count': 1},
-                {'timestamp': 6, 'open': 70000.0, 'high': 71200.0, 'low': 69900.0, 'close': 70500.0, 'vwap': 70500.0, 'volume': 15.0, 'count': 1},
-            ],
+            lambda pair, interval=15, limit=25: build_trend_candles(
+                count=40,
+                interval_minutes=interval,
+                start_price=68000.0,
+                drift=90.0,
+                close_offset=55.0,
+                wick=30.0,
+                base_volume=10.0,
+                last_volume_multiplier=1.4,
+            ),
         )
         original_balance = crypto_ledger.balance
         original_positions = dict(crypto_ledger.positions)
@@ -4242,14 +5053,16 @@ def test_crypto_exit_sets_cooldown_and_blocks_immediate_reentry(tmp_path, monkey
         )
         monkeypatch.setattr(
             'app.services.watchlist_monitoring.kraken_service.get_ohlc',
-            lambda pair, interval=15, limit=25: [
-                {'timestamp': 1, 'open': 68000.0, 'high': 69000.0, 'low': 67500.0, 'close': 68500.0, 'vwap': 68500.0, 'volume': 10.0, 'count': 1},
-                {'timestamp': 2, 'open': 68500.0, 'high': 69500.0, 'low': 68000.0, 'close': 69000.0, 'vwap': 69000.0, 'volume': 11.0, 'count': 1},
-                {'timestamp': 3, 'open': 69000.0, 'high': 70000.0, 'low': 68800.0, 'close': 69500.0, 'vwap': 69500.0, 'volume': 12.0, 'count': 1},
-                {'timestamp': 4, 'open': 69500.0, 'high': 70500.0, 'low': 69200.0, 'close': 69800.0, 'vwap': 69800.0, 'volume': 13.0, 'count': 1},
-                {'timestamp': 5, 'open': 69800.0, 'high': 71000.0, 'low': 69700.0, 'close': 70000.0, 'vwap': 70000.0, 'volume': 14.0, 'count': 1},
-                {'timestamp': 6, 'open': 70000.0, 'high': 71200.0, 'low': 69900.0, 'close': 70500.0, 'vwap': 70500.0, 'volume': 15.0, 'count': 1},
-            ],
+            lambda pair, interval=15, limit=25: build_trend_candles(
+                count=40,
+                interval_minutes=interval,
+                start_price=68000.0,
+                drift=90.0,
+                close_offset=55.0,
+                wick=30.0,
+                base_volume=10.0,
+                last_volume_multiplier=1.4,
+            ),
         )
         monkeypatch.setattr(
             'app.services.watchlist_exit_worker.kraken_service.resolve_pair',
