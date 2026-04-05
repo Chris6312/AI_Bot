@@ -39,12 +39,13 @@ TIMEFRAME_TO_KRAKEN_INTERVAL = {
     '1d': 1440,
 }
 
-MIN_COMPLETED_CANDLES = 40
+MIN_COMPLETED_CANDLES = 50
 PREFERRED_COMPLETED_CANDLES = 50
 STOCK_CANDLE_LOOKBACK_DAYS = 5
 TREND_VOLUME_CONFIRMATION_MULTIPLIER = 1.1
 BREAKOUT_VOLUME_CONFIRMATION_MULTIPLIER = 1.2
 PHASE2_VOLUME_CONFIRMATION_MULTIPLIER = 1.05
+MEAN_REVERSION_VOLUME_CONFIRMATION_MULTIPLIER = 1.0
 STOCK_TREND_EXTENSION_ATR_MULTIPLIER = 1.25
 CRYPTO_TREND_EXTENSION_ATR_MULTIPLIER = 1.5
 STOCK_BREAKOUT_RANGE_ATR_MULTIPLIER = 1.25
@@ -55,6 +56,8 @@ STOCK_BREAKOUT_RETEST_ATR_MULTIPLIER = 1.0
 CRYPTO_BREAKOUT_RETEST_ATR_MULTIPLIER = 1.5
 STOCK_PULLBACK_SMA10_TOLERANCE_ATR_MULTIPLIER = 0.25
 CRYPTO_PULLBACK_SMA10_TOLERANCE_ATR_MULTIPLIER = 0.5
+STOCK_MEAN_REVERSION_DEVIATION_RATIO = 1.2
+CRYPTO_MEAN_REVERSION_DEVIATION_RATIO = 1.5
 
 
 def _coerce_candle_float(value: Any) -> float | None:
@@ -135,6 +138,7 @@ def build_candle_metrics(candles: list[dict[str, Any]]) -> dict[str, Any]:
         'recent_low': None,
         'sma5': None,
         'sma10': None,
+        'sma20': None,
         'avg_volume_10': None,
         'range_high': None,
         'range_low': None,
@@ -146,6 +150,10 @@ def build_candle_metrics(candles: list[dict[str, Any]]) -> dict[str, Any]:
         'last_low': signal_candle['low'] if signal_candle is not None else None,
         'latest_volume': signal_candle['volume'] if signal_candle is not None else None,
         'signalAtUtc': signal_candle['datetime'] if signal_candle is not None else None,
+        'price_deviation': None,
+        'price_deviation_ratio': None,
+        'recent_swing_low': None,
+        'reversal_signal': None,
     }
     if len(ordered) < MIN_COMPLETED_CANDLES:
         return details
@@ -157,10 +165,13 @@ def build_candle_metrics(candles: list[dict[str, Any]]) -> dict[str, Any]:
 
     sma5_window = ordered[-5:]
     sma10_window = ordered[-10:]
+    sma20_window = ordered[-20:]
     recent_high = max(item['high'] for item in structure_window)
     recent_low = min(item['low'] for item in structure_window)
     sma5 = sum(item['close'] for item in sma5_window) / 5.0
     sma10 = sum(item['close'] for item in sma10_window) / 10.0
+    sma20 = sum(item['close'] for item in sma20_window) / 20.0
+    recent_swing_low = min(item['low'] for item in sma5_window)
 
     volume_window = ordered[-10:]
     volume_values = [item['volume'] for item in volume_window if item['volume'] is not None]
@@ -178,19 +189,35 @@ def build_candle_metrics(candles: list[dict[str, Any]]) -> dict[str, Any]:
             )
         )
     atr14 = (sum(true_ranges[-14:]) / 14.0) if len(true_ranges) >= 14 else None
+    last_price = signal_candle['close'] if signal_candle is not None else None
+    open_price = signal_candle['open'] if signal_candle is not None else None
+    prev_close = previous_candle['close'] if previous_candle is not None else None
+    price_deviation = (last_price - sma20) if last_price is not None else None
+    price_deviation_ratio = (abs(price_deviation) / atr14) if price_deviation is not None and atr14 else None
+    reversal_signal = bool(
+        signal_candle is not None
+        and previous_candle is not None
+        and signal_candle['close'] > previous_candle['close']
+        and signal_candle['close'] > float(open_price or 0.0)
+    )
 
     details.update(
         {
-            'ready': atr14 is not None,
+            'ready': atr14 is not None and sma20 is not None,
             'recent_high': recent_high,
             'recent_low': recent_low,
             'sma5': sma5,
             'sma10': sma10,
+            'sma20': sma20,
             'avg_volume_10': avg_volume_10,
             'range_high': recent_high,
             'range_low': recent_low,
             'atr14': atr14,
             'range_width': recent_high - recent_low,
+            'price_deviation': price_deviation,
+            'price_deviation_ratio': price_deviation_ratio,
+            'recent_swing_low': recent_swing_low,
+            'reversal_signal': reversal_signal,
         }
     )
     return details
@@ -605,10 +632,12 @@ class TemplateEvaluationService:
                 details=details,
             )
         elif template == 'mean_reversion_bounce':
-            bounce_floor = min(recent_low, sma10)
-            is_ready = change_pct >= (-1.5 - threshold_bias) and last_price >= bounce_floor and last_price >= open_price
-            reason = 'Mean reversion bounce is stabilizing off recent pressure.' if is_ready else 'Mean reversion bounce has not stabilized yet.'
-            details['bounceFloor'] = round(bounce_floor, 6)
+            is_ready, reason = self._evaluate_mean_reversion_bounce(
+                metrics=metrics,
+                scope=scope,
+                candles=candles,
+                details=details,
+            )
         elif template == 'range_breakout':
             is_ready, reason = self._evaluate_range_breakout(
                 metrics=metrics,
@@ -683,6 +712,89 @@ class TemplateEvaluationService:
         if not not_overextended:
             return False, 'Trend continuation rejected: price is too extended above SMA5 relative to ATR14.'
         return True, 'Trend continuation confirmed from completed candle structure.'
+
+    def _evaluate_mean_reversion_bounce(
+        self,
+        *,
+        metrics: dict[str, Any],
+        scope: str,
+        candles: list[dict[str, Any]],
+        details: dict[str, Any],
+    ) -> tuple[bool, str]:
+        atr14 = self._safe_float(metrics.get('atr14'))
+        sma5 = self._safe_float(metrics.get('sma5'))
+        sma10 = self._safe_float(metrics.get('sma10'))
+        sma20 = self._safe_float(metrics.get('sma20'))
+        last_price = self._safe_float(metrics.get('last_price'))
+        prev_close = self._safe_float(metrics.get('prev_close'))
+        open_price = self._safe_float(metrics.get('open_price'))
+        price_deviation = self._safe_float(metrics.get('price_deviation'))
+        price_deviation_ratio = self._safe_float(metrics.get('price_deviation_ratio'))
+        recent_swing_low = self._safe_float(metrics.get('recent_swing_low'))
+        reversal_signal = bool(metrics.get('reversal_signal'))
+        avg_volume_10 = metrics.get('avg_volume_10')
+        latest_volume = metrics.get('latest_volume')
+
+        if atr14 <= 0:
+            return False, 'Mean reversion bounce requires ATR14 from completed candles.'
+        if sma20 <= 0:
+            return False, 'Mean reversion bounce requires SMA20 from completed candles.'
+
+        ordered = _normalize_candle_series(candles)
+        if len(ordered) < MIN_COMPLETED_CANDLES:
+            return False, 'Mean reversion bounce requires at least 50 completed candles.'
+
+        threshold = (
+            STOCK_MEAN_REVERSION_DEVIATION_RATIO
+            if scope == 'stocks_only'
+            else CRYPTO_MEAN_REVERSION_DEVIATION_RATIO
+        )
+        volume_ok = self._volume_confirmation_ok(
+            avg_volume_10=avg_volume_10,
+            latest_volume=latest_volume,
+            multiplier=MEAN_REVERSION_VOLUME_CONFIRMATION_MULTIPLIER,
+        )
+        swing_window = ordered[-5:]
+        swing_low_offset = min(range(len(swing_window)), key=lambda index: swing_window[index]['low'])
+        swing_low_age_candles = (len(swing_window) - 1) - swing_low_offset
+        swing_low_formed = swing_low_age_candles >= 1
+        recent_closes = [float(candle['close']) for candle in swing_window]
+        downward_close_count = sum(
+            1 for index in range(1, len(recent_closes)) if recent_closes[index] < recent_closes[index - 1]
+        )
+        recent_net_momentum = recent_closes[-1] - recent_closes[0]
+        trend_collapse = (
+            sma5 < (sma10 - (atr14 * 0.2))
+            and downward_close_count >= 3
+            and recent_net_momentum < -(atr14 * 0.5)
+        )
+        price_recovery_started = last_price > recent_swing_low and last_price > prev_close and last_price > open_price
+
+        details['meanReversionDeviationRatioThreshold'] = round(threshold, 6)
+        details['meanReversionVolumeConfirmationPassed'] = volume_ok
+        details['recentSwingLowAgeCandles'] = swing_low_age_candles
+        details['meanReversionDownwardCloseCount'] = downward_close_count
+        details['meanReversionNetMomentum'] = round(recent_net_momentum, 6)
+        details['meanReversionTrendCollapseGuard'] = trend_collapse
+        details['meanReversionBelowSma20'] = last_price < sma20
+
+        if last_price >= sma20:
+            return False, 'Mean reversion bounce rejected: price is not below SMA20.'
+        if price_deviation >= 0:
+            return False, 'Mean reversion bounce rejected: price deviation is not oversold.'
+        if price_deviation_ratio < threshold:
+            return False, 'Mean reversion bounce rejected: price deviation from SMA20 is too small relative to ATR14.'
+        if not reversal_signal:
+            return False, 'Mean reversion bounce rejected: no bullish reversal candle is present yet.'
+        if not swing_low_formed:
+            return False, 'Mean reversion bounce rejected: recent swing low has not formed before the signal candle.'
+        if not price_recovery_started:
+            return False, 'Mean reversion bounce rejected: price is still falling after the oversold deviation.'
+        if not volume_ok:
+            return False, 'Mean reversion bounce rejected: latest volume is below the 10-candle average.'
+        if trend_collapse:
+            return False, 'Mean reversion bounce rejected: short-term trend collapse remains too strong.'
+        return True, 'Mean reversion bounce confirmed from oversold deviation, reversal candle, and recovery structure.'
 
     def _evaluate_pullback_reclaim(
         self,
@@ -1270,14 +1382,19 @@ class TemplateEvaluationService:
             ('recent_low', 'recentLow', 6),
             ('sma5', 'sma5', 6),
             ('sma10', 'sma10', 6),
+            ('sma20', 'sma20', 6),
             ('avg_volume_10', 'avgVolume10', 6),
             ('range_high', 'rangeHigh', 6),
             ('range_low', 'rangeLow', 6),
             ('range_width', 'rangeWidth', 6),
             ('atr14', 'atr14', 6),
+            ('price_deviation', 'priceDeviation', 6),
+            ('price_deviation_ratio', 'priceDeviationRatio', 6),
+            ('recent_swing_low', 'recentSwingLow', 6),
         ):
             value = metrics.get(source_key)
             details[target_key] = round(float(value), decimals) if value is not None else None
+        details['reversalSignal'] = bool(metrics.get('reversal_signal')) if metrics.get('reversal_signal') is not None else None
         signal_at_utc = metrics.get('signalAtUtc')
         details['signalAtUtc'] = signal_at_utc.isoformat() if isinstance(signal_at_utc, datetime) else None
 

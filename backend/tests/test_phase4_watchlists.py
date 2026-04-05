@@ -131,7 +131,7 @@ def build_stock_payload() -> dict:
 
 def build_trend_candles(
     *,
-    count: int = 40,
+    count: int = 50,
     interval_minutes: int = 5,
     start_price: float = 100.0,
     drift: float = 0.18,
@@ -163,7 +163,7 @@ def build_trend_candles(
 
 def build_range_breakout_candles(
     *,
-    count: int = 40,
+    count: int = 50,
     interval_minutes: int = 5,
     base_volume: float = 1000.0,
     breakout: str = 'confirmed',
@@ -250,7 +250,7 @@ def _append_test_candle(
 
 def build_pullback_reclaim_candles(
     *,
-    count: int = 40,
+    count: int = 50,
     interval_minutes: int = 15,
     start_price: float = 100.0,
     pullback_depth_below_breakout: float = 0.08,
@@ -344,7 +344,7 @@ def build_pullback_reclaim_candles(
 
 def build_breakout_retest_candles(
     *,
-    count: int = 40,
+    count: int = 50,
     interval_minutes: int = 60,
     breakout_close_offset: float = 0.24,
     retest_low_below_breakout: float = 0.05,
@@ -409,6 +409,100 @@ def build_breakout_retest_candles(
     return candles
 
 
+def build_mean_reversion_bounce_candles(
+    *,
+    count: int = 50,
+    interval_minutes: int = 15,
+    start_price: float = 100.0,
+    drift: float = 0.04,
+    base_volume: float = 1000.0,
+    oversold_depth: float = 1.0,
+    signal_recovery_offset: float = 0.12,
+    signal_mode: str = 'confirmed',
+    last_volume_multiplier: float = 1.1,
+) -> list[dict[str, float | int]]:
+    started_at = datetime.now(UTC) - timedelta(minutes=interval_minutes * (count + 6))
+    candles: list[dict[str, float | int]] = []
+    price = start_price
+
+    for index in range(count - 5):
+        open_price = price
+        close_price = open_price + 0.03
+        _append_test_candle(
+            candles,
+            started_at=started_at,
+            interval_minutes=interval_minutes,
+            index=index,
+            open_price=open_price,
+            high_price=close_price + 0.08,
+            low_price=open_price - 0.08,
+            close_price=close_price,
+            volume=base_volume,
+        )
+        price += drift
+
+    anchor = float(candles[-1]['close'])
+    base_index = len(candles)
+    sequence = [
+        (anchor - 0.02, anchor + 0.03, anchor - 0.14, anchor - 0.08, base_volume),
+        (anchor - 0.08, anchor - 0.01, anchor - 0.34, anchor - 0.28, base_volume),
+        (anchor - 0.28, anchor - 0.18, anchor - oversold_depth - 0.08, anchor - oversold_depth, base_volume),
+        (anchor - oversold_depth + 0.02, anchor - oversold_depth + 0.15, anchor - oversold_depth - 0.02, anchor - oversold_depth + 0.1, base_volume),
+    ]
+    for offset, (open_price, high_price, low_price, close_price, volume) in enumerate(sequence):
+        _append_test_candle(
+            candles,
+            started_at=started_at,
+            interval_minutes=interval_minutes,
+            index=base_index + offset,
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            close_price=close_price,
+            volume=volume,
+        )
+
+    prior_close = float(candles[-1]['close'])
+    if signal_mode == 'confirmed':
+        signal = {
+            'open_price': prior_close - 0.03,
+            'high_price': anchor - oversold_depth + signal_recovery_offset + 0.08,
+            'low_price': prior_close - 0.07,
+            'close_price': anchor - oversold_depth + signal_recovery_offset,
+            'volume': base_volume * last_volume_multiplier,
+        }
+    elif signal_mode == 'falling':
+        signal = {
+            'open_price': prior_close + 0.04,
+            'high_price': prior_close + 0.08,
+            'low_price': prior_close - 0.2,
+            'close_price': prior_close - 0.14,
+            'volume': base_volume,
+        }
+    else:
+        signal_close = anchor - oversold_depth + signal_recovery_offset
+        signal = {
+            'open_price': signal_close - 0.02,
+            'high_price': signal_close + 0.06,
+            'low_price': signal_close - 0.06,
+            'close_price': signal_close,
+            'volume': base_volume * last_volume_multiplier,
+        }
+
+    _append_test_candle(
+        candles,
+        started_at=started_at,
+        interval_minutes=interval_minutes,
+        index=base_index + 4,
+        open_price=signal['open_price'],
+        high_price=signal['high_price'],
+        low_price=signal['low_price'],
+        close_price=signal['close_price'],
+        volume=signal['volume'],
+    )
+    return candles
+
+
 def build_stock_orb_candles(*, breakout: str = 'confirmed') -> list[dict[str, float | int]]:
     et = ZoneInfo('America/New_York')
     session_start_et = (datetime.now(et) - timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
@@ -430,7 +524,7 @@ def build_stock_orb_candles(*, breakout: str = 'confirmed') -> list[dict[str, fl
             }
         )
 
-    for index in range(3, 39):
+    for index in range(3, 49):
         open_price = 99.9 + ((index - 3) * 0.003)
         close_price = open_price + 0.01
         candles.append(
@@ -453,7 +547,7 @@ def build_stock_orb_candles(*, breakout: str = 'confirmed') -> list[dict[str, fl
 
     candles.append(
         {
-            'timestamp': int((session_start_et + timedelta(minutes=5 * 39)).astimezone(UTC).timestamp()),
+            'timestamp': int((session_start_et + timedelta(minutes=5 * 49)).astimezone(UTC).timestamp()),
             **signal,
         }
     )
@@ -1668,6 +1762,136 @@ def test_breakout_retest_allows_deeper_crypto_retests_than_stocks() -> None:
     assert stock_ready is False
     assert crypto_ready is True
     assert stock_details['retestDistanceLimit'] < crypto_details['retestDistanceLimit']
+
+
+def test_mean_reversion_bounce_fails_when_price_is_near_sma20() -> None:
+    candles = build_mean_reversion_bounce_candles(
+        oversold_depth=0.65,
+        signal_recovery_offset=0.12,
+        signal_mode='confirmed',
+    )
+    metrics = build_candle_metrics(candles)
+    details: dict[str, object] = {}
+
+    is_ready, reason = template_evaluation_service._evaluate_mean_reversion_bounce(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        details=details,
+    )
+
+    assert is_ready is False
+    assert metrics['sma20'] is not None
+    assert metrics['price_deviation_ratio'] is not None
+    assert 'too small' in reason.lower()
+
+
+def test_mean_reversion_bounce_fails_when_price_is_still_falling() -> None:
+    candles = build_mean_reversion_bounce_candles(signal_mode='falling')
+    metrics = build_candle_metrics(candles)
+    details: dict[str, object] = {}
+
+    is_ready, reason = template_evaluation_service._evaluate_mean_reversion_bounce(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        details=details,
+    )
+
+    assert is_ready is False
+    assert metrics['reversal_signal'] is False
+    assert 'reversal candle' in reason.lower()
+
+
+def test_mean_reversion_bounce_passes_when_price_recovers_from_oversold() -> None:
+    candles = build_mean_reversion_bounce_candles()
+    metrics = build_candle_metrics(candles)
+    details: dict[str, object] = {}
+
+    is_ready, reason = template_evaluation_service._evaluate_mean_reversion_bounce(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        details=details,
+    )
+
+    assert is_ready is True
+    assert metrics['atr14'] is not None
+    assert metrics['price_deviation_ratio'] is not None
+    assert details['meanReversionDeviationRatioThreshold'] == 1.2
+    assert 'confirmed' in reason.lower()
+
+
+def test_mean_reversion_bounce_requires_larger_crypto_deviation_than_stocks() -> None:
+    candles = build_mean_reversion_bounce_candles(
+        oversold_depth=0.76,
+        signal_recovery_offset=0.12,
+        signal_mode='confirmed',
+    )
+    metrics = build_candle_metrics(candles)
+    stock_details: dict[str, object] = {}
+    crypto_details: dict[str, object] = {}
+
+    stock_ready, _ = template_evaluation_service._evaluate_mean_reversion_bounce(
+        metrics=metrics,
+        scope='stocks_only',
+        candles=candles,
+        details=stock_details,
+    )
+    crypto_ready, crypto_reason = template_evaluation_service._evaluate_mean_reversion_bounce(
+        metrics=metrics,
+        scope='crypto_only',
+        candles=candles,
+        details=crypto_details,
+    )
+
+    assert stock_ready is True
+    assert crypto_ready is False
+    assert stock_details['meanReversionDeviationRatioThreshold'] < crypto_details['meanReversionDeviationRatioThreshold']
+    assert 'too small' in crypto_reason.lower()
+
+
+def test_stock_mean_reversion_evaluator_includes_atr14_in_details(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        payload = build_stock_payload()
+        payload['bot_payload']['symbols'] = [payload['bot_payload']['symbols'][0]]
+        payload['bot_payload']['symbols'][0]['setup_template'] = 'mean_reversion_bounce'
+        payload['bot_payload']['symbols'][0]['bot_timeframes'] = ['15m']
+        payload['ui_payload']['summary']['selected_count'] = 1
+        payload['ui_payload']['summary']['primary_focus'] = ['AAPL']
+        payload['ui_payload']['symbol_context'] = {'AAPL': payload['ui_payload']['symbol_context']['AAPL']}
+        watchlist_service.ingest_watchlist(db, payload, source='api')
+
+        monkeypatch.setattr(
+            tradier_client,
+            'get_quote_sync',
+            lambda symbol, mode=None: {
+                'symbol': symbol,
+                'last': 100.0,
+                'prevclose': 100.0,
+                'open': 100.0,
+                'volume': 1_000_000,
+                '_fetched_at_utc': datetime.now(UTC).isoformat(),
+            },
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_timesales_sync',
+            lambda symbol, mode=None, interval_minutes=15, start=None, end=None, session_filter='open', timeout=None: build_mean_reversion_bounce_candles(
+                interval_minutes=interval_minutes,
+            ),
+        )
+
+        template_evaluation_service.evaluate_scope(db, scope='stocks_only', force=True)
+        monitor_row = db.query(WatchlistMonitorState).filter(WatchlistMonitorState.symbol == 'AAPL').one()
+        details = monitor_row.decision_context_json['latestEvaluation']['details']
+
+        assert monitor_row.latest_decision_state == ENTRY_CANDIDATE
+        assert details['atr14'] is not None
+        assert details['sma20'] is not None
+        assert details['priceDeviationRatio'] is not None
+        assert details['reversalSignal'] is True
 
 
 def test_stock_range_breakout_uses_orb_and_requires_close_confirmation(tmp_path, monkeypatch) -> None:
@@ -4396,7 +4620,7 @@ def test_due_run_executes_crypto_watchlist_entry_into_paper_ledger(tmp_path, mon
         monkeypatch.setattr(
             'app.services.watchlist_monitoring.kraken_service.get_ohlc',
             lambda pair, interval=15, limit=25: build_trend_candles(
-                count=40,
+                count=50,
                 interval_minutes=interval,
                 start_price=68000.0,
                 drift=90.0,
@@ -5054,7 +5278,7 @@ def test_crypto_exit_sets_cooldown_and_blocks_immediate_reentry(tmp_path, monkey
         monkeypatch.setattr(
             'app.services.watchlist_monitoring.kraken_service.get_ohlc',
             lambda pair, interval=15, limit=25: build_trend_candles(
-                count=40,
+                count=50,
                 interval_minutes=interval,
                 start_price=68000.0,
                 drift=90.0,
