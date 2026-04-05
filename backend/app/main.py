@@ -456,7 +456,7 @@ async def get_unified_positions(db: Session = Depends(get_db)):
         )
         for key in stock_keys
     ]
-    crypto_rows = [_serialize_unified_crypto_position(row) for row in crypto_ledger.get_positions(db=db)]
+    crypto_rows = [_serialize_unified_crypto_position(row) for row in crypto_ledger.get_positions()]
     rows = sorted(stock_rows + crypto_rows, key=lambda row: (-float(row.get('marketValue') or 0.0), str(row.get('displaySymbol') or '')))
     stock_drift_count = sum(1 for row in stock_rows if row['sourceStatus'] != 'aligned')
     return {

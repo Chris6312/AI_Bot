@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -49,6 +49,35 @@ def _extract_collection(payload: Any, *path: str) -> list[dict[str, Any]]:
             return _normalize_to_list(current)
         return []
     return _normalize_to_list(current)
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value in (None, ''):
+        return None
+    if isinstance(value, datetime):
+        result = value
+    elif isinstance(value, (int, float)):
+        result = datetime.fromtimestamp(float(value), tz=timezone.utc)
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        try:
+            result = datetime.fromisoformat(text)
+        except ValueError:
+            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+                try:
+                    result = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                return None
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
 
 class TradierClient:
     def __init__(self) -> None:
@@ -170,6 +199,85 @@ class TradierClient:
     async def get_quote_async(self, ticker: str, mode: str | None = None) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.get_quote_sync, ticker, mode)
+
+    def get_timesales_sync(
+        self,
+        symbol: str,
+        *,
+        interval_minutes: int = 5,
+        mode: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        session_filter: str = 'open',
+        timeout: float | None = None,
+    ) -> list[dict[str, Any]]:
+        interval_labels = {
+            1: '1min',
+            5: '5min',
+            10: '10min',
+            15: '15min',
+            30: '30min',
+            60: '1hour',
+        }
+        target_symbol = str(symbol or '').upper().strip()
+        if not target_symbol:
+            return []
+
+        end_at = _parse_datetime(end) or datetime.now(timezone.utc)
+        start_at = _parse_datetime(start) or (end_at - timedelta(days=5))
+        payload = self._request_json(
+            'GET',
+            'markets/timesales',
+            mode=mode,
+            params={
+                'symbol': target_symbol,
+                'interval': interval_labels.get(max(1, int(interval_minutes)), '5min'),
+                'start': start_at.strftime('%Y-%m-%d %H:%M'),
+                'end': end_at.strftime('%Y-%m-%d %H:%M'),
+                'session_filter': session_filter,
+            },
+            timeout=timeout,
+        )
+        raw_bars = _extract_collection(payload, 'series', 'data')
+        candles: list[dict[str, Any]] = []
+        for bar in raw_bars:
+            timestamp = _parse_datetime(bar.get('time') or bar.get('timestamp') or bar.get('datetime') or bar.get('date'))
+            if timestamp is None:
+                continue
+            candles.append(
+                {
+                    'timestamp': int(timestamp.timestamp()),
+                    'open': _coalesce_numeric(bar, ['open']),
+                    'high': _coalesce_numeric(bar, ['high']),
+                    'low': _coalesce_numeric(bar, ['low']),
+                    'close': _coalesce_numeric(bar, ['close']),
+                    'volume': bar.get('volume') if bar.get('volume') not in (None, '') else None,
+                }
+            )
+        return candles
+
+    async def get_timesales_async(
+        self,
+        symbol: str,
+        *,
+        interval_minutes: int = 5,
+        mode: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        session_filter: str = 'open',
+    ) -> list[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.get_timesales_sync(
+                symbol,
+                interval_minutes=interval_minutes,
+                mode=mode,
+                start=start,
+                end=end,
+                session_filter=session_filter,
+            ),
+        )
 
     def place_order_sync(
         self,
