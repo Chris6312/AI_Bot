@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
@@ -69,6 +70,7 @@ class WatchlistExitWorkerService:
         snapshot = self._build_scope_snapshot(db, scope="stocks_only", observed_at=observed_at)
         rows = list(snapshot.get("rows") or [])
         status_rows = [self._build_status_row(db, row) for row in rows]
+        status_rows = [row for row in status_rows if row.get("exitTrigger") or row.get("exitAlreadyInProgress")]
         candidate_exit_count = sum(1 for row in status_rows if not row.get("exitAlreadyInProgress"))
         blocked_expired_count = sum(1 for row in status_rows if row.get("positionState", {}).get("positionExpired") and row.get("reason") == "STOCK_SESSION_CLOSED")
         eligible_expired_count = sum(1 for row in status_rows if row.get("positionState", {}).get("positionExpired") and row.get("reason") != "STOCK_SESSION_CLOSED")
@@ -90,7 +92,7 @@ class WatchlistExitWorkerService:
         }
 
     def _build_status_row(self, db: Session, row: dict[str, Any]) -> dict[str, Any]:
-        candidate = self._build_candidate_row(db, row)
+        candidate = self._build_candidate_row(db, row, enforce_session_open=True)
         return {
             "symbol": row.get("symbol"),
             "managedOnly": bool(row.get("managedOnly")),
@@ -156,19 +158,18 @@ class WatchlistExitWorkerService:
         }
 
         for row in due_rows:
-            candidate = self._build_candidate_row(db, row)
+            candidate = self._build_candidate_row(db, row, enforce_session_open=execute)
             action = str(candidate.get("action") or "")
-            if action in {"SKIPPED", "BLOCKED"} and str(candidate.get("reason") or "") == "NO_SELLABLE_QUANTITY":
-                continue
-            if not action and not candidate.get("exitTrigger"):
+            if not candidate.get("exitTrigger"):
                 continue
             if candidate.get("positionState", {}).get("positionExpired"):
                 summary["expiredPositionCount"] += 1
-            if candidate.get("exitTrigger") in {STOP_LOSS_TRIGGER, TRAILING_STOP_TRIGGER}:
+            exit_reasons = set(candidate.get("exitReasons") or [])
+            if {STOP_LOSS_TRIGGER, TRAILING_STOP_TRIGGER}.intersection(exit_reasons) or candidate.get("exitTrigger") in {STOP_LOSS_TRIGGER, TRAILING_STOP_TRIGGER}:
                 summary["protectiveExitCount"] += 1
-            if candidate.get("exitTrigger") == PROFIT_TARGET_TRIGGER:
+            if PROFIT_TARGET_TRIGGER in exit_reasons or candidate.get("exitTrigger") == PROFIT_TARGET_TRIGGER:
                 summary["profitTargetCount"] += 1
-            if candidate.get("exitTrigger") == FOLLOW_THROUGH_TRIGGER:
+            if FOLLOW_THROUGH_TRIGGER in exit_reasons or candidate.get("exitTrigger") == FOLLOW_THROUGH_TRIGGER:
                 summary["followThroughExitCount"] += 1
 
             if not execute:
@@ -239,7 +240,15 @@ class WatchlistExitWorkerService:
 
     def _build_scope_snapshot(self, db: Session, *, scope: str, observed_at: datetime) -> dict[str, Any]:
         try:
-            return watchlist_service.get_exit_readiness_snapshot(db, scope=scope)
+            snapshot = watchlist_service.get_exit_readiness_snapshot(db, scope=scope)
+            rows = []
+            for row in list(snapshot.get("rows") or []):
+                normalized = dict(row)
+                normalized.setdefault("scope", scope)
+                rows.append(normalized)
+            snapshot = dict(snapshot)
+            snapshot["rows"] = rows
+            return snapshot
         except Exception as exc:
             logger.warning(
                 "Watchlist exit worker could not build %s exit readiness snapshot: %s",
@@ -250,17 +259,17 @@ class WatchlistExitWorkerService:
 
     @staticmethod
     def _primary_exit_trigger(row: dict[str, Any]) -> str | None:
-        exit_reasons = row.get("positionState", {}).get("exitReasons") or []
+        position_state = row.get("positionState", {}) or {}
+        exit_reasons = position_state.get("exitReasons") or position_state.get("protectiveExitReasons") or []
         if exit_reasons:
             return str(exit_reasons[0])
-        position_state = row.get("positionState", {}) or {}
         if position_state.get("stopLossBreached"):
             return STOP_LOSS_TRIGGER
         if position_state.get("trailingStopBreached"):
             return TRAILING_STOP_TRIGGER
-        if position_state.get("profitTargetReached"):
+        if position_state.get("scaleOutReady"):
             return PROFIT_TARGET_TRIGGER
-        if position_state.get("failedFollowThrough"):
+        if position_state.get("followThroughFailed") or position_state.get("failedFollowThrough"):
             return FOLLOW_THROUGH_TRIGGER
         if position_state.get("positionExpired"):
             return EXIT_TRIGGER
@@ -269,18 +278,23 @@ class WatchlistExitWorkerService:
     @staticmethod
     def _build_exit_reasons(row: dict[str, Any]) -> list[str]:
         position_state = row.get("positionState", {}) or {}
-        reasons: list[str] = []
+        seeded = list(position_state.get("exitReasons") or position_state.get("protectiveExitReasons") or [])
+        reasons: list[str] = [str(reason) for reason in seeded if str(reason or "").strip()]
         if position_state.get("stopLossBreached"):
             reasons.append(STOP_LOSS_TRIGGER)
         if position_state.get("trailingStopBreached"):
             reasons.append(TRAILING_STOP_TRIGGER)
-        if position_state.get("profitTargetReached"):
+        if position_state.get("scaleOutReady"):
             reasons.append(PROFIT_TARGET_TRIGGER)
-        if position_state.get("failedFollowThrough"):
+        if position_state.get("followThroughFailed") or position_state.get("failedFollowThrough"):
             reasons.append(FOLLOW_THROUGH_TRIGGER)
         if position_state.get("positionExpired"):
             reasons.append(EXIT_TRIGGER)
-        return reasons
+        deduped: list[str] = []
+        for reason in reasons:
+            if reason not in deduped:
+                deduped.append(reason)
+        return deduped
 
     @staticmethod
     def _determine_requested_quantity(*, trigger: str | None, available_quantity: int) -> int:
@@ -297,7 +311,7 @@ class WatchlistExitWorkerService:
         except (TypeError, ValueError):
             return 0.0
 
-    def _build_candidate_row(self, db: Session, row: dict[str, Any]) -> dict[str, Any]:
+    def _build_candidate_row(self, db: Session, row: dict[str, Any], *, enforce_session_open: bool = True) -> dict[str, Any]:
         scope = str(row.get("scope") or "stocks_only")
         if scope == "crypto_only":
             return self._build_crypto_candidate_row(db, row)
@@ -313,6 +327,7 @@ class WatchlistExitWorkerService:
             "monitoringStatus": row.get("monitoringStatus"),
             "positionId": row.get("positionState", {}).get("positionId"),
             "positionState": row.get("positionState", {}),
+            "currentPrice": self._safe_float(row.get("positionState", {}).get("currentPrice")),
             "exitTemplate": row.get("exitTemplate"),
             "exitTrigger": self._primary_exit_trigger(row),
             "exitReasons": self._build_exit_reasons(row),
@@ -342,7 +357,7 @@ class WatchlistExitWorkerService:
             payload["monitoringStatus"] = "EXIT_PENDING"
             return payload
 
-        if not bool(get_scope_session_status("stocks_only", datetime.now(UTC)).session_open):
+        if enforce_session_open and not bool(get_scope_session_status("stocks_only", datetime.now(UTC)).session_open):
             payload["action"] = "BLOCKED"
             payload["reason"] = "STOCK_SESSION_CLOSED"
             payload["monitoringStatus"] = "WAITING_FOR_MARKET_OPEN"
@@ -359,22 +374,30 @@ class WatchlistExitWorkerService:
         broker_quantity = int(broker_state.get("brokerQuantity") or 0)
         reserved_quantity = int(broker_state.get("reservedQuantity") or 0)
         available_quantity = int(broker_state.get("availableQuantity") or 0)
-        db_position = (
-            db.query(Position)
-            .filter(Position.ticker == symbol, Position.is_open.is_(True))
-            .order_by(Position.entry_time.desc(), Position.id.desc())
-            .first()
+        db_quantity = int(
+            sum(
+                int(row.shares or 0)
+                for row in db.query(Position).filter(Position.ticker == symbol, Position.is_open.is_(True)).all()
+            )
         )
-        db_quantity = int(db_position.shares or 0) if db_position is not None else 0
+        expected_quantity = db_quantity if db_quantity > 0 else broker_quantity
         return {
+            "expectedPositionQty": expected_quantity,
+            "brokerReportedQty": broker_quantity,
+            "pendingOpenOrdersQty": reserved_quantity,
+            "sellableQty": available_quantity,
             "brokerQuantity": broker_quantity,
             "reservedQuantity": reserved_quantity,
             "availableQuantity": available_quantity,
             "dbQuantity": db_quantity,
+            "dbOpenQuantity": db_quantity,
+            "pendingExitQuantity": reserved_quantity,
+            "sellableQuantity": available_quantity,
+            "quantityDelta": broker_quantity - expected_quantity,
             "requestedQuantity": available_quantity,
             "quantitySource": "BROKER_AVAILABLE",
-            "dbTruthAvailable": db_quantity > 0,
-            "driftDetected": db_quantity > 0 and broker_quantity > 0 and db_quantity != broker_quantity,
+            "dbTruthAvailable": expected_quantity > 0,
+            "driftDetected": expected_quantity > 0 and broker_quantity != expected_quantity,
         }
 
     def _get_latest_exit_intent(self, db: Session, row: dict[str, Any]) -> OrderIntent | None:
@@ -451,6 +474,13 @@ class WatchlistExitWorkerService:
 
         return status in ACTIVE_EXIT_INTENT_STATUSES
 
+    @staticmethod
+    def _call_broker_with_optional_use_cache(callable_obj: Any, *args: Any, use_cache: bool = True, **kwargs: Any) -> Any:
+        try:
+            return callable_obj(*args, use_cache=use_cache, **kwargs)
+        except TypeError:
+            return callable_obj(*args, **kwargs)
+
     @classmethod
     def _get_broker_exit_state(cls, symbol: str, *, mode: str, use_cache: bool = True) -> dict[str, Any]:
         if not tradier_client.is_ready(mode=mode):
@@ -461,13 +491,13 @@ class WatchlistExitWorkerService:
                 "pendingOrders": [],
             }
 
-        broker_quantity = int(tradier_client.get_position_quantity_sync(symbol, mode=mode, use_cache=use_cache) or 0)
-        pending_orders = tradier_client.get_orders_sync(
+        broker_quantity = int(cls._call_broker_with_optional_use_cache(tradier_client.get_position_quantity_sync, symbol, mode=mode, use_cache=use_cache) or 0)
+        pending_orders = cls._call_broker_with_optional_use_cache(
+            tradier_client.get_orders_sync,
             mode=mode,
             symbol=symbol,
             side="SELL",
             statuses=list(ACTIVE_BROKER_EXIT_ORDER_STATUSES),
-            use_cache=use_cache,
         ) or []
 
         reserved_quantity = 0
@@ -524,9 +554,30 @@ class WatchlistExitWorkerService:
             logger.exception("Watchlist exit worker failed to refresh open position prices")
             return 0
 
+        blocked_symbols: set[str] = set()
+        template_by_symbol: dict[str, str] = {}
+        snapshot = watchlist_service.get_exit_readiness_snapshot(db, scope="stocks_only")
+        for row in list(snapshot.get("rows") or []):
+            position_state = row.get("positionState", {}) or {}
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if not symbol:
+                continue
+            template_by_symbol[symbol] = str(row.get("exitTemplate") or "").strip().lower()
+            if (
+                position_state.get("stopLossBreached")
+                or position_state.get("trailingStopBreached")
+                or position_state.get("followThroughFailed")
+                or position_state.get("positionExpired")
+                or position_state.get("timeStopExtended")
+            ):
+                blocked_symbols.add(symbol)
+
         refreshed_count = 0
         for position in positions:
             symbol = str(position.ticker or "").upper().strip()
+            if symbol in blocked_symbols:
+                continue
+            exit_template = template_by_symbol.get(symbol, "")
             quote = quotes.get(symbol) or {}
             last_price = quote.get("last")
             if last_price in {None, ""}:
@@ -537,14 +588,20 @@ class WatchlistExitWorkerService:
                 continue
 
             position.current_price = current_price
-            peak_price = float(position.peak_price or 0.0)
-            if current_price > peak_price:
-                position.peak_price = current_price
-                peak_price = current_price
+            prior_peak_price = float(position.peak_price or 0.0)
+            trail_pct = settings.TRAILING_STOP_PCT
+            if exit_template == "trail_after_impulse" and position.profit_target and current_price >= float(position.profit_target):
+                trail_pct = settings.TRAILING_STOP_PCT * IMPULSE_TRAIL_STOP_FACTOR
 
-            if position.profit_target and current_price >= float(position.profit_target):
-                if position.trailing_stop is None:
-                    position.trailing_stop = round(current_price * 0.97, 4)
+            if current_price > prior_peak_price:
+                position.peak_price = current_price
+                position.trailing_stop = max(
+                    float(position.trailing_stop or 0.0),
+                    round(current_price * (1.0 - trail_pct), 4),
+                )
+
+            if position.profit_target and current_price >= float(position.profit_target) and position.trailing_stop is None:
+                position.trailing_stop = round(current_price * (1.0 - trail_pct), 4)
 
             trade = (
                 db.query(Trade)
@@ -552,8 +609,11 @@ class WatchlistExitWorkerService:
                 .order_by(Trade.entry_time.desc(), Trade.id.desc())
                 .first()
             )
-            if trade is not None and current_price > peak_price:
-                position.trailing_stop = max(float(position.trailing_stop or 0.0), round(current_price * 0.97, 4))
+            if trade is not None and current_price > prior_peak_price:
+                position.trailing_stop = max(
+                    float(position.trailing_stop or 0.0),
+                    round(current_price * (1.0 - trail_pct), 4),
+                )
 
             refreshed_count += 1
 
@@ -579,7 +639,11 @@ class WatchlistExitWorkerService:
 
     def _find_crypto_ledger_position(self, symbol: str, *, db: Session | None = None) -> dict[str, Any] | None:
         aliases = self._crypto_symbol_aliases(symbol)
-        for row in crypto_ledger.get_positions(db=db):
+        try:
+            positions = crypto_ledger.get_positions(db=db)
+        except TypeError:
+            positions = crypto_ledger.get_positions()
+        for row in positions:
             pair = str(row.get("pair") or "").upper().strip()
             if pair in aliases or self._crypto_symbol_aliases(pair).intersection(aliases):
                 return row
@@ -766,8 +830,29 @@ class WatchlistExitWorkerService:
         session_state = get_scope_session_status("stocks_only", datetime.now(UTC))
         if not bool(getattr(session_state, "session_open", False)):
             candidate["action"] = "BLOCKED"
-            candidate["reason"] = "MARKET_CLOSED"
+            candidate["reason"] = "STOCK_SESSION_CLOSED"
             return candidate
+
+        intent = OrderIntent(
+            intent_id=f"intent_{uuid4().hex[:24]}",
+            account_id="paper",
+            asset_class="stock",
+            symbol=symbol,
+            side="SELL",
+            requested_quantity=requested_quantity,
+            requested_price=self._safe_float(candidate.get("currentPrice")),
+            status="READY",
+            execution_source=EXECUTION_SOURCE,
+            position_id=candidate.get("positionId"),
+            submitted_at=datetime.now(UTC),
+            context_json={
+                "exitTrigger": candidate.get("exitTrigger"),
+                "exitReasons": candidate.get("exitReasons") or [],
+                "quantityTruth": candidate.get("quantityTruth") or {},
+            },
+        )
+        db.add(intent)
+        db.flush()
 
         try:
             response = tradier_client.place_order_sync(
@@ -782,32 +867,58 @@ class WatchlistExitWorkerService:
             message = str(exc)
             if "more shares than your current long position" in message.lower():
                 broker_state = self._get_broker_exit_state(symbol, mode=mode, use_cache=False)
+                candidate["brokerQuantity"] = int(broker_state.get("brokerQuantity") or 0)
+                candidate["brokerReservedQuantity"] = int(broker_state.get("reservedQuantity") or 0)
+                candidate["brokerAvailableQuantity"] = int(broker_state.get("availableQuantity") or 0)
+                candidate["brokerPendingOrders"] = list(broker_state.get("pendingOrders") or [])
+                candidate["brokerExitPending"] = bool(candidate["brokerPendingOrders"])
+                candidate["quantityTruth"] = self._build_stock_quantity_truth(db, symbol=symbol, broker_state=broker_state)
+                candidate["requestedQuantity"] = min(requested_quantity, int(broker_state.get("availableQuantity") or 0))
                 candidate["reconciliation"] = {"brokerState": broker_state, "pendingOrders": broker_state.get("pendingOrders") or []}
                 if broker_state.get("pendingOrders"):
                     candidate["action"] = "EXIT_ALREADY_IN_PROGRESS"
                     candidate["reason"] = "BROKER_EXIT_PENDING_AFTER_REJECTION"
                     candidate["monitoringStatus"] = "EXIT_PENDING"
+                    intent.status = "SKIPPED"
+                    execution_lifecycle.record_event(
+                        db,
+                        intent,
+                        event_type="EXIT_RECONCILED",
+                        status="SKIPPED",
+                        message=f"Reconciled pending stock exit for {symbol} after broker oversell rejection",
+                        payload={
+                            "brokerState": broker_state,
+                            "pendingOrders": broker_state.get("pendingOrders") or [],
+                            "quantityTruth": candidate.get("quantityTruth") or {},
+                        },
+                    )
                 else:
-                    candidate["action"] = "BLOCKED"
+                    candidate["action"] = "SKIPPED"
                     candidate["reason"] = "BROKER_POSITION_INSUFFICIENT"
+                    intent.status = "SKIPPED"
+                    intent.rejection_reason = message
+                    execution_lifecycle.record_event(
+                        db,
+                        intent,
+                        event_type="EXIT_RECONCILED",
+                        status="SKIPPED",
+                        message=f"Skipped stock exit for {symbol} after broker oversell rejection",
+                        payload={
+                            "brokerState": broker_state,
+                            "quantityTruth": candidate.get("quantityTruth") or {},
+                        },
+                    )
+                db.commit()
                 return candidate
+            intent.status = "FAILED"
+            intent.rejection_reason = message
+            db.commit()
             raise
 
         order = response.get("order") or {}
         order_id = str(order.get("id") or "").strip()
-        intent = OrderIntent(
-            account_id="paper",
-            asset_class="stock",
-            symbol=symbol,
-            side="SELL",
-            requested_quantity=requested_quantity,
-            status="SUBMITTED",
-            execution_source=EXECUTION_SOURCE,
-            submitted_order_id=order_id or None,
-            submitted_at=datetime.now(UTC),
-        )
-        db.add(intent)
-        db.flush()
+        intent.status = "SUBMITTED"
+        intent.submitted_order_id = order_id or None
 
         execution_lifecycle.record_event(
             db,
@@ -829,32 +940,38 @@ class WatchlistExitWorkerService:
             intent.filled_quantity = filled_quantity
             intent.avg_fill_price = avg_fill_price
             if final_status == "filled":
-                self._finalize_stock_exit(db, symbol=symbol, filled_quantity=filled_quantity, fill_price=avg_fill_price)
+                intent.first_fill_at = datetime.now(UTC)
+                intent.last_fill_at = datetime.now(UTC)
+                self._finalize_stock_exit(db, symbol=symbol, filled_quantity=filled_quantity, fill_price=avg_fill_price, trigger=str(candidate.get("exitTrigger") or PROFIT_TARGET_TRIGGER), order_id=order_id or None)
                 candidate["action"] = "SCALE_OUT_SUBMITTED"
                 candidate["closedShares"] = filled_quantity
                 candidate["remainingShares"] = max(int(candidate.get("brokerQuantity") or 0) - filled_quantity, 0)
+                db.commit()
                 return candidate
 
         if final_status == "filled":
-            intent.status = "FILLED"
+            intent.status = "CLOSED"
             intent.filled_quantity = filled_quantity
             intent.avg_fill_price = avg_fill_price
+            intent.first_fill_at = intent.first_fill_at or datetime.now(UTC)
             intent.last_fill_at = datetime.now(UTC)
-            self._finalize_stock_exit(db, symbol=symbol, filled_quantity=filled_quantity, fill_price=avg_fill_price)
+            self._finalize_stock_exit(db, symbol=symbol, filled_quantity=filled_quantity, fill_price=avg_fill_price, trigger=str(candidate.get("exitTrigger") or EXIT_TRIGGER), order_id=order_id or None)
             execution_lifecycle.record_event(
                 db,
                 intent,
                 event_type="EXIT_FILLED",
-                status="FILLED",
+                status="CLOSED",
                 message=f"Filled stock exit for {symbol}",
                 payload={"symbol": symbol, "filledQuantity": filled_quantity, "avgFillPrice": avg_fill_price},
             )
             candidate["action"] = "EXIT_CLOSED"
             candidate["filledQuantity"] = filled_quantity
             candidate["filledPrice"] = avg_fill_price
+            db.commit()
             return candidate
 
-        candidate["action"] = "SUBMISSION_PENDING"
+        candidate["action"] = "EXIT_SUBMITTED"
+        db.commit()
         return candidate
 
     def _submit_crypto_exit_candidate(self, db: Session, candidate: dict[str, Any]) -> dict[str, Any]:
@@ -869,6 +986,7 @@ class WatchlistExitWorkerService:
             return candidate
 
         intent = OrderIntent(
+            intent_id=f"intent_{uuid4().hex[:24]}",
             account_id="paper-crypto-ledger",
             asset_class="crypto",
             symbol=pair,
@@ -907,7 +1025,7 @@ class WatchlistExitWorkerService:
         )
         status = str(trade.get("status") or "").upper()
         if status == "FILLED":
-            intent.status = "FILLED"
+            intent.status = "CLOSED"
             intent.filled_quantity = requested_quantity
             intent.avg_fill_price = current_price
             intent.submitted_order_id = trade.get("id")
@@ -917,7 +1035,7 @@ class WatchlistExitWorkerService:
                 db,
                 intent,
                 event_type="EXIT_FILLED",
-                status="FILLED",
+                status="CLOSED",
                 message=f"Filled crypto exit for {pair}",
                 payload=trade,
             )
@@ -925,6 +1043,7 @@ class WatchlistExitWorkerService:
             candidate["action"] = "EXIT_CLOSED"
             candidate["filledQuantity"] = requested_quantity
             candidate["filledPrice"] = current_price
+            db.commit()
             return candidate
 
         intent.status = "REJECTED"
@@ -939,6 +1058,7 @@ class WatchlistExitWorkerService:
         )
         candidate["action"] = "BLOCKED"
         candidate["reason"] = "CRYPTO_EXIT_REJECTED"
+        db.commit()
         return candidate
 
     def _apply_crypto_cooldown(self, db: Session, *, symbol: str, fill_payload: dict[str, Any]) -> None:
@@ -953,12 +1073,23 @@ class WatchlistExitWorkerService:
             return
         blocked_until = datetime.now(UTC) + timedelta(minutes=15)
         context_json = dict(monitor_state.decision_context_json or {})
+        entry_execution = dict(context_json.get("entryExecution") or {})
+        entry_execution.update(
+            {
+                "action": "EXIT_FILLED",
+                "reason": "CRYPTO_LEDGER_EXIT_FILLED",
+                "filledQuantity": fill_payload.get("amount"),
+                "filledPrice": fill_payload.get("price"),
+                "displayPair": fill_payload.get("pair") or symbol,
+            }
+        )
         context_json.update(
             {
                 "lastExitAtUtc": datetime.now(UTC).isoformat(),
                 "lastExitReason": "CRYPTO_LEDGER_EXIT_FILLED",
                 "reentryBlockedUntilUtc": blocked_until.isoformat(),
                 "cooldownActive": True,
+                "entryExecution": entry_execution,
                 "exitExecution": {
                     "action": "EXIT_FILLED",
                     "filledQuantity": fill_payload.get("amount"),
@@ -973,7 +1104,7 @@ class WatchlistExitWorkerService:
         monitor_state.decision_context_json = context_json
         db.flush()
 
-    def _finalize_stock_exit(self, db: Session, *, symbol: str, filled_quantity: int, fill_price: float) -> None:
+    def _finalize_stock_exit(self, db: Session, *, symbol: str, filled_quantity: int, fill_price: float, trigger: str, order_id: str | None = None) -> None:
         position = (
             db.query(Position)
             .filter(Position.ticker == symbol, Position.is_open.is_(True))
@@ -983,13 +1114,21 @@ class WatchlistExitWorkerService:
         if position is None:
             return
 
+        original_shares = int(position.shares or 0)
         position.current_price = fill_price
-        remaining = max(int(position.shares or 0) - int(filled_quantity), 0)
+        position.peak_price = max(float(position.peak_price or 0.0), float(fill_price or 0.0))
+        remaining = max(original_shares - int(filled_quantity), 0)
         if remaining <= 0:
             position.shares = 0
             position.is_open = False
         else:
             position.shares = remaining
+            if trigger == PROFIT_TARGET_TRIGGER:
+                position.stop_loss = max(float(position.stop_loss or 0.0), float(position.avg_entry_price or 0.0))
+                position.trailing_stop = max(
+                    float(position.trailing_stop or 0.0),
+                    round(float(fill_price or 0.0) * (1.0 - settings.TRAILING_STOP_PCT), 4),
+                )
 
         trade = (
             db.query(Trade)
@@ -1001,10 +1140,25 @@ class WatchlistExitWorkerService:
             if remaining <= 0:
                 trade.exit_time = datetime.now(UTC)
                 trade.exit_price = fill_price
-                trade.exit_order_id = f"exit-{symbol.lower()}"
-                trade.realized_pnl = ((fill_price - float(trade.entry_price or 0)) * float(trade.shares or 0))
+                trade.exit_order_id = order_id or f"exit-{symbol.lower()}"
+                trade.exit_trigger = trigger
+                trade.exit_proceeds = float(fill_price or 0.0) * float(filled_quantity or 0)
+                trade.gross_pnl = trade.exit_proceeds - float(trade.entry_cost or 0.0)
+                trade.net_pnl = trade.gross_pnl
+                trade.return_pct = ((trade.net_pnl / float(trade.entry_cost or 1.0)) * 100.0) if float(trade.entry_cost or 0.0) > 0 else 0.0
             else:
                 trade.shares = remaining
+                context = dict(trade.exit_reasoning or {})
+                partial_exits = list(context.get("partialExits") or [])
+                partial_exits.append({
+                    "trigger": trigger,
+                    "filledQuantity": int(filled_quantity or 0),
+                    "filledPrice": float(fill_price or 0.0),
+                    "remainingShares": remaining,
+                    "recordedAtUtc": datetime.now(UTC).isoformat(),
+                })
+                context["partialExits"] = partial_exits
+                trade.exit_reasoning = context
         db.flush()
 
     async def run_forever(self) -> None:

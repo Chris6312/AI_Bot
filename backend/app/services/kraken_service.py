@@ -442,11 +442,12 @@ class CryptoPaperLedger:
     """Paper crypto ledger with in-memory runtime state and best-effort DB persistence."""
 
     def __init__(self, starting_balance: float = 100000.0):
-        self.account_key = 'paper-crypto-ledger'
+        self.account_id = 'paper-crypto-ledger'
         self.starting_balance = Decimal(str(starting_balance))
         self.balance = Decimal(str(starting_balance))
         self.trades: List[Dict] = []
         self.positions: Dict[str, Dict] = {}
+        self.pair_mappings: dict[str, str] = {}
         self.kraken = KrakenAPIService()
         self._ledger_lock = RLock()
         self._hydrate_from_db_best_effort()
@@ -468,59 +469,77 @@ class CryptoPaperLedger:
     def _hydrate_from_db_best_effort(self) -> None:
         try:
             from app.core.database import SessionLocal
+            with SessionLocal() as db:
+                self._refresh_cache(db=db, include_trades=True)
+        except Exception:
+            return
+
+    def _refresh_cache(self, db: Any = None, include_trades: bool = True) -> None:
+        if db is None:
+            return
+
+        try:
             from app.models.crypto_paper_account import CryptoPaperAccount
             from app.models.crypto_paper_fill import CryptoPaperFill
             from app.models.crypto_paper_position import CryptoPaperPosition
         except Exception:
             return
 
-        try:
-            with SessionLocal() as db:
-                account = (
-                    db.query(CryptoPaperAccount)
-                    .filter(CryptoPaperAccount.account_key == self.account_key)
-                    .one_or_none()
-                )
-                if account is not None:
-                    self.starting_balance = Decimal(str(account.starting_balance or self.starting_balance))
-                    self.balance = Decimal(str(account.cash_balance or self.balance))
+        with self._ledger_lock:
+            account = (
+                db.query(CryptoPaperAccount)
+                .filter(CryptoPaperAccount.account_key == self.account_id)
+                .one_or_none()
+            )
+            if account is not None:
+                self.starting_balance = Decimal(str(account.starting_balance or self.starting_balance))
+                self.balance = Decimal(str(account.cash_balance or self.balance))
 
-                rows = (
-                    db.query(CryptoPaperPosition)
-                    .filter(CryptoPaperPosition.is_open.is_(True))
-                    .all()
+            rows = (
+                db.query(CryptoPaperPosition)
+                .filter(
+                    CryptoPaperPosition.account_key == self.account_id,
+                    CryptoPaperPosition.is_open.is_(True),
                 )
-                hydrated_positions: Dict[str, Dict] = {}
-                for row in rows:
-                    quantity = Decimal(str(row.quantity or 0.0))
-                    if quantity <= 0:
-                        continue
-                    hydrated_positions[str(row.symbol)] = {
-                        'amount': quantity,
-                        'total_cost': Decimal(str(row.total_cost or 0.0)),
-                        'entry_time_utc': row.entry_time_utc.isoformat() if row.entry_time_utc else None,
-                        'ohlcv_pair': row.ohlcv_pair,
-                    }
-                self.positions = hydrated_positions
+                .order_by(CryptoPaperPosition.symbol.asc(), CryptoPaperPosition.id.asc())
+                .all()
+            )
+            self.positions = {
+                str(row.symbol): {
+                    'amount': Decimal(str(row.quantity or 0.0)),
+                    'total_cost': Decimal(str(row.total_cost or 0.0)),
+                    'entry_time_utc': self._coerce_datetime(row.entry_time_utc).isoformat() if row.entry_time_utc else None,
+                    'ohlcv_pair': str(row.ohlcv_pair or '').strip() or None,
+                }
+                for row in rows
+                if Decimal(str(row.quantity or 0.0)) > 0
+            }
 
-                fills = db.query(CryptoPaperFill).order_by(CryptoPaperFill.filled_at.asc(), CryptoPaperFill.id.asc()).all()
-                self.trades = [
-                    {
-                        'id': fill.fill_id,
-                        'timestamp': self._coerce_datetime(fill.filled_at).isoformat(),
-                        'market': 'CRYPTO',
-                        'pair': str(fill.symbol or '').upper().strip(),
-                        'ohlcvPair': fill.ohlcv_pair,
-                        'side': str(fill.side or '').upper().strip(),
-                        'amount': float(fill.quantity or 0.0),
-                        'price': float(fill.price or 0.0),
-                        'total': float(fill.notional or 0.0),
-                        'balance': None,
-                    }
-                    for fill in fills
-                ]
-        except Exception:
-            return
+            if not include_trades:
+                return
+
+            fills = (
+                db.query(CryptoPaperFill)
+                .filter(CryptoPaperFill.account_key == self.account_id)
+                .order_by(CryptoPaperFill.filled_at.asc(), CryptoPaperFill.id.asc())
+                .all()
+            )
+            self.trades = [
+                {
+                    'id': str(fill.order_id or fill.fill_id),
+                    'timestamp': self._coerce_datetime(fill.filled_at).isoformat(),
+                    'market': 'CRYPTO',
+                    'pair': str(fill.symbol or '').upper().strip(),
+                    'ohlcvPair': fill.ohlcv_pair,
+                    'side': str(fill.side or '').upper().strip(),
+                    'amount': float(fill.quantity or 0.0),
+                    'price': float(fill.price or 0.0),
+                    'total': float(fill.notional or 0.0),
+                    'status': 'FILLED',
+                    'balance': None,
+                }
+                for fill in fills
+            ]
 
     def _persist_state_best_effort(self) -> None:
         try:
@@ -535,12 +554,12 @@ class CryptoPaperLedger:
             with SessionLocal() as db:
                 account = (
                     db.query(CryptoPaperAccount)
-                    .filter(CryptoPaperAccount.account_key == self.account_key)
+                    .filter(CryptoPaperAccount.account_id == self.account_id)
                     .one_or_none()
                 )
                 if account is None:
                     account = CryptoPaperAccount(
-                        account_key=self.account_key,
+                        account_id=self.account_id,
                         base_currency='USD',
                     )
                     db.add(account)
@@ -555,15 +574,13 @@ class CryptoPaperLedger:
                     db.add(
                         CryptoPaperFill(
                             fill_id=str(trade.get('id') or ''),
-                            order_id=str(trade.get('id') or ''),
-                            account_key=self.account_key,
                             symbol=str(trade.get('pair') or '').upper().strip(),
                             ohlcv_pair=str(trade.get('ohlcvPair') or '').strip() or None,
                             side=str(trade.get('side') or '').upper().strip(),
                             quantity=float(trade.get('amount') or 0.0),
                             price=float(trade.get('price') or 0.0),
-                            notional=float(trade.get('total') or 0.0),
-                            fee=0.0,
+                            total=float(trade.get('total') or 0.0),
+                            status=str(trade.get('status') or 'FILLED').upper(),
                             filled_at=self._coerce_datetime(trade.get('timestamp')),
                         )
                     )
@@ -579,16 +596,13 @@ class CryptoPaperLedger:
                     ohlcv_pair = str(position.get('ohlcv_pair') or '').strip() or None
                     db.add(
                         CryptoPaperPosition(
-                            account_key=self.account_key,
                             symbol=str(pair or '').upper().strip(),
                             ohlcv_pair=ohlcv_pair,
                             quantity=float(quantity),
                             total_cost=float(total_cost),
                             avg_price=float(total_cost / quantity) if quantity > 0 else 0.0,
                             entry_time_utc=entry_time,
-                            realized_pnl=0.0,
-                            closed_at=None,
-                            is_open=True,
+                            is_closed=False,
                         )
                     )
 
@@ -603,9 +617,11 @@ class CryptoPaperLedger:
         side: str,
         amount: float,
         price: Optional[float] = None,
-        db=None,
-        intent_id: str | None = None,
+        *,
+        db: Any = None,
         source: str | None = None,
+        intent_id: str | None = None,
+        submitted_at: datetime | str | None = None,
     ) -> Dict:
         """Execute a paper trade."""
         if price is None:
@@ -613,6 +629,23 @@ class CryptoPaperLedger:
             if not ticker or 'c' not in ticker:
                 return {'status': 'REJECTED', 'reason': 'Failed to fetch current price'}
             price = float(ticker['c'][0])
+
+        if db is not None:
+            from app.services.crypto_paper_broker import crypto_paper_broker
+
+            trade = crypto_paper_broker.execute_trade(
+                db=db,
+                pair=str(pair or '').upper().strip(),
+                ohlcv_pair=str(ohlcv_pair or '').upper().strip() or None,
+                side=str(side or '').upper().strip(),
+                amount=Decimal(str(amount)),
+                price=Decimal(str(price)),
+                source=source,
+                intent_id=intent_id,
+                submitted_at=self._coerce_datetime(submitted_at) if submitted_at else None,
+            )
+            self._refresh_cache(db=db, include_trades=True)
+            return trade
 
         pair = str(pair or '').upper().strip()
         ohlcv_pair = str(ohlcv_pair or '').upper().strip() or None
@@ -680,8 +713,8 @@ class CryptoPaperLedger:
             symbol=pair,
             quantity=float(amount_dec),
             price=float(price_dec),
-            execution_source='CRYPTO_PAPER_LEDGER',
-            account_id=self.account_key,
+            execution_source=source or 'CRYPTO_PAPER_LEDGER',
+            account_id='paper-crypto-ledger',
             status=str(trade.get('status') or 'FILLED').upper(),
             extra={
                 'mode': 'PAPER',
@@ -812,8 +845,10 @@ class CryptoPaperLedger:
 
         return 0.0
 
-    def get_positions(self, db=None) -> List[Dict]:
+    def get_positions(self, db: Any = None) -> List[Dict]:
         """Get current positions with P&L and paper-equity context."""
+        if db is not None:
+            self._refresh_cache(db=db, include_trades=False)
         positions = []
         balance, starting_balance, trades_snapshot, positions_snapshot = self._snapshot_state()
         if not positions_snapshot:
@@ -876,8 +911,10 @@ class CryptoPaperLedger:
             return raw_pair.replace('/', '')
         return raw_pair
 
-    def get_ledger(self, db=None) -> Dict:
+    def get_ledger(self, db: Any = None) -> Dict:
         """Get full ledger including balance, market value, equity, and P&L."""
+        if db is not None:
+            self._refresh_cache(db=db, include_trades=True)
         balance_snapshot, starting_balance_snapshot, trades_snapshot, _ = self._snapshot_state()
         positions = self.get_positions()
         market_value = round(sum(float(position.get('marketValue') or 0.0) for position in positions), 8)

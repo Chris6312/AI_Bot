@@ -99,131 +99,143 @@ class CryptoPaperBrokerService:
         event_time = self._coerce_utc(submitted_at)
 
         with self._lock:
-            with self._session_scope(db) as (session, _):
-                account = self.ensure_account(session)
-                position = (
-                    session.query(CryptoPaperPosition)
-                    .filter(
-                        CryptoPaperPosition.account_key == CRYPTO_PAPER_ACCOUNT_KEY,
-                        CryptoPaperPosition.symbol == pair,
-                        CryptoPaperPosition.is_open.is_(True),
-                    )
-                    .one_or_none()
-                )
-                total = self._normalize_decimal(quantity * price_dec)
-                current_cash = self._normalize_decimal(account.cash_balance or 0)
-
-                if side == "BUY":
-                    if current_cash + DUST < total:
-                        return {
-                            "status": "REJECTED",
-                            "reason": f"Insufficient balance: {self._decimal_to_text(account.cash_balance)} < {self._decimal_to_text(total)}",
-                        }
-
-                    account.cash_balance = self._normalize_decimal(current_cash - total)
-
-                    if position is None:
-                        position = CryptoPaperPosition(
-                            account_key=CRYPTO_PAPER_ACCOUNT_KEY,
-                            symbol=pair,
-                            ohlcv_pair=ohlcv_pair,
-                            quantity=ZERO,
-                            avg_price=ZERO,
-                            total_cost=ZERO,
-                            realized_pnl=ZERO,
-                            entry_time_utc=event_time,
-                            is_open=True,
+            with self._session_scope(db) as (session, owns_session):
+                try:
+                    account = self.ensure_account(session)
+                    position = (
+                        session.query(CryptoPaperPosition)
+                        .filter(
+                            CryptoPaperPosition.account_key == CRYPTO_PAPER_ACCOUNT_KEY,
+                            CryptoPaperPosition.symbol == pair,
+                            CryptoPaperPosition.is_open.is_(True),
                         )
-                        session.add(position)
-                        session.flush()
+                        .one_or_none()
+                    )
+                    total = self._normalize_decimal(quantity * price_dec)
+                    current_cash = self._normalize_decimal(account.cash_balance or 0)
 
-                    old_quantity = self._normalize_decimal(position.quantity or 0)
-                    old_cost = self._normalize_decimal(position.total_cost or 0)
-                    new_quantity = self._normalize_decimal(old_quantity + quantity)
-                    new_cost = self._normalize_decimal(old_cost + total)
+                    if side == "BUY":
+                        if current_cash + DUST < total:
+                            if not owns_session:
+                                session.rollback()
+                            return {
+                                "status": "REJECTED",
+                                "reason": f"Insufficient balance: {self._decimal_to_text(account.cash_balance)} < {self._decimal_to_text(total)}",
+                            }
 
-                    position.quantity = new_quantity
-                    position.total_cost = new_cost
-                    position.avg_price = self._normalize_decimal(new_cost / new_quantity) if new_quantity > 0 else ZERO
-                    if old_quantity <= DUST:
-                        position.entry_time_utc = event_time
-                    position.closed_at = None
-                    position.is_open = True
+                        account.cash_balance = self._normalize_decimal(current_cash - total)
 
-                else:
-                    available = self._normalize_decimal(position.quantity if position is not None else 0)
-                    if position is None or available + DUST < quantity:
-                        return {"status": "REJECTED", "reason": f"Insufficient {pair} position"}
+                        if position is None:
+                            position = CryptoPaperPosition(
+                                account_key=CRYPTO_PAPER_ACCOUNT_KEY,
+                                symbol=pair,
+                                ohlcv_pair=ohlcv_pair,
+                                quantity=ZERO,
+                                avg_price=ZERO,
+                                total_cost=ZERO,
+                                realized_pnl=ZERO,
+                                entry_time_utc=event_time,
+                                is_open=True,
+                            )
+                            session.add(position)
+                            session.flush()
 
-                    avg_cost = self._normalize_decimal((self._normalize_decimal(position.total_cost or 0) / available) if available > 0 else ZERO)
-                    closed_cost = self._normalize_decimal(avg_cost * quantity)
-                    realized = self._normalize_decimal(total - closed_cost)
-                    new_quantity = self._normalize_decimal(available - quantity)
-                    new_total_cost = self._normalize_decimal(self._normalize_decimal(position.total_cost or 0) - closed_cost)
+                        old_quantity = self._normalize_decimal(position.quantity or 0)
+                        old_cost = self._normalize_decimal(position.total_cost or 0)
+                        new_quantity = self._normalize_decimal(old_quantity + quantity)
+                        new_cost = self._normalize_decimal(old_cost + total)
 
-                    account.cash_balance = self._normalize_decimal(current_cash + total)
-                    account.realized_pnl = self._normalize_decimal(self._normalize_decimal(account.realized_pnl or 0) + realized)
-                    position.realized_pnl = self._normalize_decimal(self._normalize_decimal(position.realized_pnl or 0) + realized)
-
-                    if new_quantity <= DUST:
-                        position.quantity = ZERO
-                        position.total_cost = ZERO
-                        position.avg_price = ZERO
-                        position.is_open = False
-                        position.closed_at = event_time
-                    else:
                         position.quantity = new_quantity
-                        position.total_cost = new_total_cost
-                        position.avg_price = self._normalize_decimal(new_total_cost / new_quantity) if new_quantity > 0 else ZERO
+                        position.total_cost = new_cost
+                        position.avg_price = self._normalize_decimal(new_cost / new_quantity) if new_quantity > 0 else ZERO
+                        if old_quantity <= DUST:
+                            position.entry_time_utc = event_time
+                        position.closed_at = None
+                        position.is_open = True
 
-                order_id = f"paper_{uuid4().hex[:24]}"
-                order = CryptoPaperOrder(
-                    order_id=order_id,
-                    account_key=CRYPTO_PAPER_ACCOUNT_KEY,
-                    symbol=pair,
-                    ohlcv_pair=ohlcv_pair,
-                    side=side,
-                    status="FILLED",
-                    requested_quantity=quantity,
-                    requested_price=price_dec,
-                    filled_quantity=quantity,
-                    avg_fill_price=price_dec,
-                    intent_id=intent_id,
-                    source=source,
-                    submitted_at=event_time,
-                )
-                session.add(order)
-                session.flush()
+                    else:
+                        available = self._normalize_decimal(position.quantity if position is not None else 0)
+                        if position is None or available + DUST < quantity:
+                            if not owns_session:
+                                session.rollback()
+                            return {"status": "REJECTED", "reason": f"Insufficient {pair} position"}
 
-                fill = CryptoPaperFill(
-                    fill_id=f"fill_{uuid4().hex[:24]}",
-                    order_id=order.order_id,
-                    account_key=CRYPTO_PAPER_ACCOUNT_KEY,
-                    symbol=pair,
-                    ohlcv_pair=ohlcv_pair,
-                    side=side,
-                    quantity=quantity,
-                    price=price_dec,
-                    notional=total,
-                    fee=ZERO,
-                    filled_at=event_time,
-                )
-                session.add(fill)
-                session.flush()
+                        avg_cost = self._normalize_decimal((self._normalize_decimal(position.total_cost or 0) / available) if available > 0 else ZERO)
+                        closed_cost = self._normalize_decimal(avg_cost * quantity)
+                        realized = self._normalize_decimal(total - closed_cost)
+                        new_quantity = self._normalize_decimal(available - quantity)
+                        new_total_cost = self._normalize_decimal(self._normalize_decimal(position.total_cost or 0) - closed_cost)
 
-                return {
-                    "id": order.order_id,
-                    "timestamp": event_time.isoformat(),
-                    "market": "CRYPTO",
-                    "pair": pair,
-                    "ohlcvPair": ohlcv_pair,
-                    "side": side,
-                    "amount": float(quantity),
-                    "price": float(price_dec),
-                    "total": float(total),
-                    "status": "FILLED",
-                    "balance": float(account.cash_balance),
-                }
+                        account.cash_balance = self._normalize_decimal(current_cash + total)
+                        account.realized_pnl = self._normalize_decimal(self._normalize_decimal(account.realized_pnl or 0) + realized)
+                        position.realized_pnl = self._normalize_decimal(self._normalize_decimal(position.realized_pnl or 0) + realized)
+
+                        if new_quantity <= DUST:
+                            position.quantity = ZERO
+                            position.total_cost = ZERO
+                            position.avg_price = ZERO
+                            position.is_open = False
+                            position.closed_at = event_time
+                        else:
+                            position.quantity = new_quantity
+                            position.total_cost = new_total_cost
+                            position.avg_price = self._normalize_decimal(new_total_cost / new_quantity) if new_quantity > 0 else ZERO
+
+                    order_id = f"paper_{uuid4().hex[:24]}"
+                    order = CryptoPaperOrder(
+                        order_id=order_id,
+                        account_key=CRYPTO_PAPER_ACCOUNT_KEY,
+                        symbol=pair,
+                        ohlcv_pair=ohlcv_pair,
+                        side=side,
+                        status="FILLED",
+                        requested_quantity=quantity,
+                        requested_price=price_dec,
+                        filled_quantity=quantity,
+                        avg_fill_price=price_dec,
+                        intent_id=intent_id,
+                        source=source,
+                        submitted_at=event_time,
+                    )
+                    session.add(order)
+                    session.flush()
+
+                    fill = CryptoPaperFill(
+                        fill_id=f"fill_{uuid4().hex[:24]}",
+                        order_id=order.order_id,
+                        account_key=CRYPTO_PAPER_ACCOUNT_KEY,
+                        symbol=pair,
+                        ohlcv_pair=ohlcv_pair,
+                        side=side,
+                        quantity=quantity,
+                        price=price_dec,
+                        notional=total,
+                        fee=ZERO,
+                        filled_at=event_time,
+                    )
+                    session.add(fill)
+                    session.flush()
+
+                    if not owns_session:
+                        session.commit()
+
+                    return {
+                        "id": order.order_id,
+                        "timestamp": event_time.isoformat(),
+                        "market": "CRYPTO",
+                        "pair": pair,
+                        "ohlcvPair": ohlcv_pair,
+                        "side": side,
+                        "amount": float(quantity),
+                        "price": float(price_dec),
+                        "total": float(total),
+                        "status": "FILLED",
+                        "balance": float(account.cash_balance),
+                    }
+                except Exception:
+                    if not owns_session:
+                        session.rollback()
+                    raise
 
     def rebuild_from_replay_trades(self, db: Session, trades: list[Any]) -> dict[str, Any]:
         self.reset_account_state(db)
@@ -249,6 +261,8 @@ class CryptoPaperBrokerService:
             symbol = str(row.get("pair") or "").strip()
             if symbol:
                 restored_symbols.add(symbol)
+
+        db.commit()
 
         return {
             "replayedTradeCount": replayed_count,
