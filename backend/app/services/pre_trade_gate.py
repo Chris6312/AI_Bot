@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.services.control_plane import get_execution_gate_status
 from app.services.kraken_service import kraken_service
+from app.services.market_sessions import get_scope_session_status
 from app.services.runtime_visibility import runtime_visibility_service
 from app.services.safety_validator import SafetyValidator
 from app.services.trade_validator import trade_validator
@@ -218,6 +220,17 @@ class PreTradeGateService:
             elif isinstance(session_payload, dict) and 'sessionOpen' in session_payload:
                 session_open_hint = bool(session_payload.get('sessionOpen'))
 
+        if session_open_hint is None and isinstance(session_payload, dict) and 'quoteFetchedAtUtc' in session_payload:
+            observed_at = session_payload.get('quoteFetchedAtUtc')
+            if isinstance(observed_at, str):
+                try:
+                    observed_at = datetime.fromisoformat(observed_at.replace('Z', '+00:00'))
+                except ValueError:
+                    observed_at = None
+            if observed_at is not None:
+                session_status = get_scope_session_status('stocks_only', observed_at)
+                session_open_hint = bool(session_status.session_open)
+
         safety_payload = {
             'candidates': [
                 {
@@ -229,7 +242,7 @@ class PreTradeGateService:
             ],
             'vix': (decision_context or {}).get('vix'),
             'enforce_vix': bool(selected_mode == 'LIVE'),
-            'require_market_hours': bool(selected_mode == 'LIVE'),
+            'require_market_hours': bool(selected_mode == 'LIVE' or session_open_hint is not None),
             'marketSessionOpen': session_open_hint,
         }
         safety_result = self.safety.validate_sync(

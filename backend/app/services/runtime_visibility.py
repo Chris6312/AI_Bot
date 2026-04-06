@@ -245,6 +245,13 @@ class RuntimeVisibilityService:
                     .filter(
                         (OrderEvent.event_type.like("%EXIT%"))
                         | (OrderEvent.event_type.like("%CLOSE%"))
+                        | (OrderEvent.event_type.in_([
+                            "ORDER_SUBMITTED",
+                            "ORDER_STATUS_UPDATED",
+                            "ORDER_SUBMISSION_FAILED",
+                            "ORDER_SUBMISSION_UNCERTAIN",
+                            "PRE_TRADE_GATE_REJECTED",
+                        ]))
                     )
                     .order_by(OrderEvent.event_time.desc())
                     .limit(limit)

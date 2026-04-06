@@ -742,6 +742,7 @@ class WatchlistMonitoringOrchestrator:
             db.commit()
             return payload
 
+        session_status = get_scope_session_status("stocks_only", self._utcnow())
         gate_context = {
             "watchlist": {
                 "uploadId": symbol_row.upload_id,
@@ -756,6 +757,8 @@ class WatchlistMonitoringOrchestrator:
             },
             "strategySnapshot": strategy_snapshot,
             "technicalSnapshot": technical_snapshot,
+            "session": session_status.to_dict(),
+            "marketSessionOpen": bool(session_status.session_open),
         }
         gate = pre_trade_gate.evaluate_stock_order_sync(
             ticker=symbol,

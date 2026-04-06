@@ -948,26 +948,22 @@ class WatchlistExitWorkerService:
             candidate["reason"] = "STOCK_SESSION_CLOSED"
             return candidate
 
-        intent = OrderIntent(
-            intent_id=f"intent_{uuid4().hex[:24]}",
+        intent = execution_lifecycle.create_exit_intent(
+            db,
             account_id="paper",
             asset_class="stock",
             symbol=symbol,
-            side="SELL",
             requested_quantity=requested_quantity,
             requested_price=self._safe_float(candidate.get("currentPrice")),
-            status="READY",
             execution_source=EXECUTION_SOURCE,
             position_id=candidate.get("positionId"),
-            submitted_at=datetime.now(UTC),
-            context_json={
+            trade_id=None,
+            context={
                 "exitTrigger": candidate.get("exitTrigger"),
                 "exitReasons": candidate.get("exitReasons") or [],
                 "quantityTruth": candidate.get("quantityTruth") or {},
             },
         )
-        db.add(intent)
-        db.flush()
 
         try:
             response = tradier_client.place_order_sync(
@@ -1035,23 +1031,22 @@ class WatchlistExitWorkerService:
 
         order = response.get("order") or {}
         order_id = str(order.get("id") or "").strip()
-        intent.status = "SUBMITTED"
-        intent.submitted_order_id = order_id or None
-
+        intent = execution_lifecycle.record_submission(db, intent, response)
         execution_lifecycle.record_event(
             db,
             intent,
             event_type="EXIT_SUBMITTED",
-            status="SUBMITTED",
+            status=intent.status,
             message=f"Submitted stock exit for {symbol}",
             payload={"symbol": symbol, "requestedQuantity": requested_quantity, "orderId": order_id},
         )
 
         final_order = tradier_client.get_order_sync(order_id, mode=mode) if order_id else {"order": order}
+        intent = execution_lifecycle.refresh_from_order_snapshot(db, intent, final_order)
         final_order_payload = final_order.get("order") or {}
         final_status = str(final_order_payload.get("status") or "").lower()
-        filled_quantity = int(final_order_payload.get("exec_quantity") or final_order_payload.get("quantity") or requested_quantity)
-        avg_fill_price = self._safe_float(final_order_payload.get("avg_fill_price") or candidate.get("currentPrice"))
+        filled_quantity = int(final_order_payload.get("exec_quantity") or final_order_payload.get("quantity") or intent.filled_quantity or requested_quantity)
+        avg_fill_price = self._safe_float(final_order_payload.get("avg_fill_price") or intent.avg_fill_price or candidate.get("currentPrice"))
 
         if requested_quantity < int(candidate.get("brokerQuantity") or requested_quantity):
             intent.status = "FILLED" if final_status == "filled" else "SUBMITTED"
