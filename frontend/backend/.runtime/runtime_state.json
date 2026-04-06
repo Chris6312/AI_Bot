@@ -1,0 +1,7 @@
+{
+  "running": true,
+  "stock_mode": "PAPER",
+  "crypto_mode": "PAPER",
+  "safety_require_market_hours": true,
+  "last_heartbeat": "2026-04-05T21:46:29.370042+00:00"
+}

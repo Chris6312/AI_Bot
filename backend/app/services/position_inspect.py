@@ -109,23 +109,41 @@ class PositionInspectService:
             'peakPrice': float(position.peak_price or 0.0) if position.peak_price is not None else None,
             'tradeExitTrigger': trade.exit_trigger if trade is not None else None,
         }
+        position_snapshot = {
+            'accountId': position.account_id,
+            'quantityLabel': 'Shares',
+            'quantity': int(position.shares or 0),
+            'avgEntryPrice': float(position.avg_entry_price or 0.0) if position.avg_entry_price is not None else None,
+            'currentPrice': float(position.current_price or 0.0) if position.current_price is not None else None,
+            'marketValue': (float(position.current_price or 0.0) * float(position.shares or 0.0)) if position.current_price is not None else None,
+            'unrealizedPnl': float(position.unrealized_pnl or 0.0) if position.unrealized_pnl is not None else None,
+            'unrealizedPnlPct': float(position.unrealized_pnl_pct or 0.0) if position.unrealized_pnl_pct is not None else None,
+            'entryTimeUtc': position.entry_time.isoformat() if position.entry_time else None,
+            'isOpen': bool(position.is_open),
+        }
+        latest_evaluation = {
+            'state': 'EXIT_PENDING' if broker_exit_orders else None,
+            'reason': 'Broker already has an open stock exit order for this symbol.' if broker_exit_orders else None,
+        }
+        exit_worker = self._derive_exit_worker(
+            asset_class='stock',
+            display_symbol=symbol,
+            exit_plan=exit_plan,
+            position_snapshot=position_snapshot,
+            latest_evaluation=latest_evaluation,
+            monitoring_status='ACTIVE',
+            lifecycle_state='ACTIVE',
+            cooldown_active=False,
+            broker_exit_pending=bool(broker_exit_orders),
+            managed_only=False,
+            lifecycle=events,
+        )
         return {
             'assetClass': 'stock',
             'symbol': symbol,
             'displaySymbol': symbol,
             'inspectSource': 'positions_table',
-            'positionSnapshot': {
-                'accountId': position.account_id,
-                'quantityLabel': 'Shares',
-                'quantity': int(position.shares or 0),
-                'avgEntryPrice': float(position.avg_entry_price or 0.0) if position.avg_entry_price is not None else None,
-                'currentPrice': float(position.current_price or 0.0) if position.current_price is not None else None,
-                'marketValue': (float(position.current_price or 0.0) * float(position.shares or 0.0)) if position.current_price is not None else None,
-                'unrealizedPnl': float(position.unrealized_pnl or 0.0) if position.unrealized_pnl is not None else None,
-                'unrealizedPnlPct': float(position.unrealized_pnl_pct or 0.0) if position.unrealized_pnl_pct is not None else None,
-                'entryTimeUtc': position.entry_time.isoformat() if position.entry_time else None,
-                'isOpen': bool(position.is_open),
-            },
+            'positionSnapshot': position_snapshot,
             'signalSnapshot': signal_snapshot,
             'sizing': sizing,
             'timeframeAlignment': {
@@ -136,10 +154,8 @@ class PositionInspectService:
                 'note': 'Legacy stock positions preserve entry reasoning and lifecycle events, but they do not yet store per-timeframe confirmation flags in a normalized shape.',
             },
             'exitPlan': exit_plan,
-            'latestEvaluation': {
-                'state': 'EXIT_PENDING' if broker_exit_orders else None,
-                'reason': 'Broker already has an open stock exit order for this symbol.' if broker_exit_orders else None,
-            },
+            'latestEvaluation': latest_evaluation,
+            'exitWorker': exit_worker,
             'lifecycle': events,
             'rawContext': {
                 'entryReasoning': entry_reasoning,
@@ -291,25 +307,49 @@ class PositionInspectService:
             latest_eval['reason'] = protective_reason_text
             latest_eval.setdefault('details', {})
             latest_eval['details'] = {**dict(latest_eval.get('details') or {}), 'protectiveExitReasons': protective_reasons}
+        position_snapshot = {
+            'accountId': 'paper-crypto-ledger',
+            'quantityLabel': 'Amount',
+            'quantity': self._maybe_float(current_position.get('amount')),
+            'avgEntryPrice': self._maybe_float(current_position.get('avgPrice')),
+            'currentPrice': self._maybe_float(current_position.get('currentPrice')),
+            'marketValue': self._maybe_float(current_position.get('marketValue')),
+            'costBasis': self._maybe_float(current_position.get('costBasis')),
+            'unrealizedPnl': self._maybe_float(current_position.get('pnl')),
+            'unrealizedPnlPct': self._maybe_float(current_position.get('pnlPercent')),
+            'realizedPnl': self._maybe_float(current_position.get('realizedPnl')),
+            'entryTimeUtc': current_position.get('entryTimeUtc'),
+            'isOpen': True,
+        }
+        latest_evaluation = ({
+            **(latest_eval or {}),
+            'details': {
+                **dict((latest_eval or {}).get('details') or {}),
+                'cooldownActive': cooldown_active,
+                'reentryBlockedUntilUtc': base_monitor_context.get('reentryBlockedUntilUtc'),
+                'lastExitAtUtc': base_monitor_context.get('lastExitAtUtc'),
+                'monitoringStatus': monitor_state.monitoring_status if monitor_state is not None else None,
+            },
+        } if latest_eval or cooldown_active or monitor_state is not None else None)
+        exit_worker = self._derive_exit_worker(
+            asset_class='crypto',
+            display_symbol=current_position.get('pair') or symbol,
+            exit_plan=exit_plan,
+            position_snapshot=position_snapshot,
+            latest_evaluation=latest_evaluation,
+            monitoring_status=monitor_state.monitoring_status if monitor_state is not None else signal_snapshot.get('monitoringStatus'),
+            lifecycle_state=base_monitor_context.get('lifecycleState') or 'ACTIVE',
+            cooldown_active=cooldown_active,
+            broker_exit_pending=bool(signal_snapshot.get('brokerExitPending')),
+            managed_only=bool(watch_symbol.monitoring_status == 'MANAGED_ONLY' if watch_symbol is not None else False),
+            lifecycle=events,
+        )
         return {
             'assetClass': 'crypto',
             'symbol': symbol,
             'displaySymbol': current_position.get('pair') or symbol,
             'inspectSource': 'crypto_paper_ledger',
-            'positionSnapshot': {
-                'accountId': 'paper-crypto-ledger',
-                'quantityLabel': 'Amount',
-                'quantity': self._maybe_float(current_position.get('amount')),
-                'avgEntryPrice': self._maybe_float(current_position.get('avgPrice')),
-                'currentPrice': self._maybe_float(current_position.get('currentPrice')),
-                'marketValue': self._maybe_float(current_position.get('marketValue')),
-                'costBasis': self._maybe_float(current_position.get('costBasis')),
-                'unrealizedPnl': self._maybe_float(current_position.get('pnl')),
-                'unrealizedPnlPct': self._maybe_float(current_position.get('pnlPercent')),
-                'realizedPnl': self._maybe_float(current_position.get('realizedPnl')),
-                'entryTimeUtc': current_position.get('entryTimeUtc'),
-                'isOpen': True,
-            },
+            'positionSnapshot': position_snapshot,
             'signalSnapshot': signal_snapshot,
             'sizing': sizing,
             'timeframeAlignment': {
@@ -324,16 +364,8 @@ class PositionInspectService:
                 ),
             },
             'exitPlan': exit_plan,
-            'latestEvaluation': {
-                **(latest_eval or {}),
-                'details': {
-                    **dict((latest_eval or {}).get('details') or {}),
-                    'cooldownActive': cooldown_active,
-                    'reentryBlockedUntilUtc': base_monitor_context.get('reentryBlockedUntilUtc'),
-                    'lastExitAtUtc': base_monitor_context.get('lastExitAtUtc'),
-                    'monitoringStatus': monitor_state.monitoring_status if monitor_state is not None else None,
-                },
-            } if latest_eval or cooldown_active or monitor_state is not None else None,
+            'latestEvaluation': latest_evaluation,
+            'exitWorker': exit_worker,
             'lifecycle': events,
             'rawContext': {
                 'intentContext': intent_context,
@@ -619,6 +651,382 @@ class PositionInspectService:
         order = ['1m', '5m', '15m', '1h', '4h', '1d']
         ranked = sorted(configured_timeframes, key=lambda item: order.index(item) if item in order else len(order))
         return ranked[0] if ranked else configured_timeframes[0]
+
+
+    def _derive_exit_worker(
+        self,
+        *,
+        asset_class: str,
+        display_symbol: str,
+        exit_plan: dict[str, Any],
+        position_snapshot: dict[str, Any],
+        latest_evaluation: dict[str, Any] | None,
+        monitoring_status: str | None,
+        lifecycle_state: str | None,
+        cooldown_active: bool,
+        broker_exit_pending: bool,
+        managed_only: bool,
+        lifecycle: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        details = dict((latest_evaluation or {}).get('details') or {})
+        state = str((latest_evaluation or {}).get('state') or '').strip().upper()
+        reason = str((latest_evaluation or {}).get('reason') or '').strip() or None
+        template = str(exit_plan.get('template') or '').strip().lower()
+        current_price = self._maybe_float(position_snapshot.get('currentPrice'))
+        entry_price = self._maybe_float(position_snapshot.get('avgEntryPrice'))
+        unrealized_pnl = self._maybe_float(position_snapshot.get('unrealizedPnl'))
+        stop_loss = self._maybe_float(exit_plan.get('stopLoss'))
+        profit_target = self._maybe_float(exit_plan.get('profitTarget'))
+        trailing_stop = self._maybe_float(exit_plan.get('trailingStop'))
+        peak_price = self._maybe_float(exit_plan.get('peakPrice'))
+        hours_since_entry = self._maybe_float(exit_plan.get('hoursSinceEntry') or details.get('hoursSinceEntry') or details.get('hours_open'))
+        max_hold_hours = self._maybe_float(exit_plan.get('maxHoldHours'))
+        target_reached = bool(details.get('profitTargetReached')) or (current_price is not None and profit_target is not None and current_price >= profit_target)
+        trail_breached = bool(details.get('trailingStopBreached')) or (current_price is not None and trailing_stop is not None and current_price <= trailing_stop)
+        stop_breached = bool(details.get('stopLossBreached')) or (current_price is not None and stop_loss is not None and current_price <= stop_loss)
+        follow_through_failed = bool(details.get('followThroughFailed'))
+        impulse_trail_armed = bool(details.get('impulseTrailArmed'))
+        scale_out_taken = bool(details.get('scaleOutAlreadyTaken'))
+        scale_out_ready = bool(details.get('scaleOutReady')) or (template == 'scale_out_then_trail' and target_reached and not scale_out_taken)
+        execution_status = 'No order pending'
+        broker_status = 'Connected'
+        logic_state = 'NO_EXIT_SIGNAL'
+        logic_summary = 'No exit signal is active right now.'
+        why_not = 'No exit condition is currently active.'
+        next_trigger = 'Continue monitoring'
+        next_trigger_level = None
+        next_trigger_distance = None
+        current_phase = 'Monitoring'
+        phase_transition = 'Will continue monitoring until an exit rule arms.'
+        structure_health = 'Neutral'
+        signal_conflict = 'None'
+        trail_status = 'Configured' if trailing_stop is not None else 'Unavailable'
+        volatility_regime = 'Normal'
+        risk_state = 'Stable'
+        risk_compression = 'Mixed'
+        exit_readiness_score = 0.15
+        exit_likelihood = 'Low probability of exit in the next review cycle.'
+        strategy_biases = []
+        exit_sensitivity = 'Balanced'
+        active_trigger_label = None
+        if cooldown_active or not position_snapshot.get('isOpen'):
+            logic_state = 'COOLDOWN_ACTIVE'
+            logic_summary = 'Cooldown active'
+            why_not = 'The position is flat and the cooldown window is blocking immediate re-entry.'
+            next_trigger = 'Cooldown expiry'
+            next_trigger_level = details.get('reentryBlockedUntilUtc')
+            current_phase = 'Cooldown'
+            phase_transition = 'Will transition back to fresh-entry monitoring after the cooldown expires.'
+            structure_health = 'N/A'
+            trail_status = 'Inactive'
+            risk_state = 'Flat'
+            risk_compression = 'Not applicable'
+            exit_readiness_score = 0.0
+            exit_likelihood = 'No exit is pending because the position is already flat.'
+        elif broker_exit_pending or state == 'EXIT_PENDING':
+            logic_state = 'EXIT_PENDING'
+            logic_summary = 'Exit pending'
+            why_not = 'An exit has already been prepared or submitted, so the worker is waiting on execution rather than searching for a new signal.'
+            next_trigger = 'Broker acknowledgement / fill'
+            current_phase = 'Exit Pending'
+            phase_transition = 'Will transition to closed once the broker confirms the exit fill.'
+            structure_health = 'Exit ready'
+            trail_status = 'Locked'
+            risk_state = 'De-risking'
+            risk_compression = 'Active'
+            execution_status = 'Exit pending'
+            exit_readiness_score = 1.0
+            exit_likelihood = 'Exit is already in motion.'
+        elif stop_breached:
+            logic_state = 'STOP_LOSS_BREACHED_EXIT_READY'
+            logic_summary = 'Stop loss breached'
+            why_not = 'Price has crossed the stop-loss rail and the position is waiting for the exit path to finish.'
+            next_trigger = 'Exit submission'
+            next_trigger_level = stop_loss
+            current_phase = 'Protective Exit'
+            phase_transition = 'Will transition to exit pending once the protective order is created.'
+            structure_health = 'Failed'
+            trail_status = 'Overridden'
+            risk_state = 'High risk'
+            risk_compression = 'Failing'
+            exit_readiness_score = 0.98
+            exit_likelihood = 'Exit is highly likely on the next worker cycle.'
+            active_trigger_label = 'Stop loss'
+        elif trail_breached:
+            logic_state = 'TRAIL_BREACH_EXIT_READY'
+            logic_summary = 'Trailing stop breached'
+            why_not = 'Price is below the active trailing rail, so the worker is preparing to close the position.'
+            next_trigger = 'Exit submission'
+            next_trigger_level = trailing_stop
+            current_phase = 'Trail Exit'
+            phase_transition = 'Will transition to exit pending once the trailing-stop exit is submitted.'
+            structure_health = 'Failed'
+            trail_status = 'Breached'
+            risk_state = 'High risk'
+            risk_compression = 'Failing'
+            exit_readiness_score = 0.95
+            exit_likelihood = 'Exit is highly likely on the next worker cycle.'
+            active_trigger_label = 'Trailing stop'
+        elif template == 'first_failed_follow_through':
+            strategy_biases = ['profit maximization bias', 'delayed exit bias', 'structure confirmation']
+            exit_sensitivity = 'Balanced'
+            if target_reached and not follow_through_failed:
+                logic_state = 'TP_HIT_AWAITING_FOLLOW_THROUGH_FAILURE'
+                logic_summary = 'TP hit awaiting weakness'
+                why_not = 'Price has exceeded the profit target, but the template has not detected failed follow-through yet.'
+                next_trigger = 'Failed follow-through confirmation'
+                next_trigger_level = trailing_stop or profit_target
+                current_phase = 'Runner'
+                phase_transition = 'Will transition to exit ready when the follow-through fails or the active protection rail is breached.'
+                structure_health = 'Strong'
+                trail_status = 'Monitoring follow-through'
+                risk_state = 'Improving'
+                risk_compression = 'Active'
+                exit_readiness_score = 0.62
+                exit_likelihood = 'Moderate probability of exit if momentum fades in the next review cycle.'
+                active_trigger_label = 'Follow-through failure'
+            elif target_reached and follow_through_failed:
+                logic_state = 'FOLLOW_THROUGH_FAILED_EXIT_READY'
+                logic_summary = 'Follow-through failed'
+                why_not = 'The profit target has been hit and the runner has now lost momentum.'
+                next_trigger = 'Exit submission'
+                next_trigger_level = trailing_stop or profit_target
+                current_phase = 'Exit Ready'
+                phase_transition = 'Will transition to exit pending once the failed follow-through exit is submitted.'
+                structure_health = 'Weakening'
+                trail_status = 'Armed'
+                risk_state = 'At risk'
+                risk_compression = 'Slowing'
+                exit_readiness_score = 0.88
+                exit_likelihood = 'High probability of exit soon.'
+                active_trigger_label = 'Failed follow-through'
+            else:
+                logic_state = 'AWAITING_PROFIT_TARGET'
+                logic_summary = 'Awaiting profit target'
+                why_not = 'The runner has not yet reached the profit target that arms failed follow-through monitoring.'
+                next_trigger = 'Profit target touch'
+                next_trigger_level = profit_target
+                current_phase = 'Target Hunt'
+                phase_transition = 'Will transition to runner supervision after the target is reached.'
+                structure_health = 'Healthy'
+                trail_status = 'Configured'
+                risk_state = 'Stable'
+                risk_compression = 'Mixed'
+                exit_readiness_score = 0.28
+                exit_likelihood = 'Low probability of exit before the target is reached.'
+                active_trigger_label = 'Profit target'
+        elif template == 'scale_out_then_trail':
+            strategy_biases = ['partial-profit bias', 'runner management', 'trail protection']
+            exit_sensitivity = 'Balanced'
+            if scale_out_taken:
+                logic_state = 'RUNNER_ACTIVE_TRAIL_PROTECTING'
+                logic_summary = 'Runner active trail protecting'
+                why_not = 'Partial profits have already been secured and the remaining size is being managed by the trailing rail.'
+                next_trigger = 'Trailing stop breach'
+                next_trigger_level = trailing_stop
+                current_phase = 'Runner'
+                phase_transition = 'Will transition to exit ready when the trailing stop is breached.'
+                structure_health = 'Healthy'
+                trail_status = 'Active'
+                risk_state = 'Improving'
+                risk_compression = 'Active'
+                exit_readiness_score = 0.48
+                exit_likelihood = 'Moderate probability of exit if the runner gives back momentum.'
+                active_trigger_label = 'Trailing stop'
+            elif scale_out_ready:
+                logic_state = 'SCALE_OUT_READY'
+                logic_summary = 'Scale-out ready'
+                why_not = 'The profit target has been reached and the worker is ready to harvest the first partial profit.'
+                next_trigger = 'Scale-out submission'
+                next_trigger_level = profit_target
+                current_phase = 'Scale Out'
+                phase_transition = 'Will transition to runner mode after the scale-out fill is recorded.'
+                structure_health = 'Healthy'
+                trail_status = 'Pending runner activation'
+                risk_state = 'Improving'
+                risk_compression = 'Active'
+                exit_readiness_score = 0.78
+                exit_likelihood = 'High probability of scale-out soon.'
+                active_trigger_label = 'Scale-out trigger'
+            else:
+                logic_state = 'AWAITING_SCALE_OUT_TRIGGER'
+                logic_summary = 'Awaiting scale-out trigger'
+                why_not = 'Price has not yet reached the first profit-taking rail required to begin scaling out.'
+                next_trigger = 'Scale-out threshold'
+                next_trigger_level = profit_target
+                current_phase = 'Pre-Target'
+                phase_transition = 'Will transition to scale-out once price reaches the profit target.'
+                structure_health = 'Healthy'
+                trail_status = 'Configured'
+                risk_state = 'Stable'
+                risk_compression = 'Mixed'
+                exit_readiness_score = 0.32
+                exit_likelihood = 'Low to moderate probability of exit before the first target is reached.'
+                active_trigger_label = 'Profit target'
+        elif template == 'trail_after_impulse':
+            strategy_biases = ['let-run bias', 'impulse confirmation', 'trail protection']
+            exit_sensitivity = 'Delayed'
+            if impulse_trail_armed:
+                logic_state = 'TRAIL_ACTIVE_STRUCTURE_HEALTHY'
+                logic_summary = 'Trail active'
+                why_not = 'The impulse threshold has been reached and the trailing rail is now protecting gains while trend structure remains intact.'
+                next_trigger = 'Trailing stop breach'
+                next_trigger_level = trailing_stop
+                current_phase = 'Trail Active'
+                phase_transition = 'Will transition to exit ready when price breaches the trailing stop.'
+                structure_health = 'Healthy'
+                trail_status = 'Active'
+                risk_state = 'Improving'
+                risk_compression = 'Active'
+                exit_readiness_score = 0.45
+                exit_likelihood = 'Moderate probability of exit if the runner pulls back.'
+                active_trigger_label = 'Trailing stop'
+            else:
+                logic_state = 'AWAITING_IMPULSE_CONFIRMATION'
+                logic_summary = 'Awaiting impulse confirmation'
+                why_not = 'Price has not moved far enough to activate the impulse-based trailing logic yet.'
+                next_trigger = 'Impulse confirmation'
+                next_trigger_level = profit_target
+                current_phase = 'Impulse Build'
+                phase_transition = 'Will transition to active trailing once the impulse threshold is reached.'
+                structure_health = 'Healthy'
+                trail_status = 'Configured'
+                risk_state = 'Stable'
+                risk_compression = 'Mixed'
+                exit_readiness_score = 0.24
+                exit_likelihood = 'Low probability of exit before the impulse threshold is reached.'
+                active_trigger_label = 'Impulse threshold'
+        elif template == 'time_stop_with_structure_check':
+            strategy_biases = ['time-based governance', 'structure check', 'risk control']
+            exit_sensitivity = 'Conservative'
+            hours_until_expiry = self._maybe_float(exit_plan.get('hoursUntilExpiry') or details.get('hoursUntilExpiry'))
+            if hours_until_expiry is not None and hours_until_expiry <= 0:
+                logic_state = 'TIME_STOP_DUE_AWAITING_STRUCTURE_CHECK'
+                logic_summary = 'Time stop due'
+                why_not = 'The maximum hold window has expired and the worker is waiting on the structure check result.'
+                next_trigger = 'Structure check verdict'
+                current_phase = 'Time Stop Review'
+                phase_transition = 'Will transition either to an extension or to exit ready after the structure check.'
+                structure_health = 'Review'
+                risk_state = 'At risk'
+                risk_compression = 'Slowing'
+                exit_readiness_score = 0.76
+                exit_likelihood = 'Moderate to high probability of exit soon.'
+            else:
+                logic_state = 'TIME_STOP_MONITORING'
+                logic_summary = 'Time stop monitoring'
+                why_not = 'The trade is still inside its allowed hold window, so the worker is monitoring for either a price-based exit or the later time-stop review.'
+                next_trigger = 'Time-stop review'
+                next_trigger_level = details.get('positionExpiresAtUtc') or exit_plan.get('positionExpiresAtUtc')
+                current_phase = 'Hold Window'
+                phase_transition = 'Will transition to time-stop review when the hold window expires.'
+                structure_health = 'Healthy'
+                risk_state = 'Stable'
+                risk_compression = 'Mixed'
+                exit_readiness_score = 0.22
+                exit_likelihood = 'Low probability of exit unless the trade nears expiry or breaches protection.'
+        if next_trigger_level is not None and current_price is not None and isinstance(next_trigger_level, (int, float)):
+            next_trigger_distance = float(next_trigger_level) - current_price
+        elif next_trigger_level is not None and isinstance(next_trigger_level, str):
+            next_trigger_distance = None
+        distance_from_stop = None
+        distance_from_trail = None
+        distance_from_target = None
+        if current_price is not None and stop_loss is not None and current_price:
+            distance_from_stop = ((current_price - stop_loss) / current_price) * 100.0
+        if current_price is not None and trailing_stop is not None and current_price:
+            distance_from_trail = ((current_price - trailing_stop) / current_price) * 100.0
+        if current_price is not None and profit_target is not None and current_price:
+            distance_from_target = ((profit_target - current_price) / current_price) * 100.0
+        if managed_only and 'managed only' not in why_not.lower():
+            why_not = f'{why_not} Symbol is managed-only, so the worker is supervising exits without allowing fresh entries.'
+        if managed_only:
+            execution_status = 'Managed-only supervision'
+        position_maturity = 'Unknown'
+        hours_since_entry = self._derive_hours_since_entry(position_snapshot.get('entryTimeUtc'))
+        if hours_since_entry is not None and max_hold_hours:
+            pct = hours_since_entry / max_hold_hours if max_hold_hours else 0.0
+            if pct < 0.33:
+                position_maturity = 'Early'
+            elif pct < 0.8:
+                position_maturity = 'Normal'
+            else:
+                position_maturity = 'Extended'
+        current_progress_r = None
+        expected_exit_range = None
+        if entry_price is not None and stop_loss is not None and current_price is not None:
+            risk_per_unit = entry_price - stop_loss
+            if risk_per_unit > 0:
+                current_progress_r = (current_price - entry_price) / risk_per_unit
+                expected_exit_range = {'from': 1.0, 'to': 2.5} if template in {'scale_out_then_trail', 'first_failed_follow_through'} else {'from': 0.8, 'to': 2.0}
+        state_history = self._build_exit_state_history(lifecycle, logic_summary)
+        return {
+            'worker': 'Exit Worker',
+            'logicState': logic_state,
+            'logicSummary': logic_summary,
+            'whyNotExitingYet': why_not,
+            'nextExitTrigger': next_trigger,
+            'nextTriggerLevel': next_trigger_level,
+            'nextTriggerDistance': next_trigger_distance,
+            'nextReviewAtUtc': (latest_evaluation or {}).get('nextEvaluationAtUtc') or details.get('nextEvaluationAtUtc'),
+            'currentPhase': current_phase,
+            'phaseTransitionCondition': phase_transition,
+            'monitoringStatus': monitoring_status,
+            'lifecycleState': lifecycle_state,
+            'cooldownActive': cooldown_active,
+            'managedOnly': managed_only,
+            'managedOnlyExplanation': 'Symbol is no longer eligible for fresh entries and is under exit-only supervision.' if managed_only else None,
+            'activeTriggerLabel': active_trigger_label,
+            'structureHealth': structure_health,
+            'signalConflict': signal_conflict,
+            'trailStatus': trail_status,
+            'volatilityRegime': volatility_regime,
+            'riskState': risk_state,
+            'riskCompression': risk_compression,
+            'distanceFromStopPct': distance_from_stop,
+            'distanceFromTrailPct': distance_from_trail,
+            'distanceFromTargetPct': distance_from_target,
+            'unrealizedProfitExposed': unrealized_pnl if unrealized_pnl and unrealized_pnl > 0 else 0.0,
+            'exitReadinessScore': round(exit_readiness_score, 2),
+            'exitLikelihood': exit_likelihood,
+            'expectedExitRangeR': expected_exit_range,
+            'currentProgressR': current_progress_r,
+            'positionMaturity': position_maturity,
+            'strategyBiases': strategy_biases,
+            'exitSensitivity': exit_sensitivity,
+            'executionStatus': execution_status,
+            'brokerStatus': broker_status,
+            'stateHistory': state_history,
+            'evaluatedAtUtc': (latest_evaluation or {}).get('evaluatedAtUtc'),
+        }
+
+    def _build_exit_state_history(self, lifecycle: list[dict[str, Any]], logic_summary: str) -> list[dict[str, Any]]:
+        history: list[dict[str, Any]] = []
+        for event in (lifecycle or [])[-3:]:
+            history.append({
+                'time': event.get('eventTime'),
+                'label': str(event.get('eventType') or '').replace('_', ' ').title(),
+                'detail': event.get('message'),
+            })
+        if not history:
+            history.append({'time': None, 'label': logic_summary, 'detail': 'Latest exit-worker verdict.'})
+        return history
+
+    @staticmethod
+    def _derive_hours_since_entry(entry_time_value: Any) -> float | None:
+        if not entry_time_value:
+            return None
+        try:
+            from datetime import datetime, timezone
+            raw = str(entry_time_value)
+            if raw.endswith('Z'):
+                raw = raw[:-1] + '+00:00'
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max((datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 3600.0, 0.0)
+        except Exception:
+            return None
 
     @staticmethod
     def _maybe_float(value: Any) -> float | None:

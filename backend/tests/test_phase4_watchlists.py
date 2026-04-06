@@ -2687,6 +2687,68 @@ def test_watchlist_exit_worker_dry_run_skips_structure_extended_time_stop(tmp_pa
         assert result['rows'] == []
 
 
+def test_watchlist_exit_worker_skips_broker_lookups_without_exit_trigger(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+
+        def _snapshot(*args, scope=None, **kwargs):
+            if scope != 'stocks_only':
+                return {'scope': scope, 'summary': {}, 'rows': []}
+            return {
+                'scope': scope,
+                'summary': {'openPositionCount': 1},
+                'rows': [
+                    {
+                        'scope': 'stocks_only',
+                        'assetClass': 'stock',
+                        'symbol': 'AAPL',
+                        'managedOnly': False,
+                        'monitoringStatus': 'ACTIVE',
+                        'positionState': {
+                            'positionId': 'pos-no-trigger',
+                            'currentPrice': 101.0,
+                            'exitReasons': [],
+                            'stopLossBreached': False,
+                            'trailingStopBreached': False,
+                            'scaleOutReady': False,
+                            'followThroughFailed': False,
+                            'positionExpired': False,
+                        },
+                        'exitTemplate': 'scale_out_then_trail',
+                    }
+                ],
+            }
+
+        monkeypatch.setattr(watchlist_service, 'get_exit_readiness_snapshot', _snapshot)
+
+        monkeypatch.setattr(runtime_state, 'get', lambda: SimpleNamespace(running=True, stock_mode='PAPER'))
+        monkeypatch.setattr(
+            'app.services.watchlist_exit_worker.get_scope_session_status',
+            lambda scope, observed_at: SimpleNamespace(
+                session_open=True,
+                to_dict=lambda: {'scope': scope, 'observedAtUtc': observed_at.isoformat(), 'sessionOpen': True},
+            ),
+        )
+        monkeypatch.setattr(tradier_client, 'is_ready', lambda mode=None: True)
+        monkeypatch.setattr(
+            tradier_client,
+            'get_position_quantity_sync',
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('should not fetch broker quantity without an exit trigger')),
+        )
+        monkeypatch.setattr(
+            tradier_client,
+            'get_orders_sync',
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('should not fetch broker orders without an exit trigger')),
+        )
+
+        status = watchlist_exit_worker.get_status(db)
+        result = watchlist_exit_worker.run_exit_sweep(db, execute=False, limit=10)
+
+        assert status['summary']['candidateExitCount'] == 0
+        assert result['summary']['candidateCount'] == 0
+        assert result['rows'] == []
+
+
 def test_exit_readiness_snapshot_marks_structure_time_stop_expired_after_extension_window(tmp_path) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
         db = SessionFactory()

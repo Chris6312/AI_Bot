@@ -303,15 +303,25 @@ class RuntimeVisibilityService:
         runtime_running = bool(control_plane.get("runtimeRunning"))
         dependencies_operational = bool(dependency_summary.get("operationalReady"))
         supervision_ready = bool(authorization_ready and dependencies_operational)
-        fresh_entry_base_ready = bool(supervision_ready and runtime_running and execution_gate.get("allowed"))
+        fresh_entry_base_ready = bool(supervision_ready)
 
         for scope_name in ("stocks_only", "crypto_only"):
             truth = scope_truth_raw.get(scope_name) if isinstance(scope_truth_raw, dict) else {}
+            legacy_ready = bool((truth or {}).get("ready", False))
             normalized = {
                 "scope": scope_name,
                 "state": str((truth or {}).get("state") or "MISSING"),
                 "reason": str((truth or {}).get("reason") or ""),
-                "ready": bool((truth or {}).get("ready", False)),
+                "ready": legacy_ready,
+                "freshnessState": str((truth or {}).get("freshnessState") or "UNKNOWN"),
+                "freshEntryState": str((truth or {}).get("freshEntryState") or "UNKNOWN"),
+                "freshEntriesReady": bool((truth or {}).get("freshEntriesReady", legacy_ready)),
+                "reviewState": str((truth or {}).get("reviewState") or "OK"),
+                "reviewReason": str((truth or {}).get("reviewReason") or ""),
+                "operationalState": str((truth or {}).get("operationalState") or "HEALTHY"),
+                "operationalReason": str((truth or {}).get("operationalReason") or ""),
+                "operationalImpairment": bool((truth or {}).get("operationalImpairment", False)),
+                "supervisionOnly": bool((truth or {}).get("supervisionOnly", False)),
                 "activeUploadId": (truth or {}).get("activeUploadId"),
                 "activeUploadReceivedAtUtc": (truth or {}).get("activeUploadReceivedAtUtc"),
                 "watchlistExpiresAtUtc": (truth or {}).get("watchlistExpiresAtUtc"),
@@ -328,33 +338,47 @@ class RuntimeVisibilityService:
                 or normalized["openPositionCount"] > 0
             )
             normalized["tracked"] = tracked
-            normalized["freshEntryReady"] = bool(fresh_entry_base_ready and tracked and normalized["ready"])
-            normalized["supervisionReady"] = bool(supervision_ready and (tracked or authorization_ready))
+            normalized["freshEntryReady"] = bool(fresh_entry_base_ready and tracked and normalized["freshEntriesReady"])
+            normalized["supervisionReady"] = bool(supervision_ready and (tracked or authorization_ready) and not normalized["operationalImpairment"])
             scopes[scope_name] = normalized
             if tracked:
                 tracked_scope_payloads.append(normalized)
 
-        active_issues: list[str] = []
+        critical_issues: list[str] = []
+        scope_issues: list[str] = []
+        review_items: list[str] = []
         if not authorization_ready:
-            active_issues.append(str(control_plane.get("reason") or "Authorization surfaces are not fully configured."))
-        elif not runtime_running:
-            active_issues.append(str(control_plane.get("reason") or "Runtime running flag is false."))
+            critical_issues.append(str(control_plane.get("reason") or "Authorization surfaces are not fully configured."))
+
+        if not runtime_running:
+            review_items.append(str(control_plane.get("reason") or "Runtime running flag is false."))
 
         if not dependencies_operational:
-            active_issues.append("One or more critical dependencies or worker probes are degraded.")
+            critical_issues.append("One or more critical dependencies or worker probes are degraded.")
 
         if not execution_gate.get("allowed"):
             gate_reason = str(execution_gate.get("reason") or execution_gate.get("state") or "Execution gate is blocking entries.")
             if gate_reason:
-                active_issues.append(gate_reason)
+                review_items.append(gate_reason)
 
         for scope_name, scope_payload in scopes.items():
             if not scope_payload["tracked"]:
                 continue
-            if scope_payload["state"] != "READY":
-                reason = scope_payload.get("reason") or scope_payload["state"]
-                active_issues.append(f"{scope_name}: {reason}")
+            if scope_payload["operationalImpairment"]:
+                reason = scope_payload.get("operationalReason") or scope_payload.get("reason") or scope_payload["state"]
+                critical_issues.append(f"{scope_name}: {reason}")
+            elif not scope_payload.get("freshEntriesReady"):
+                reason = (
+                    scope_payload.get("reason")
+                    or scope_payload.get("reviewReason")
+                    or scope_payload.get("freshEntryState")
+                    or scope_payload["state"]
+                )
+                scope_issues.append(f"{scope_name}: {reason}")
+            elif scope_payload.get("reviewReason"):
+                review_items.append(f"{scope_name}: {scope_payload['reviewReason']}")
 
+        active_issues = critical_issues + scope_issues
         unique_issues: list[str] = []
         seen: set[str] = set()
         for issue in active_issues:
@@ -364,21 +388,36 @@ class RuntimeVisibilityService:
             seen.add(normalized_issue)
             unique_issues.append(normalized_issue)
 
+        unique_reviews: list[str] = []
+        seen_reviews: set[str] = set()
+        for item in review_items:
+            normalized_item = str(item).strip()
+            if not normalized_item or normalized_item in seen_reviews:
+                continue
+            seen_reviews.add(normalized_item)
+            unique_reviews.append(normalized_item)
+
         fresh_entry_ready = bool(any(scope["freshEntryReady"] for scope in tracked_scope_payloads))
         if not tracked_scope_payloads:
             fresh_entry_ready = False
             if runtime_running and authorization_ready:
-                unique_issues.append("No active watchlist scopes are currently loaded for fresh entries.")
+                unique_reviews.append("No active watchlist scopes are currently loaded for fresh entries.")
 
-        if not supervision_ready:
-            truth_state = "BLOCKED"
-            truth_reason = unique_issues[0] if unique_issues else "Supervision rails are not operational."
+        if critical_issues:
+            truth_state = "DEGRADED"
+            truth_reason = unique_issues[0]
         elif fresh_entry_ready:
             truth_state = "READY"
-            truth_reason = "At least one tracked scope is eligible for fresh entries and supervision is healthy."
+            truth_reason = "Supervision and fresh-entry monitoring are healthy."
         else:
             truth_state = "REVIEW"
-            truth_reason = unique_issues[0] if unique_issues else "No tracked scope is currently eligible for fresh entries."
+            truth_reason = (
+                unique_issues[0]
+                if unique_issues
+                else unique_reviews[0]
+                if unique_reviews
+                else "Supervision is healthy. Fresh entries are currently paused or waiting on review conditions."
+            )
 
         return {
             "state": truth_state,
@@ -387,6 +426,7 @@ class RuntimeVisibilityService:
             "supervisionReady": supervision_ready,
             "trackedScopeCount": len(tracked_scope_payloads),
             "activeIssues": unique_issues,
+            "reviewItems": unique_reviews,
             "scopes": scopes,
         }
 
@@ -521,17 +561,69 @@ class RuntimeVisibilityService:
             if not isinstance(snapshot, dict):
                 continue
             truth_payload = snapshot.get("scopeTruth") if isinstance(snapshot.get("scopeTruth"), dict) else snapshot
+            raw_state = str((truth_payload or {}).get("state") or "READY").upper()
+            raw_reason = str((truth_payload or {}).get("reason") or "")
+            freshness_state = str((truth_payload or {}).get("freshnessState") or "").upper()
+            if not freshness_state:
+                if raw_state in {"STALE", "MISSING"}:
+                    freshness_state = raw_state
+                else:
+                    freshness_state = "FRESH" if raw_state in {"READY", "HEALTHY"} else "UNKNOWN"
+            fresh_entry_state = str((truth_payload or {}).get("freshEntryState") or "").upper()
+            if not fresh_entry_state:
+                if raw_state in {"READY", "HEALTHY"}:
+                    fresh_entry_state = "READY"
+                elif raw_state in {"STALE", "MISSING", "PAUSED"}:
+                    fresh_entry_state = raw_state
+                elif raw_state == "DEGRADED":
+                    fresh_entry_state = "PAUSED"
+                else:
+                    fresh_entry_state = "UNKNOWN"
+            fresh_entries_ready = (truth_payload or {}).get("freshEntriesReady")
+            if fresh_entries_ready is None:
+                fresh_entries_ready = raw_state in {"READY", "HEALTHY"}
+            review_state = str((truth_payload or {}).get("reviewState") or "").upper()
+            review_reason = str((truth_payload or {}).get("reviewReason") or "")
+            if not review_state:
+                if raw_state in {"DEGRADED", "STALE", "MISSING", "PAUSED"}:
+                    review_state = "REVIEW"
+                    if not review_reason:
+                        review_reason = raw_reason
+                else:
+                    review_state = "OK"
             normalized_truth = {
-                "state": str((truth_payload or {}).get("state") or "READY"),
-                "reason": str((truth_payload or {}).get("reason") or ""),
+                "state": raw_state,
+                "reason": raw_reason,
+                "freshnessState": freshness_state,
+                "freshEntryState": fresh_entry_state,
+                "freshEntriesReady": bool(fresh_entries_ready),
+                "reviewState": review_state,
+                "reviewReason": review_reason,
+                "operationalState": str((truth_payload or {}).get("operationalState") or "HEALTHY").upper(),
+                "operationalReason": str((truth_payload or {}).get("operationalReason") or ""),
+                "operationalImpairment": bool((truth_payload or {}).get("operationalImpairment", False)),
             }
             scope_truth[str(scope)] = normalized_truth
 
         scope_issues = [
-            f"{scope}: {truth.get('reason')}"
+            f"{scope}: {truth.get('reason') or truth.get('reviewReason') or truth.get('state')}"
             for scope, truth in scope_truth.items()
-            if str(truth.get("state") or "READY") != "READY"
+            if str(truth.get("state") or "READY").upper() not in {"READY", "HEALTHY"}
         ]
+        operational_issues = [
+            f"{scope}: {truth.get('operationalReason') or truth.get('reason') or truth.get('state')}"
+            for scope, truth in scope_truth.items()
+            if bool(truth.get("operationalImpairment")) or str(truth.get("operationalState") or "HEALTHY") == "DEGRADED"
+        ]
+        review_items = [
+            f"{scope}: {truth.get('reviewReason') or truth.get('reason') or truth.get('state')}"
+            for scope, truth in scope_truth.items()
+            if not (bool(truth.get("operationalImpairment")) or str(truth.get("operationalState") or "HEALTHY") == "DEGRADED")
+            and str(truth.get("reviewState") or "OK") != "OK"
+        ]
+        stale_scopes = [scope for scope, truth in scope_truth.items() if str(truth.get("freshnessState") or "").upper() == "STALE"]
+        missing_scopes = [scope for scope, truth in scope_truth.items() if str(truth.get("freshnessState") or "").upper() == "MISSING"]
+        paused_scopes = [scope for scope, truth in scope_truth.items() if str(truth.get("freshEntryState") or "").upper() == "PAUSED"]
 
         probe = self._build_worker_probe(
             name="Watchlist Monitor",
@@ -549,10 +641,58 @@ class RuntimeVisibilityService:
                 "scopeIssues": scope_issues,
             },
         )
-        if probe["state"] == "READY" and scope_issues:
-            probe["state"] = "DEGRADED"
-            probe["ready"] = True
-            probe["reason"] = "Worker loop is active, but one or more scopes need review."
+
+        freshness_state = "UNTRACKED"
+        freshness_reason = "No tracked watchlist scopes are loaded right now."
+        if scope_truth:
+            if stale_scopes and (missing_scopes or paused_scopes):
+                freshness_state = "MIXED"
+                freshness_reason = "Some scopes are fresh while others are stale or paused for fresh entries."
+            elif stale_scopes:
+                freshness_state = "STALE"
+                freshness_reason = "One or more scopes have stale watchlist freshness for fresh entries."
+            elif missing_scopes:
+                freshness_state = "MISSING"
+                freshness_reason = "One or more scopes are missing an active watchlist for fresh entries."
+            else:
+                freshness_state = "FRESH"
+                freshness_reason = "Tracked watchlist scopes are fresh enough for fresh-entry evaluation."
+
+        probe["details"]["workerHealth"] = {
+            "state": probe["state"],
+            "ready": probe["ready"],
+            "reason": probe["reason"],
+            "checkedAtUtc": probe["checkedAtUtc"],
+        }
+        probe["details"]["freshness"] = {
+            "state": freshness_state,
+            "reason": freshness_reason,
+            "staleScopes": stale_scopes,
+            "missingScopes": missing_scopes,
+            "pausedScopes": paused_scopes,
+        }
+        probe["details"]["scopeReview"] = {
+            "state": "REVIEW" if review_items else "OK",
+            "reason": review_items[0] if review_items else "No scope review items are active.",
+            "issues": review_items,
+        }
+        probe["details"]["operationalImpairment"] = {
+            "state": "DEGRADED" if operational_issues else "HEALTHY",
+            "reason": operational_issues[0] if operational_issues else "No operational impairments are currently reported.",
+            "issues": operational_issues,
+        }
+
+        if probe["state"] == "READY":
+            if operational_issues:
+                probe["state"] = "DEGRADED"
+                probe["ready"] = False
+                probe["reason"] = operational_issues[0]
+            elif scope_issues:
+                probe["state"] = "DEGRADED"
+                probe["ready"] = True
+                probe["reason"] = scope_issues[0]
+            elif review_items:
+                probe["reason"] = review_items[0]
         return probe
 
     def _probe_watchlist_exit_worker(self, observed_at: datetime) -> dict[str, Any]:
@@ -670,7 +810,7 @@ class RuntimeVisibilityService:
             "name": name,
             "state": "STALE",
             "ready": False,
-            "reason": f"Last worker activity was {age_seconds}s ago, outside the expected poll window.",
+            "reason": f"Worker heartbeat is stale. Last activity was {age_seconds}s ago, outside the expected poll window.",
             "checkedAtUtc": observed_at.isoformat(),
             "details": payload_details,
         }

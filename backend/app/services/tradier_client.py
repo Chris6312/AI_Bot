@@ -87,9 +87,11 @@ class TradierClient:
         self._max_positions_cache_entries = 8
         self._max_positions_snapshot_cache_entries = 8
         self._max_orders_cache_entries = 32
+        self._max_orders_response_cache_entries = 4
         self._positions_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._positions_snapshot_cache: dict[tuple[str, bool], tuple[float, list[dict[str, Any]]]] = {}
         self._orders_cache: dict[tuple[str, str, str, tuple[str, ...]], tuple[float, list[dict[str, Any]]]] = {}
+        self._orders_response_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 
     @staticmethod
@@ -414,15 +416,36 @@ class TradierClient:
         if use_cache and cached and self._cache_is_fresh(cached[0], self._orders_cache_ttl_seconds):
             return [dict(item) for item in cached[1]]
 
-        creds = self._credentials_for_mode(mode)
-        payload = self._request_json(
-            "GET",
-            f"accounts/{creds['account_id']}/orders",
-            mode=mode,
-            timeout=timeout,
-        )
-        raw_orders = _extract_collection(payload, 'orders', 'order')
-        orders = self.normalize_orders_response(raw_orders)
+        response_cached = self._orders_response_cache.get(selected_mode)
+        if use_cache and response_cached and self._cache_is_fresh(response_cached[0], self._orders_cache_ttl_seconds):
+            orders = [dict(item) for item in response_cached[1]]
+        else:
+            creds = self._credentials_for_mode(mode)
+            try:
+                payload = self._request_json(
+                    "GET",
+                    f"accounts/{creds['account_id']}/orders",
+                    mode=mode,
+                    timeout=timeout,
+                )
+            except RequestException as exc:
+                logger.warning("Tradier orders fetch failed for %s: %s", selected_mode, exc)
+                if response_cached:
+                    orders = [dict(item) for item in response_cached[1]]
+                else:
+                    raise
+            else:
+                raw_orders = _extract_collection(payload, 'orders', 'order')
+                orders = self.normalize_orders_response(raw_orders)
+                self._orders_response_cache[selected_mode] = (
+                    time.monotonic(),
+                    [dict(item) for item in orders],
+                )
+                self._prune_cache(
+                    self._orders_response_cache,
+                    ttl_seconds=self._orders_cache_ttl_seconds,
+                    max_entries=self._max_orders_response_cache_entries,
+                )
 
         filtered: list[dict[str, Any]] = []
         for order in orders:

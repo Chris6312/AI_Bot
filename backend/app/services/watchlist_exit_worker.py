@@ -329,7 +329,8 @@ class WatchlistExitWorkerService:
 
         mode = runtime_state.get().stock_mode
         symbol = str(row.get("symbol") or "").upper().strip()
-        broker_state = self._get_broker_exit_state(symbol, mode=mode)
+        exit_trigger = self._primary_exit_trigger(row)
+        exit_reasons = self._build_exit_reasons(row)
         payload = {
             "scope": scope,
             "assetClass": row.get("assetClass") or "stock",
@@ -341,31 +342,47 @@ class WatchlistExitWorkerService:
             "positionState": row.get("positionState", {}),
             "currentPrice": self._safe_float(row.get("positionState", {}).get("currentPrice")),
             "exitTemplate": row.get("exitTemplate"),
-            "exitTrigger": self._primary_exit_trigger(row),
-            "exitReasons": self._build_exit_reasons(row),
+            "exitTrigger": exit_trigger,
+            "exitReasons": exit_reasons,
             "action": None,
             "reason": None,
-            "brokerQuantity": int(broker_state.get("brokerQuantity") or 0),
-            "brokerReservedQuantity": int(broker_state.get("reservedQuantity") or 0),
-            "brokerAvailableQuantity": int(broker_state.get("availableQuantity") or 0),
-            "brokerPendingOrders": list(broker_state.get("pendingOrders") or []),
-            "brokerExitPending": bool(broker_state.get("pendingOrders")),
-            "requestedQuantity": self._determine_requested_quantity(
-                trigger=self._primary_exit_trigger(row),
-                available_quantity=int(broker_state.get("availableQuantity") or 0),
-            ),
-            "quantityTruth": self._build_stock_quantity_truth(db, symbol=symbol, broker_state=broker_state),
+            "brokerQuantity": 0,
+            "brokerReservedQuantity": 0,
+            "brokerAvailableQuantity": 0,
+            "brokerPendingOrders": [],
+            "brokerExitPending": False,
+            "requestedQuantity": 0,
+            "quantityTruth": None,
         }
-
-        if payload["brokerExitPending"]:
-            payload["action"] = "EXIT_ALREADY_IN_PROGRESS"
-            payload["reason"] = "BROKER_EXIT_PENDING"
-            payload["monitoringStatus"] = "EXIT_PENDING"
-            return payload
 
         if self._has_blocking_exit_intent(db, row):
             payload["action"] = "EXIT_ALREADY_IN_PROGRESS"
             payload["reason"] = "EXIT_INTENT_ALREADY_ACTIVE"
+            payload["monitoringStatus"] = "EXIT_PENDING"
+            return payload
+
+        if not exit_trigger:
+            return payload
+
+        broker_state = self._get_broker_exit_state(symbol, mode=mode)
+        payload.update(
+            {
+                "brokerQuantity": int(broker_state.get("brokerQuantity") or 0),
+                "brokerReservedQuantity": int(broker_state.get("reservedQuantity") or 0),
+                "brokerAvailableQuantity": int(broker_state.get("availableQuantity") or 0),
+                "brokerPendingOrders": list(broker_state.get("pendingOrders") or []),
+                "brokerExitPending": bool(broker_state.get("pendingOrders")),
+                "requestedQuantity": self._determine_requested_quantity(
+                    trigger=exit_trigger,
+                    available_quantity=int(broker_state.get("availableQuantity") or 0),
+                ),
+                "quantityTruth": self._build_stock_quantity_truth(db, symbol=symbol, broker_state=broker_state),
+            }
+        )
+
+        if payload["brokerExitPending"]:
+            payload["action"] = "EXIT_ALREADY_IN_PROGRESS"
+            payload["reason"] = "BROKER_EXIT_PENDING"
             payload["monitoringStatus"] = "EXIT_PENDING"
             return payload
 

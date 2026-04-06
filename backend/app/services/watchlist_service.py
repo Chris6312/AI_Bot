@@ -710,6 +710,8 @@ class WatchlistService:
                 (row['monitoring']['lastEvaluatedAtUtc'] for row in rows if row.get('monitoring') and row['monitoring']['lastEvaluatedAtUtc']),
                 default=None,
             )
+            entry_submitted_states = {'SUBMISSION_PENDING', 'ENTRY_SUBMITTED'}
+            entry_rejected_states = {'GATE_REJECTED', 'SUBMISSION_REJECTED'}
             summary = {
                     'total': len(rows),
                     'activeCount': sum(1 for row in rows if row['monitoringStatus'] == ACTIVE),
@@ -717,6 +719,12 @@ class WatchlistService:
                     'inactiveCount': sum(1 for row in rows if row['monitoringStatus'] == INACTIVE),
                     'pendingEvaluationCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == PENDING_EVALUATION),
                     'entryCandidateCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'ENTRY_CANDIDATE'),
+                    'entrySubmittedCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] in entry_submitted_states),
+                    'entryFilledCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'ENTRY_FILLED'),
+                    'entryRejectedCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] in entry_rejected_states),
+                    'entrySkippedCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'SKIPPED'),
+                    'gateRejectedCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'GATE_REJECTED'),
+                    'submissionRejectedCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'SUBMISSION_REJECTED'),
                     'waitingForSetupCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'WAITING_FOR_SETUP'),
                     'dataStaleCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'DATA_STALE'),
                     'dataUnavailableCount': sum(1 for row in rows if row.get('monitoring') and row['monitoring']['latestDecisionState'] == 'DATA_UNAVAILABLE'),
@@ -770,31 +778,75 @@ class WatchlistService:
                 and _normalize_dt(active_upload.watchlist_expires_at_utc) <= observed_at
             )
             data_warning_count = int(summary['dataStaleCount'] + summary['dataUnavailableCount'] + summary['evaluationBlockedCount'])
+            supervision_only = bool(summary['managedOnlyCount'] > 0 and summary['activeCount'] <= 0)
+            fresh_entry_state = 'READY'
+            fresh_entries_ready = bool(active_upload is not None and not watchlist_expired and summary['activeCount'] > 0)
+            review_state = 'OK'
+            review_reason = ''
+            operational_state = 'HEALTHY'
+            operational_reason = ''
+            operational_impairment = False
+            scope_truth_ready = True
+
             if active_upload is None:
+                fresh_entry_state = 'MISSING'
                 if summary['openPositionCount'] > 0 or summary['managedOnlyCount'] > 0:
-                    scope_truth_state = 'DEGRADED'
-                    scope_truth_reason = 'No active watchlist upload is loaded, but existing positions still need supervision.'
+                    scope_truth_state = 'PAUSED'
+                    scope_truth_reason = 'No active watchlist is loaded for fresh entries. Existing positions remain under supervision.'
+                    review_state = 'REVIEW'
+                    review_reason = 'Fresh entries are paused until a new watchlist is loaded for this scope.'
                 else:
                     scope_truth_state = 'MISSING'
                     scope_truth_reason = 'No active watchlist upload is loaded for this scope.'
+                    scope_truth_ready = False
+                    review_state = 'REVIEW'
+                    review_reason = scope_truth_reason
             elif watchlist_expired:
+                fresh_entry_state = 'STALE'
                 scope_truth_state = 'STALE'
-                scope_truth_reason = 'Active watchlist upload has expired for fresh entries.'
-            elif summary['managedOnlyCount'] > 0:
-                scope_truth_state = 'DEGRADED'
-                if summary['activeCount'] <= 0:
-                    scope_truth_reason = 'Scope is supervision-only. Managed-only rows remain, but no fresh-entry symbols are eligible.'
-                else:
-                    scope_truth_reason = 'Scope is not supervision-only-ready. Managed-only rows still require supervision-only review before it can be treated as fully ready.'
+                scope_truth_reason = 'Active watchlist freshness has expired for fresh entries. Supervision remains active.'
+                review_state = 'REVIEW'
+                review_reason = 'Fresh entries are stale until a newer watchlist is loaded.'
             else:
-                scope_truth_state = 'READY'
-                scope_truth_reason = '' if data_warning_count == 0 else 'Scope has active symbols, but some rows currently need data or evaluation review.'
+                if summary['activeCount'] <= 0:
+                    fresh_entry_state = 'PAUSED'
+                if summary['managedOnlyCount'] > 0:
+                    scope_truth_state = 'DEGRADED'
+                    scope_truth_ready = False
+                    if supervision_only:
+                        fresh_entries_ready = False
+                        scope_truth_reason = 'Scope is supervision-only. Managed-only rows remain, but no fresh-entry symbols are eligible.'
+                    else:
+                        scope_truth_reason = 'Scope has supervision-only rows that require review before fresh-entry monitoring is considered healthy.'
+                    review_state = 'REVIEW'
+                    review_reason = (
+                        'Fresh entries are paused because this scope is currently supervision-only.'
+                        if supervision_only
+                        else 'Some rows are supervision-only while other symbols remain eligible for fresh-entry evaluation.'
+                    )
+                elif data_warning_count > 0:
+                    scope_truth_state = 'HEALTHY'
+                    scope_truth_reason = 'Scope is healthy. Some rows are waiting on normal data or evaluation review.'
+                    review_state = 'REVIEW'
+                    review_reason = 'One or more rows are waiting on data, setup confirmation, or another valid review gate.'
+                else:
+                    scope_truth_state = 'HEALTHY'
+                    scope_truth_reason = 'Scope is healthy and monitoring is operating normally.'
 
             scope_truth = {
                 'scope': scope_value,
                 'state': scope_truth_state,
-                'ready': bool(scope_truth_state == 'READY'),
+                'ready': scope_truth_ready and not operational_impairment,
                 'reason': scope_truth_reason,
+                'freshnessState': 'MISSING' if active_upload is None else ('STALE' if watchlist_expired else 'FRESH'),
+                'freshEntryState': fresh_entry_state,
+                'freshEntriesReady': fresh_entries_ready,
+                'reviewState': review_state,
+                'reviewReason': review_reason,
+                'operationalState': operational_state,
+                'operationalReason': operational_reason,
+                'operationalImpairment': operational_impairment,
+                'supervisionOnly': supervision_only,
                 'activeUploadId': active_upload.upload_id if active_upload else None,
                 'activeUploadReceivedAtUtc': active_upload_received_at,
                 'watchlistExpiresAtUtc': watchlist_expires_at,

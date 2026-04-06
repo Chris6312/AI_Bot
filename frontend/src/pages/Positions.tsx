@@ -169,8 +169,12 @@ type DerivedInspectSections = {
   strategyRows: LabeledStat[]
   sizingRows: LabeledStat[]
   exitRows: LabeledStat[]
-  latestEvaluationRows: LabeledStat[]
-  latestEvaluationReason: string | null
+  exitVerdictRows: LabeledStat[]
+  exitVerdictReason: string | null
+  exitNextTriggerRows: LabeledStat[]
+  exitHealthRows: LabeledStat[]
+  executionRows: LabeledStat[]
+  exitStateHistory: Array<{ time: string | null; label: string; detail: string | null }>
   rawSections: Array<{ label: string; value: unknown }>
 }
 
@@ -695,13 +699,28 @@ function PositionInspectDrawer({
               <KeyValueGrid rows={sections.exitRows} />
             </StructuredInspectCard>
 
-            <StructuredInspectCard title="Latest evaluation" eyebrow="Current worker verdict" icon={<CalendarClock className="h-4 w-4 text-cyan-300" />}>
+            <StructuredInspectCard title="Current exit worker verdict" eyebrow="Primary decision engine" icon={<CalendarClock className="h-4 w-4 text-cyan-300" />}>
               <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-                <KeyValueList rows={sections.latestEvaluationRows} />
+                <KeyValueList rows={sections.exitVerdictRows} />
                 <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-                  <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Why</div>
-                  <p className="mt-3 text-sm leading-6 text-slate-300">{sections.latestEvaluationReason ?? 'No evaluation reason stored yet.'}</p>
+                  <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Why not exiting yet</div>
+                  <p className="mt-3 text-sm leading-6 text-slate-300">{sections.exitVerdictReason ?? 'No exit-worker rationale stored yet.'}</p>
                 </div>
+              </div>
+            </StructuredInspectCard>
+
+            <StructuredInspectCard title="Next trigger and phase" eyebrow="Tier 1 operator telemetry" icon={<ArrowRightLeft className="h-4 w-4 text-cyan-300" />}>
+              <KeyValueGrid rows={sections.exitNextTriggerRows} />
+            </StructuredInspectCard>
+
+            <StructuredInspectCard title="Structure, risk, and readiness" eyebrow="Tier 2 → Tier 3 telemetry" icon={<ShieldCheck className="h-4 w-4 text-cyan-300" />}>
+              <KeyValueGrid rows={sections.exitHealthRows} />
+            </StructuredInspectCard>
+
+            <StructuredInspectCard title="Execution status" eyebrow="Logic versus order state" icon={<Clock3 className="h-4 w-4 text-cyan-300" />}>
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+                <KeyValueList rows={sections.executionRows} />
+                <ExitStateHistory items={sections.exitStateHistory} />
               </div>
             </StructuredInspectCard>
 
@@ -829,6 +848,7 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
   const sizing = inspect.sizing ?? {}
   const exitPlan = inspect.exitPlan ?? {}
   const latestEvaluation = inspect.latestEvaluation ?? {}
+  const exitWorker = asRecord(inspect.exitWorker)
   const signalLifecycleState = asText(signal.lifecycleState) ?? asText(watchlist.lifecycleState) ?? asText(entryReasoning.lifecycleState) ?? asText(signal.monitoringStatus)
   const signalLifecycleNote = asText(signal.lifecycleNote) ?? asText(watchlist.lifecycleNote) ?? asText(entryReasoning.lifecycleNote)
 
@@ -916,23 +936,64 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
     { label: 'Exit trigger', value: displayValue('tradeExitTrigger', exitPlan.tradeExitTrigger), tone: 'muted' },
   ]
 
-  const latestDetails = asRecord(latestEvaluation.details)
-  const latestEvaluationRows: LabeledStat[] = [
-    { label: 'State', value: displayValue('state', latestEvaluation.state), tone: getStatusMeta(String(latestEvaluation.state ?? '')).tone },
-    { label: 'Worker time', value: displayValue('evaluatedAtUtc', latestEvaluation.evaluatedAtUtc), tone: 'muted' },
-    { label: 'Broker exit pending', value: displayValue('brokerExitPending', signal.brokerExitPending), tone: 'warn' },
-    { label: 'Monitoring status', value: displayValue('monitoringStatus', latestDetails.monitoringStatus ?? signal.monitoringStatus), tone: 'muted' },
-    { label: 'Lifecycle state', value: displayValue('lifecycleState', latestDetails.lifecycleState ?? signalLifecycleState), tone: 'muted' },
-    { label: 'Cooldown active', value: displayValue('cooldownActive', latestDetails.cooldownActive ?? signal.cooldownActive), tone: 'warn' },
-    { label: 'Re-entry blocked until', value: displayValue('reentryBlockedUntilUtc', latestDetails.reentryBlockedUntilUtc ?? signal.reentryBlockedUntilUtc), tone: 'warn' },
-    { label: 'Last exit at', value: displayValue('lastExitAtUtc', latestDetails.lastExitAtUtc ?? signal.lastExitAtUtc), tone: 'muted' },
+  const exitState = asText(exitWorker.logicSummary) ?? asText(latestEvaluation.state)
+  const exitVerdictRows: LabeledStat[] = [
+    { label: 'Worker', value: displayValue('worker', exitWorker.worker ?? 'Exit Worker'), tone: 'info' },
+    { label: 'State', value: displayValue('logicSummary', exitState), tone: getStatusMeta(String(exitWorker.logicState ?? latestEvaluation.state ?? '')).tone },
+    { label: 'Worker time', value: displayValue('evaluatedAtUtc', exitWorker.evaluatedAtUtc ?? latestEvaluation.evaluatedAtUtc), tone: 'muted' },
+    { label: 'Monitoring status', value: displayValue('monitoringStatus', exitWorker.monitoringStatus ?? signal.monitoringStatus), tone: 'muted' },
+    { label: 'Lifecycle state', value: displayValue('lifecycleState', exitWorker.lifecycleState ?? signalLifecycleState), tone: 'muted' },
+    { label: 'Cooldown active', value: displayValue('cooldownActive', exitWorker.cooldownActive ?? signal.cooldownActive), tone: 'warn' },
   ]
+  const exitNextTriggerRows: LabeledStat[] = [
+    { label: 'Current phase', value: displayValue('currentPhase', exitWorker.currentPhase), tone: 'info' },
+    { label: 'Next exit trigger', value: displayValue('nextExitTrigger', exitWorker.nextExitTrigger), tone: 'warn' },
+    { label: 'Next trigger level', value: displayValue('nextTriggerLevel', exitWorker.nextTriggerLevel), tone: 'warn' },
+    { label: 'Next trigger distance', value: displayValue('nextTriggerDistance', exitWorker.nextTriggerDistance), tone: toneFromPnl(-(asNumber(exitWorker.nextTriggerDistance) ?? 0)) },
+    { label: 'Next review', value: displayValue('nextReviewAtUtc', exitWorker.nextReviewAtUtc), tone: 'muted' },
+    { label: 'Transition condition', value: displayValue('phaseTransitionCondition', exitWorker.phaseTransitionCondition), tone: 'muted' },
+    { label: 'Active trigger', value: displayValue('activeTriggerLabel', exitWorker.activeTriggerLabel), tone: 'info' },
+    { label: 'Position maturity', value: displayValue('positionMaturity', exitWorker.positionMaturity), tone: 'muted' },
+  ]
+  const exitHealthRows: LabeledStat[] = [
+    { label: 'Structure health', value: displayValue('structureHealth', exitWorker.structureHealth), tone: 'info' },
+    { label: 'Signal conflict', value: displayValue('signalConflict', exitWorker.signalConflict), tone: 'warn' },
+    { label: 'Trail status', value: displayValue('trailStatus', exitWorker.trailStatus), tone: 'warn' },
+    { label: 'Volatility regime', value: displayValue('volatilityRegime', exitWorker.volatilityRegime), tone: 'muted' },
+    { label: 'Risk state', value: displayValue('riskState', exitWorker.riskState), tone: 'warn' },
+    { label: 'Risk compression', value: displayValue('riskCompression', exitWorker.riskCompression), tone: 'muted' },
+    { label: 'Distance from stop %', value: displayValue('distanceFromStopPct', exitWorker.distanceFromStopPct), tone: 'warn' },
+    { label: 'Distance from trail %', value: displayValue('distanceFromTrailPct', exitWorker.distanceFromTrailPct), tone: 'warn' },
+    { label: 'Distance from target %', value: displayValue('distanceFromTargetPct', exitWorker.distanceFromTargetPct), tone: 'good' },
+    { label: 'Unrealized profit exposed', value: displayValue('unrealizedProfitExposed', exitWorker.unrealizedProfitExposed), tone: toneFromPnl(asNumber(exitWorker.unrealizedProfitExposed) ?? 0) },
+    { label: 'Exit readiness score', value: displayValue('exitReadinessScore', exitWorker.exitReadinessScore), tone: 'info' },
+    { label: 'Exit likelihood', value: displayValue('exitLikelihood', exitWorker.exitLikelihood), tone: 'muted' },
+    { label: 'Expected exit range R', value: formatRange(asRecord(exitWorker.expectedExitRangeR)), tone: 'muted' },
+    { label: 'Current progress R', value: displayValue('currentProgressR', exitWorker.currentProgressR), tone: 'muted' },
+    { label: 'Strategy biases', value: displayValue('strategyBiases', exitWorker.strategyBiases), tone: 'muted' },
+    { label: 'Exit sensitivity', value: displayValue('exitSensitivity', exitWorker.exitSensitivity), tone: 'muted' },
+  ]
+  const executionRows: LabeledStat[] = [
+    { label: 'Execution status', value: displayValue('executionStatus', exitWorker.executionStatus), tone: 'info' },
+    { label: 'Broker status', value: displayValue('brokerStatus', exitWorker.brokerStatus), tone: 'muted' },
+    { label: 'Managed only', value: displayValue('managedOnly', exitWorker.managedOnly), tone: 'warn' },
+    { label: 'Managed only explanation', value: displayValue('managedOnlyExplanation', exitWorker.managedOnlyExplanation), tone: 'muted' },
+  ]
+  const exitStateHistory = Array.isArray(exitWorker.stateHistory) ? exitWorker.stateHistory.map((item) => {
+    const row = asRecord(item)
+    return {
+      time: asText(row.time),
+      label: asText(row.label) ?? 'State update',
+      detail: asText(row.detail),
+    }
+  }) : []
 
   const rawSections = [
     { label: 'Signal snapshot', value: inspect.signalSnapshot ?? {} },
     { label: 'Sizing math', value: inspect.sizing ?? {} },
     { label: 'Exit plan', value: inspect.exitPlan ?? {} },
     { label: 'Latest evaluation', value: inspect.latestEvaluation ?? {} },
+    { label: 'Exit worker', value: inspect.exitWorker ?? {} },
     { label: 'Raw context', value: inspect.rawContext ?? {} },
   ]
 
@@ -941,8 +1002,12 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
     strategyRows,
     sizingRows,
     exitRows,
-    latestEvaluationRows,
-    latestEvaluationReason: asText(latestEvaluation.reason),
+    exitVerdictRows,
+    exitVerdictReason: asText(exitWorker.whyNotExitingYet) ?? asText(latestEvaluation.reason),
+    exitNextTriggerRows,
+    exitHealthRows,
+    executionRows,
+    exitStateHistory,
     rawSections,
   }
 }
@@ -1040,6 +1105,34 @@ function KeyValueGrid({ rows }: { rows: LabeledStat[] }) {
       ))}
     </div>
   )
+}
+
+function ExitStateHistory({ items }: { items: Array<{ time: string | null; label: string; detail: string | null }> }) {
+  if (items.length === 0) {
+    return <EmptyState message="No exit-state transitions were stored yet." />
+  }
+
+  return (
+    <div className="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+      <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">State history</div>
+      {items.map((item, index) => (
+        <div key={`${item.label}-${index}`} className="rounded-2xl border border-slate-800/80 bg-slate-900/70 px-4 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm font-semibold text-white">{item.label}</div>
+            <div className="text-xs text-slate-500">{item.time ? formatCompactDateTime(item.time) : 'Latest'}</div>
+          </div>
+          <div className="mt-2 text-sm leading-6 text-slate-400">{item.detail ?? 'No extra detail stored for this state transition.'}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function formatRange(value: Record<string, unknown>): string {
+  const from = asNumber(value.from)
+  const to = asNumber(value.to)
+  if (from == null || to == null) return '—'
+  return `${from.toFixed(1)}R – ${to.toFixed(1)}R`
 }
 
 function TimeframeAlignmentTable({ items }: { items: PositionInspectTimeframeItem[] }) {

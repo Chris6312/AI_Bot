@@ -787,6 +787,7 @@ export interface PositionInspectRecord {
   }
   exitPlan: Record<string, unknown>
   latestEvaluation?: Record<string, unknown> | null
+  exitWorker?: Record<string, unknown> | null
   lifecycle: PositionInspectTimelineEvent[]
   rawContext: Record<string, unknown>
 }

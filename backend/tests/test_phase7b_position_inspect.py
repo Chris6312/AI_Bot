@@ -218,6 +218,8 @@ def test_crypto_position_inspect_returns_signal_sizing_and_lifecycle(tmp_path, m
         ]
         assert payload['latestEvaluation']['state'] == 'ENTRY_CANDIDATE'
         assert payload['latestEvaluation']['details']['cooldownActive'] is False
+        assert payload['exitWorker']['logicState'] == 'SCALE_OUT_READY'
+        assert payload['exitWorker']['nextExitTrigger'] == 'Scale-out submission'
 
 
 def test_crypto_position_inspect_uses_symbol_aliases_and_intent_watchlist_fallback(tmp_path, monkeypatch) -> None:
@@ -510,6 +512,7 @@ def test_crypto_position_inspect_surfaces_protective_exit_pending_when_stop_loss
         assert 'STOP_LOSS_BREACH' in payload['signalSnapshot']['latestDecisionReason']
         assert payload['latestEvaluation']['state'] == 'EXIT_PENDING'
         assert 'STOP_LOSS_BREACH' in payload['latestEvaluation']['reason']
+        assert payload['exitWorker']['logicState'] == 'EXIT_PENDING'
 
 
 def test_crypto_inspect_returns_cooldown_payload_after_exit(tmp_path) -> None:
