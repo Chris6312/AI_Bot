@@ -790,6 +790,19 @@ export interface PositionInspectRecord {
   exitWorker?: Record<string, unknown> | null
   lifecycle: PositionInspectTimelineEvent[]
   rawContext: Record<string, unknown>
+  biasExplanation?: {
+    biasState?: string | null
+    entryPermission?: string | null
+    unblockCondition?: string | null
+    summary?: string | null
+    timeframes?: Array<{
+      timeframe?: string | null
+      bias?: string | null
+      emaStructureAligned?: boolean | null
+      priceAboveRibbon?: boolean | null
+      higherHighsConfirmed?: boolean | null
+    }> | null
+  } | null
 }
 
 

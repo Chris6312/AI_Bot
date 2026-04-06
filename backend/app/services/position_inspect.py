@@ -17,6 +17,7 @@ from app.models.watchlist_upload import WatchlistUpload
 from app.services.kraken_service import crypto_ledger, kraken_service
 from app.services.runtime_state import runtime_state
 from app.services.tradier_client import tradier_client
+from app.services.watchlist_service import watchlist_service
 
 
 @dataclass
@@ -107,6 +108,12 @@ class PositionInspectService:
             'profitTarget': float(position.profit_target or 0.0) if position.profit_target is not None else None,
             'trailingStop': float(position.trailing_stop or 0.0) if position.trailing_stop is not None else None,
             'peakPrice': float(position.peak_price or 0.0) if position.peak_price is not None else None,
+            'protectionMode': None,
+            'feeAdjustedBreakEven': None,
+            'promotedProtectiveFloor': None,
+            'tpTouchedAtUtc': None,
+            'strongerMarginReached': False,
+            'lastConfirmedHigherLow': None,
             'tradeExitTrigger': trade.exit_trigger if trade is not None else None,
         }
         position_snapshot = {
@@ -153,6 +160,12 @@ class PositionInspectService:
                 'items': [],
                 'note': 'Legacy stock positions preserve entry reasoning and lifecycle events, but they do not yet store per-timeframe confirmation flags in a normalized shape.',
             },
+            'biasExplanation': self._build_bias_explanation(
+                bias=signal_snapshot.get('bias'),
+                monitoring_status=signal_snapshot.get('monitoringStatus'),
+                latest_evaluation=latest_evaluation,
+                timeframe_items=[],
+            ),
             'exitPlan': exit_plan,
             'latestEvaluation': latest_evaluation,
             'exitWorker': exit_worker,
@@ -189,6 +202,9 @@ class PositionInspectService:
         intent = self._find_crypto_intent(db, aliases)
         watch_symbol = self._find_crypto_watch_symbol(db, aliases)
         monitor_state = self._find_crypto_monitor_state(db, aliases, watch_symbol)
+        live_watchlist_row = self._find_live_crypto_watchlist_row(db, aliases=aliases)
+        live_position_state = dict(live_watchlist_row.get('positionState') or {}) if isinstance(live_watchlist_row, dict) else {}
+        live_monitoring = dict(live_watchlist_row.get('monitoring') or {}) if isinstance(live_watchlist_row, dict) else {}
         upload = None
         if watch_symbol is not None:
             upload = db.query(WatchlistUpload).filter(WatchlistUpload.upload_id == watch_symbol.upload_id).first()
@@ -200,6 +216,8 @@ class PositionInspectService:
         details = dict(latest_eval.get('details') or {})
         if not details and base_monitor_context:
             details = dict(base_monitor_context.get('details') or {})
+        if live_position_state:
+            details.update({key: value for key, value in live_position_state.items() if value is not None})
 
         configured_timeframes = list(
             (watch_symbol.bot_timeframes if watch_symbol is not None else None)
@@ -250,15 +268,21 @@ class PositionInspectService:
             'displayPair': intent_context.get('displayPair') or current_position.get('pair'),
             'ohlcvPair': intent_context.get('ohlcvPair') or current_position.get('ohlcvPair'),
         }
-        stop_loss = self._maybe_float(current_position.get('stopLoss') or (
+        stop_loss = self._maybe_float(live_position_state.get('stopLoss'))
+        if stop_loss is None:
+            stop_loss = self._maybe_float(current_position.get('stopLoss') or (
             round(float(current_position['avgPrice']) * (1.0 - float(settings.STOP_LOSS_PCT)), 8)
             if current_position.get('avgPrice') else None
         ))
-        profit_target = self._maybe_float(current_position.get('profitTarget') or (
+        profit_target = self._maybe_float(live_position_state.get('profitTarget'))
+        if profit_target is None:
+            profit_target = self._maybe_float(current_position.get('profitTarget') or (
             round(float(current_position['avgPrice']) * (1.0 + float(settings.PROFIT_TARGET_PCT)), 8)
             if current_position.get('avgPrice') else None
         ))
-        trailing_stop = self._maybe_float(current_position.get('trailingStop') or (
+        trailing_stop = self._maybe_float(live_position_state.get('trailingStop'))
+        if trailing_stop is None:
+            trailing_stop = self._maybe_float(current_position.get('trailingStop') or (
             round(float(current_position['avgPrice']) * (1.0 - float(settings.TRAILING_STOP_PCT)), 8)
             if current_position.get('avgPrice') else None
         ))
@@ -280,6 +304,12 @@ class PositionInspectService:
             'stopLoss': stop_loss,
             'profitTarget': profit_target,
             'trailingStop': trailing_stop,
+            'protectionMode': details.get('protectionMode'),
+            'feeAdjustedBreakEven': self._maybe_float(details.get('feeAdjustedBreakEven')),
+            'promotedProtectiveFloor': self._maybe_float(details.get('promotedProtectiveFloor')),
+            'tpTouchedAtUtc': details.get('tpTouchedAtUtc'),
+            'strongerMarginReached': bool(details.get('strongerMarginReached')),
+            'lastConfirmedHigherLow': self._maybe_float(details.get('lastConfirmedHigherLow')),
             'stopDistance': stop_distance,
             'targetDistance': target_distance,
             'trailingDistance': trailing_distance,
@@ -307,6 +337,11 @@ class PositionInspectService:
             latest_eval['reason'] = protective_reason_text
             latest_eval.setdefault('details', {})
             latest_eval['details'] = {**dict(latest_eval.get('details') or {}), 'protectiveExitReasons': protective_reasons}
+        elif live_monitoring:
+            if live_monitoring.get('latestDecisionState') and not signal_snapshot.get('latestDecisionState'):
+                signal_snapshot['latestDecisionState'] = live_monitoring.get('latestDecisionState')
+            if live_monitoring.get('latestDecisionReason') and not signal_snapshot.get('latestDecisionReason'):
+                signal_snapshot['latestDecisionReason'] = live_monitoring.get('latestDecisionReason')
         position_snapshot = {
             'accountId': 'paper-crypto-ledger',
             'quantityLabel': 'Amount',
@@ -323,12 +358,15 @@ class PositionInspectService:
         }
         latest_evaluation = ({
             **(latest_eval or {}),
+            'state': (latest_eval or {}).get('state') or live_monitoring.get('latestDecisionState'),
+            'reason': (latest_eval or {}).get('reason') or live_monitoring.get('latestDecisionReason'),
             'details': {
                 **dict((latest_eval or {}).get('details') or {}),
+                **{key: value for key, value in live_position_state.items() if value is not None},
                 'cooldownActive': cooldown_active,
                 'reentryBlockedUntilUtc': base_monitor_context.get('reentryBlockedUntilUtc'),
                 'lastExitAtUtc': base_monitor_context.get('lastExitAtUtc'),
-                'monitoringStatus': monitor_state.monitoring_status if monitor_state is not None else None,
+                'monitoringStatus': monitor_state.monitoring_status if monitor_state is not None else live_watchlist_row.get('monitoringStatus') if isinstance(live_watchlist_row, dict) else None,
             },
         } if latest_eval or cooldown_active or monitor_state is not None else None)
         exit_worker = self._derive_exit_worker(
@@ -571,6 +609,18 @@ class PositionInspectService:
         row = query.filter(or_(*filters)).order_by(WatchlistMonitorState.updated_at.desc(), WatchlistMonitorState.id.desc()).first()
         return row
 
+    def _find_live_crypto_watchlist_row(self, db: Session, *, aliases: set[str]) -> dict[str, Any] | None:
+        try:
+            snapshot = watchlist_service.get_monitoring_snapshot(db, scope='crypto_only', include_inactive=True)
+        except Exception:
+            return None
+
+        for row in list(snapshot.get('rows') or []):
+            row_aliases = self._crypto_symbol_aliases(str(row.get('symbol') or ''))
+            if row_aliases.intersection(aliases):
+                return row
+        return None
+
     @staticmethod
     def _load_events(db: Session, intent: OrderIntent | None) -> list[dict[str, Any]]:
         if intent is None:
@@ -653,6 +703,50 @@ class PositionInspectService:
         return ranked[0] if ranked else configured_timeframes[0]
 
 
+    @staticmethod
+    def _normalize_protection_mode_label(value: Any) -> str | None:
+        raw = str(value or '').strip().upper()
+        mapping = {
+            'INITIAL_RISK': 'Initial risk',
+            'BREAK_EVEN_PROMOTED': 'Break-even promoted',
+            'STRUCTURE_TIGHTENED': 'Structure tightened',
+            'EXIT_READY': 'Exit ready',
+        }
+        return mapping.get(raw) or (raw.replace('_', ' ').title() if raw else None)
+
+    @staticmethod
+    def _build_bias_explanation(
+        *,
+        bias: Any,
+        monitoring_status: str | None,
+        latest_evaluation: dict[str, Any] | None,
+        timeframe_items: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        normalized_bias = str(bias or 'unknown').strip().title() or 'Unknown'
+        state = str((latest_evaluation or {}).get('state') or '').strip().upper()
+        reason = str((latest_evaluation or {}).get('reason') or '').strip() or None
+        blocked = state in {'BLOCKED', 'REJECTED'} or str(monitoring_status or '').strip().upper() in {'BLOCKED', 'BIAS_CONFLICT'}
+        items: list[dict[str, Any]] = []
+        for item in list(timeframe_items or []):
+            timeframe = str(item.get('timeframe') or '').strip()
+            status = str(item.get('status') or '').strip().title() or 'Unknown'
+            item_reason = str(item.get('reason') or '').strip() or None
+            if timeframe:
+                items.append({'timeframe': timeframe, 'status': status, 'reason': item_reason})
+        if blocked:
+            entry_permission = 'Blocked'
+            unblock_condition = reason or 'Reclaim bullish structure across required timeframes.'
+        else:
+            entry_permission = 'Allowed'
+            unblock_condition = 'No bias block is active right now.'
+        return {
+            'biasState': normalized_bias,
+            'entryPermission': entry_permission,
+            'unblockCondition': unblock_condition,
+            'timeframes': items,
+        }
+
+
     def _derive_exit_worker(
         self,
         *,
@@ -679,15 +773,27 @@ class PositionInspectService:
         profit_target = self._maybe_float(exit_plan.get('profitTarget'))
         trailing_stop = self._maybe_float(exit_plan.get('trailingStop'))
         peak_price = self._maybe_float(exit_plan.get('peakPrice'))
+        protection_mode = str(details.get('protectionMode') or exit_plan.get('protectionMode') or 'INITIAL_RISK').strip().upper() or 'INITIAL_RISK'
+        fee_adjusted_break_even = self._maybe_float(details.get('feeAdjustedBreakEven') or exit_plan.get('feeAdjustedBreakEven'))
+        promoted_protective_floor = self._maybe_float(details.get('promotedProtectiveFloor') or exit_plan.get('promotedProtectiveFloor'))
+        tp_touched_at_utc = details.get('tpTouchedAtUtc') or exit_plan.get('tpTouchedAtUtc')
+        stronger_margin_reached = bool(details.get('strongerMarginReached') or exit_plan.get('strongerMarginReached'))
+        last_confirmed_higher_low = self._maybe_float(details.get('lastConfirmedHigherLow') or exit_plan.get('lastConfirmedHigherLow'))
         hours_since_entry = self._maybe_float(exit_plan.get('hoursSinceEntry') or details.get('hoursSinceEntry') or details.get('hours_open'))
         max_hold_hours = self._maybe_float(exit_plan.get('maxHoldHours'))
-        target_reached = bool(details.get('profitTargetReached')) or (current_price is not None and profit_target is not None and current_price >= profit_target)
-        trail_breached = bool(details.get('trailingStopBreached')) or (current_price is not None and trailing_stop is not None and current_price <= trailing_stop)
+        target_reached = bool(details.get('profitTargetReached')) or bool(tp_touched_at_utc) or (current_price is not None and profit_target is not None and current_price >= profit_target)
+        effective_protective_floor = trailing_stop
+        candidate_floors = [value for value in (trailing_stop, promoted_protective_floor, fee_adjusted_break_even) if value is not None]
+        if candidate_floors:
+            effective_protective_floor = max(candidate_floors)
+        trail_breached = bool(details.get('trailingStopBreached')) or (current_price is not None and effective_protective_floor is not None and current_price <= effective_protective_floor)
         stop_breached = bool(details.get('stopLossBreached')) or (current_price is not None and stop_loss is not None and current_price <= stop_loss)
-        follow_through_failed = bool(details.get('followThroughFailed'))
+        follow_through_failed = bool(details.get('followThroughFailed') or exit_plan.get('followThroughFailed'))
         impulse_trail_armed = bool(details.get('impulseTrailArmed'))
         scale_out_taken = bool(details.get('scaleOutAlreadyTaken'))
         scale_out_ready = bool(details.get('scaleOutReady')) or (template == 'scale_out_then_trail' and target_reached and not scale_out_taken)
+        promoted_floor = promoted_protective_floor
+        active_protection_rail = promoted_floor or effective_protective_floor or trailing_stop
         execution_status = 'No order pending'
         broker_status = 'Connected'
         logic_state = 'NO_EXIT_SIGNAL'
@@ -757,7 +863,7 @@ class PositionInspectService:
             logic_summary = 'Trailing stop breached'
             why_not = 'Price is below the active trailing rail, so the worker is preparing to close the position.'
             next_trigger = 'Exit submission'
-            next_trigger_level = trailing_stop
+            next_trigger_level = active_protection_rail or trailing_stop
             current_phase = 'Trail Exit'
             phase_transition = 'Will transition to exit pending once the trailing-stop exit is submitted.'
             structure_health = 'Failed'
@@ -773,24 +879,24 @@ class PositionInspectService:
             if target_reached and not follow_through_failed:
                 logic_state = 'TP_HIT_AWAITING_FOLLOW_THROUGH_FAILURE'
                 logic_summary = 'TP hit awaiting weakness'
-                why_not = 'Price has exceeded the profit target, but the template has not detected failed follow-through yet.'
-                next_trigger = 'Failed follow-through confirmation'
-                next_trigger_level = trailing_stop or profit_target
-                current_phase = 'Runner'
-                phase_transition = 'Will transition to exit ready when the follow-through fails or the active protection rail is breached.'
+                why_not = 'Profit target was touched, break-even protection is promoted, and the runner remains open until follow-through fails or the promoted floor breaks.'
+                next_trigger = 'Follow-through failure or trail breach'
+                next_trigger_level = active_protection_rail or profit_target
+                current_phase = 'Break-even promoted' if protection_mode == 'BREAK_EVEN_PROMOTED' else 'Structure tightened' if protection_mode == 'STRUCTURE_TIGHTENED' else 'TP hit awaiting weakness'
+                phase_transition = 'Will transition to exit ready when follow-through fails or the promoted protection rail is breached.'
                 structure_health = 'Strong'
-                trail_status = 'Monitoring follow-through'
-                risk_state = 'Improving'
+                trail_status = 'Break-even promoted' if protection_mode == 'BREAK_EVEN_PROMOTED' else 'Structure tightened' if protection_mode == 'STRUCTURE_TIGHTENED' else 'Monitoring follow-through'
+                risk_state = 'Protected' if protection_mode in {'BREAK_EVEN_PROMOTED', 'STRUCTURE_TIGHTENED'} else 'Improving'
                 risk_compression = 'Active'
                 exit_readiness_score = 0.62
                 exit_likelihood = 'Moderate probability of exit if momentum fades in the next review cycle.'
-                active_trigger_label = 'Follow-through failure'
+                active_trigger_label = 'Break-even floor' if protection_mode == 'BREAK_EVEN_PROMOTED' else 'Promoted protective floor' if protection_mode == 'STRUCTURE_TIGHTENED' else 'Follow-through failure'
             elif target_reached and follow_through_failed:
                 logic_state = 'FOLLOW_THROUGH_FAILED_EXIT_READY'
                 logic_summary = 'Follow-through failed'
-                why_not = 'The profit target has been hit and the runner has now lost momentum.'
-                next_trigger = 'Exit submission'
-                next_trigger_level = trailing_stop or profit_target
+                why_not = 'The profit target was hit, continuation failed, and the runner is now queued for immediate exit.'
+                next_trigger = 'Immediate exit submission'
+                next_trigger_level = active_protection_rail or profit_target
                 current_phase = 'Exit Ready'
                 phase_transition = 'Will transition to exit pending once the failed follow-through exit is submitted.'
                 structure_health = 'Weakening'
@@ -803,10 +909,10 @@ class PositionInspectService:
             else:
                 logic_state = 'AWAITING_PROFIT_TARGET'
                 logic_summary = 'Awaiting profit target'
-                why_not = 'The runner has not yet reached the profit target that arms failed follow-through monitoring.'
+                why_not = 'The runner is still waiting for the first profit-target touch that promotes protection.'
                 next_trigger = 'Profit target touch'
                 next_trigger_level = profit_target
-                current_phase = 'Target Hunt'
+                current_phase = 'Awaiting Profit Target'
                 phase_transition = 'Will transition to runner supervision after the target is reached.'
                 structure_health = 'Healthy'
                 trail_status = 'Configured'
@@ -866,28 +972,43 @@ class PositionInspectService:
         elif template == 'trail_after_impulse':
             strategy_biases = ['let-run bias', 'impulse confirmation', 'trail protection']
             exit_sensitivity = 'Delayed'
-            if impulse_trail_armed:
+            if protection_mode == 'BREAK_EVEN_PROMOTED' and not impulse_trail_armed:
+                logic_state = 'BREAK_EVEN_PROMOTED'
+                logic_summary = 'Awaiting impulse confirmation'
+                why_not = 'Profit target was touched and protection is promoted to fee-adjusted break-even while the worker waits for stronger extension.'
+                next_trigger = 'Stronger extension or trail breach'
+                next_trigger_level = active_protection_rail or profit_target
+                current_phase = 'Break-even promoted'
+                phase_transition = 'Will transition to structure tightened on stronger extension or to exit ready if the promoted floor breaks.'
+                structure_health = 'Healthy'
+                trail_status = 'Break-even promoted'
+                risk_state = 'Protected'
+                risk_compression = 'Active'
+                exit_readiness_score = 0.36
+                exit_likelihood = 'Low to moderate probability of exit unless the runner weakens.'
+                active_trigger_label = 'Break-even floor'
+            elif impulse_trail_armed or protection_mode == 'STRUCTURE_TIGHTENED':
                 logic_state = 'TRAIL_ACTIVE_STRUCTURE_HEALTHY'
                 logic_summary = 'Trail active'
-                why_not = 'The impulse threshold has been reached and the trailing rail is now protecting gains while trend structure remains intact.'
-                next_trigger = 'Trailing stop breach'
-                next_trigger_level = trailing_stop
-                current_phase = 'Trail Active'
-                phase_transition = 'Will transition to exit ready when price breaches the trailing stop.'
+                why_not = 'The impulse threshold has been reached and the active protection rail is now managing the runner while structure remains intact.'
+                next_trigger = 'Follow-through failure or trail breach'
+                next_trigger_level = active_protection_rail
+                current_phase = 'Structure tightened' if protection_mode == 'STRUCTURE_TIGHTENED' else 'Trail Active'
+                phase_transition = 'Will transition to exit ready when price breaches the active protection rail.'
                 structure_health = 'Healthy'
-                trail_status = 'Active'
-                risk_state = 'Improving'
-                risk_compression = 'Active'
+                trail_status = 'Structure tightened' if protection_mode == 'STRUCTURE_TIGHTENED' else 'Active'
+                risk_state = 'Protected' if protection_mode == 'STRUCTURE_TIGHTENED' else 'Improving'
+                risk_compression = 'Tightened' if protection_mode == 'STRUCTURE_TIGHTENED' else 'Active'
                 exit_readiness_score = 0.45
                 exit_likelihood = 'Moderate probability of exit if the runner pulls back.'
-                active_trigger_label = 'Trailing stop'
+                active_trigger_label = 'Promoted protective floor' if protection_mode == 'STRUCTURE_TIGHTENED' else 'Trailing stop'
             else:
                 logic_state = 'AWAITING_IMPULSE_CONFIRMATION'
                 logic_summary = 'Awaiting impulse confirmation'
-                why_not = 'Price has not moved far enough to activate the impulse-based trailing logic yet.'
+                why_not = 'Price has not moved far enough to activate the impulse-based protection logic yet.'
                 next_trigger = 'Impulse confirmation'
                 next_trigger_level = profit_target
-                current_phase = 'Impulse Build'
+                current_phase = 'Awaiting Impulse Confirmation'
                 phase_transition = 'Will transition to active trailing once the impulse threshold is reached.'
                 structure_health = 'Healthy'
                 trail_status = 'Configured'
@@ -938,8 +1059,8 @@ class PositionInspectService:
             distance_from_trail = ((current_price - trailing_stop) / current_price) * 100.0
         if current_price is not None and profit_target is not None and current_price:
             distance_from_target = ((profit_target - current_price) / current_price) * 100.0
-        if managed_only and 'managed only' not in why_not.lower():
-            why_not = f'{why_not} Symbol is managed-only, so the worker is supervising exits without allowing fresh entries.'
+        if managed_only and 'managed-only' not in why_not.lower():
+            why_not = f'{why_not} Managed-only: symbol removed from fresh-entry eligibility while exit supervision remains active until the position closes.'
         if managed_only:
             execution_status = 'Managed-only supervision'
         position_maturity = 'Unknown'
@@ -975,7 +1096,7 @@ class PositionInspectService:
             'lifecycleState': lifecycle_state,
             'cooldownActive': cooldown_active,
             'managedOnly': managed_only,
-            'managedOnlyExplanation': 'Symbol is no longer eligible for fresh entries and is under exit-only supervision.' if managed_only else None,
+            'managedOnlyExplanation': 'Managed-only: symbol removed from fresh-entry eligibility while exit supervision remains active until the position closes.' if managed_only else None,
             'activeTriggerLabel': active_trigger_label,
             'structureHealth': structure_health,
             'signalConflict': signal_conflict,
@@ -994,6 +1115,15 @@ class PositionInspectService:
             'positionMaturity': position_maturity,
             'strategyBiases': strategy_biases,
             'exitSensitivity': exit_sensitivity,
+            'protectionMode': protection_mode,
+            'feeAdjustedBreakEven': fee_adjusted_break_even,
+            'promotedProtectiveFloor': promoted_floor,
+            'activeProtectionRail': active_protection_rail,
+            'baseTrailingStop': trailing_stop,
+            'tpTouchedAtUtc': tp_touched_at_utc,
+            'strongerMarginReached': stronger_margin_reached,
+            'lastConfirmedHigherLow': last_confirmed_higher_low,
+            'followThroughFailed': follow_through_failed,
             'executionStatus': execution_status,
             'brokerStatus': broker_status,
             'stateHistory': state_history,

@@ -58,21 +58,33 @@ const ET_TIME = new Intl.DateTimeFormat('en-US', {
   hour12: false,
 })
 
+function trimTrailingZeros(value: string) {
+  return value.replace(/(\.\d*?[1-9])0+$/u, '$1').replace(/\.0+$/u, '')
+}
+
 function formatMoney(value: number) {
-  return `$${value.toFixed(2)}`
+  const absolute = Math.abs(value)
+  const decimals = absolute >= 100 ? 2 : absolute >= 1 ? 4 : 5
+  return `$${trimTrailingZeros(value.toFixed(decimals))}`
 }
 
 function formatPrice(value: number) {
   const absolute = Math.abs(value)
-  if (absolute === 0) return '$0.00'
-  if (absolute < 1) return `$${value.toFixed(5)}`
-  if (absolute < 100) return `$${value.toFixed(4)}`
-  return `$${value.toFixed(2)}`
+  if (absolute === 0) return '$0'
+  if (absolute < 1) return `$${trimTrailingZeros(value.toFixed(5))}`
+  if (absolute < 100) return `$${trimTrailingZeros(value.toFixed(4))}`
+  return `$${trimTrailingZeros(value.toFixed(2))}`
 }
 
 function formatPercent(value: number) {
   const prefix = value >= 0 ? '+' : ''
-  return `${prefix}${value.toFixed(2)}%`
+  return `${prefix}${trimTrailingZeros(value.toFixed(2))}%`
+}
+
+function formatPlainNumber(value: number) {
+  const absolute = Math.abs(value)
+  const decimals = absolute >= 100 ? 2 : absolute >= 1 ? 4 : 5
+  return trimTrailingZeros(value.toFixed(decimals))
 }
 
 function formatTimestamp(value?: string | null) {
@@ -167,8 +179,10 @@ type LabeledStat = {
 type DerivedInspectSections = {
   overview: StatCardRow[]
   strategyRows: LabeledStat[]
+  biasRows: LabeledStat[]
   sizingRows: LabeledStat[]
   exitRows: LabeledStat[]
+  protectionRows: LabeledStat[]
   exitVerdictRows: LabeledStat[]
   exitVerdictReason: string | null
   exitNextTriggerRows: LabeledStat[]
@@ -627,6 +641,7 @@ function PositionInspectDrawer({
   onClose: () => void
 }) {
   const [showRaw, setShowRaw] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const [timelineExpanded, setTimelineExpanded] = useState<Record<string, boolean>>({})
 
   if (!inspect && !loading && !error && !fallbackTitle) return null
@@ -686,6 +701,10 @@ function PositionInspectDrawer({
               <KeyValueGrid rows={sections.sizingRows} />
             </StructuredInspectCard>
 
+            <StructuredInspectCard title="Bias explanation" eyebrow="Entry permission" icon={<ShieldCheck className="h-4 w-4 text-cyan-300" />}>
+              <KeyValueGrid rows={sections.biasRows} />
+            </StructuredInspectCard>
+
             <StructuredInspectCard title="Timeframe alignment" eyebrow="Confirmation map" icon={<ShieldCheck className="h-4 w-4 text-cyan-300" />}>
               {inspect.timeframeAlignment?.note ? (
                 <div className="mb-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm leading-6 text-slate-400">
@@ -697,6 +716,10 @@ function PositionInspectDrawer({
 
             <StructuredInspectCard title="Exit plan" eyebrow="Risk rails" icon={<CircleAlert className="h-4 w-4 text-cyan-300" />}>
               <KeyValueGrid rows={sections.exitRows} />
+            </StructuredInspectCard>
+
+            <StructuredInspectCard title="Runner protection" eyebrow="Capital protection state" icon={<ShieldCheck className="h-4 w-4 text-cyan-300" />}>
+              <KeyValueGrid rows={sections.protectionRows} />
             </StructuredInspectCard>
 
             <StructuredInspectCard title="Current exit worker verdict" eyebrow="Primary decision engine" icon={<CalendarClock className="h-4 w-4 text-cyan-300" />}>
@@ -713,14 +736,28 @@ function PositionInspectDrawer({
               <KeyValueGrid rows={sections.exitNextTriggerRows} />
             </StructuredInspectCard>
 
-            <StructuredInspectCard title="Structure, risk, and readiness" eyebrow="Tier 2 → Tier 3 telemetry" icon={<ShieldCheck className="h-4 w-4 text-cyan-300" />}>
-              <KeyValueGrid rows={sections.exitHealthRows} />
-            </StructuredInspectCard>
-
-            <StructuredInspectCard title="Execution status" eyebrow="Logic versus order state" icon={<Clock3 className="h-4 w-4 text-cyan-300" />}>
-              <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-                <KeyValueList rows={sections.executionRows} />
-                <ExitStateHistory items={sections.exitStateHistory} />
+            <StructuredInspectCard title="Advanced telemetry" eyebrow="Folded away on purpose" icon={<Layers3 className="h-4 w-4 text-cyan-300" />}>
+              <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+                <button
+                  type="button"
+                  onClick={() => setShowAdvanced((current) => !current)}
+                  className="flex w-full items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-900/70 px-4 py-3 text-left transition hover:border-cyan-700"
+                >
+                  <div>
+                    <div className="text-sm font-medium text-slate-200">Advanced metrics, execution state, and history</div>
+                    <div className="mt-1 text-xs text-slate-500">Use this when you want the wiring diagram instead of the headline verdict.</div>
+                  </div>
+                  {showAdvanced ? <ChevronUp className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
+                </button>
+                {showAdvanced ? (
+                  <div className="mt-4 space-y-6">
+                    <KeyValueGrid rows={sections.exitHealthRows} />
+                    <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+                      <KeyValueList rows={sections.executionRows} />
+                      <ExitStateHistory items={sections.exitStateHistory} />
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </StructuredInspectCard>
 
@@ -802,9 +839,9 @@ function displayValue(label: string, value: unknown): string {
       return formatMoney(value)
     }
     if (normalized.includes('hours')) {
-      return `${value}`
+      return formatPlainNumber(value)
     }
-    return `${value}`
+    return formatPlainNumber(value)
   }
   if (typeof value === 'boolean') return value ? 'Yes' : 'No'
   if (typeof value === 'string') {
@@ -897,6 +934,19 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
     { label: 'Continuity gap seconds', value: displayValue('continuityGapSeconds', signalDetails.continuityGapSeconds), tone: 'muted' },
   ]
 
+  const biasExplanation = asRecord(inspect.biasExplanation)
+  const biasRows: LabeledStat[] = [
+    { label: 'Bias state', value: displayValue('biasState', biasExplanation.biasState ?? signal.bias), tone: 'info' },
+    { label: 'Entry permission', value: displayValue('entryPermission', biasExplanation.entryPermission), tone: asText(biasExplanation.entryPermission)?.toLowerCase() === 'blocked' ? 'danger' : 'good' },
+    { label: 'Unblock condition', value: displayValue('unblockCondition', biasExplanation.unblockCondition), tone: 'warn' },
+    { label: 'Timeframe bias breakdown', value: Array.isArray(biasExplanation.timeframes)
+      ? biasExplanation.timeframes.map((item) => {
+          const row = asRecord(item)
+          return `${displayValue('timeframe', row.timeframe)} ${displayValue('status', row.status)}`
+        }).join(' · ')
+      : '—', tone: 'muted' },
+  ]
+
   const requestedQuantity = asNumber(sizing.requestedQuantity)
   const filledQuantity = asNumber(sizing.filledQuantity)
   const requestedPrice = asNumber(sizing.requestedPrice)
@@ -921,11 +971,15 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
   ]
 
   const expectedExitThresholds = asRecord(exitPlan.expectedExitThresholds)
+  const activeProtectionRail = asNumber(exitWorker.activeProtectionRail) ?? asNumber(exitPlan.promotedProtectiveFloor) ?? asNumber(exitPlan.trailingStop)
+  const baseTrailingStop = asNumber(exitWorker.baseTrailingStop) ?? asNumber(exitPlan.trailingStop)
+
   const exitRows: LabeledStat[] = [
     { label: 'Exit template', value: displayValue('template', exitPlan.template), tone: 'info' },
     { label: 'Stop loss', value: displayValue('stopLoss', exitPlan.stopLoss), tone: 'danger' },
     { label: 'Profit target', value: displayValue('profitTarget', exitPlan.profitTarget), tone: 'good' },
-    { label: 'Trailing stop', value: displayValue('trailingStop', exitPlan.trailingStop), tone: 'warn' },
+    { label: 'Active protection rail', value: displayValue('activeProtectionRail', activeProtectionRail), tone: 'warn' },
+    { label: 'Base trailing stop', value: displayValue('baseTrailingStop', baseTrailingStop), tone: 'muted' },
     { label: 'Stop distance', value: displayValue('stopDistance', exitPlan.stopDistance), tone: 'warn' },
     { label: 'Target distance', value: displayValue('targetDistance', exitPlan.targetDistance), tone: 'good' },
     { label: 'Trailing distance', value: displayValue('trailingDistance', exitPlan.trailingDistance), tone: 'warn' },
@@ -934,6 +988,15 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
     { label: 'Bounce floor', value: displayValue('bounceFloor', expectedExitThresholds.bounceFloor ?? exitPlan.bounceFloor), tone: 'info' },
     { label: 'Peak price', value: displayValue('peakPrice', exitPlan.peakPrice), tone: 'muted' },
     { label: 'Exit trigger', value: displayValue('tradeExitTrigger', exitPlan.tradeExitTrigger), tone: 'muted' },
+  ]
+
+  const protectionRows: LabeledStat[] = [
+    { label: 'Protection mode', value: displayValue('protectionMode', exitWorker.protectionMode ?? exitPlan.protectionMode), tone: 'info' },
+    { label: 'Fee-adjusted break-even', value: displayValue('feeAdjustedBreakEven', exitWorker.feeAdjustedBreakEven ?? exitPlan.feeAdjustedBreakEven), tone: 'good' },
+    { label: 'Promoted protective floor', value: displayValue('promotedProtectiveFloor', exitWorker.promotedProtectiveFloor ?? exitPlan.promotedProtectiveFloor), tone: 'warn' },
+    { label: 'TP touched at', value: displayValue('tpTouchedAtUtc', exitWorker.tpTouchedAtUtc ?? exitPlan.tpTouchedAtUtc), tone: 'muted' },
+    { label: 'Stronger margin reached', value: displayValue('strongerMarginReached', exitWorker.strongerMarginReached ?? exitPlan.strongerMarginReached), tone: 'muted' },
+    { label: 'Last confirmed higher low', value: displayValue('lastConfirmedHigherLow', exitWorker.lastConfirmedHigherLow ?? exitPlan.lastConfirmedHigherLow), tone: 'muted' },
   ]
 
   const exitState = asText(exitWorker.logicSummary) ?? asText(latestEvaluation.state)
@@ -1000,8 +1063,10 @@ function deriveInspectSections(inspect: PositionInspectRecord): DerivedInspectSe
   return {
     overview,
     strategyRows,
+    biasRows,
     sizingRows,
     exitRows,
+    protectionRows,
     exitVerdictRows,
     exitVerdictReason: asText(exitWorker.whyNotExitingYet) ?? asText(latestEvaluation.reason),
     exitNextTriggerRows,

@@ -515,6 +515,148 @@ def test_crypto_position_inspect_surfaces_protective_exit_pending_when_stop_loss
         assert payload['exitWorker']['logicState'] == 'EXIT_PENDING'
 
 
+def test_crypto_position_inspect_uses_live_runner_protection_state(tmp_path, monkeypatch) -> None:
+    with build_session_factory(tmp_path) as SessionFactory:
+        db = SessionFactory()
+        upload = WatchlistUpload(
+            upload_id='upl-crypto-protection-1',
+            scan_id='scan-crypto-protection-1',
+            schema_version='bot_watchlist_v3',
+            provider='claude_tradier_mcp',
+            scope='crypto_only',
+            source='test',
+            payload_hash='hash-protection-1',
+            generated_at_utc=datetime(2026, 4, 5, 12, 0, tzinfo=UTC),
+            received_at_utc=datetime(2026, 4, 5, 12, 1, tzinfo=UTC),
+            watchlist_expires_at_utc=datetime(2026, 4, 6, 12, 0, tzinfo=UTC),
+            validation_status='ACCEPTED',
+            market_regime='mixed',
+            selected_count=1,
+            is_active=True,
+            validation_result_json={},
+            raw_payload_json={},
+            bot_payload_json={},
+        )
+        db.add(upload)
+        db.flush()
+
+        row = WatchlistSymbol(
+            upload_id=upload.upload_id,
+            scope='crypto_only',
+            symbol='BTC/USD',
+            quote_currency='USD',
+            asset_class='crypto',
+            enabled=True,
+            trade_direction='long',
+            priority_rank=1,
+            tier='tier_1',
+            bias='bullish',
+            setup_template='trend_continuation',
+            bot_timeframes=['15m', '1h', '4h'],
+            exit_template='first_failed_follow_through',
+            max_hold_hours=72,
+            risk_flags=['high_beta'],
+            monitoring_status='ACTIVE',
+        )
+        db.add(row)
+        db.flush()
+
+        monitor_state = WatchlistMonitorState(
+            watchlist_symbol_id=row.id,
+            upload_id=upload.upload_id,
+            scope='crypto_only',
+            symbol='BTC/USD',
+            monitoring_status='ACTIVE',
+            latest_decision_state='SKIPPED',
+            latest_decision_reason='OPEN_POSITION_EXISTS',
+            decision_context_json={
+                'latestEvaluation': {
+                    'state': 'SKIPPED',
+                    'reason': 'OPEN_POSITION_EXISTS',
+                    'evaluatedAtUtc': '2026-04-05T12:05:00+00:00',
+                    'marketDataAtUtc': '2026-04-05T12:04:30+00:00',
+                    'details': {
+                        'currentPrice': 68210.34,
+                    },
+                }
+            },
+            required_timeframes_json=['15m', '1h', '4h'],
+            evaluation_interval_seconds=300,
+            last_decision_at_utc=datetime(2026, 4, 5, 12, 5, tzinfo=UTC),
+            last_evaluated_at_utc=datetime(2026, 4, 5, 12, 5, tzinfo=UTC),
+            next_evaluation_at_utc=datetime(2026, 4, 5, 12, 10, tzinfo=UTC),
+            last_market_data_at_utc=datetime(2026, 4, 5, 12, 4, 30, tzinfo=UTC),
+        )
+        db.add(monitor_state)
+        db.commit()
+
+        monkeypatch.setattr(
+            crypto_ledger,
+            'get_positions',
+            lambda: [
+                {
+                    'pair': 'BTC/USD',
+                    'ohlcvPair': 'XBTUSD',
+                    'amount': 0.25,
+                    'avgPrice': 65000.0,
+                    'currentPrice': 68210.34,
+                    'marketValue': 17052.585,
+                    'costBasis': 16250.0,
+                    'pnl': 802.585,
+                    'pnlPercent': 4.939,
+                    'entryTimeUtc': '2026-04-05T11:00:00+00:00',
+                    'realizedPnl': 0.0,
+                }
+            ],
+        )
+
+        monkeypatch.setattr(
+            watchlist_service,
+            'get_monitoring_snapshot',
+            lambda session, **kwargs: {
+                'scope': 'crypto_only',
+                'capturedAtUtc': '2026-04-05T12:05:00+00:00',
+                'activeUploadId': upload.upload_id,
+                'summary': {},
+                'rows': [
+                    {
+                        'symbol': 'BTC/USD',
+                        'monitoringStatus': 'ACTIVE',
+                        'monitoring': {
+                            'latestDecisionState': 'SKIPPED',
+                            'latestDecisionReason': 'OPEN_POSITION_EXISTS',
+                        },
+                        'positionState': {
+                            'hasOpenPosition': True,
+                            'currentPrice': 68210.34,
+                            'profitTarget': 67600.0,
+                            'profitTargetReached': True,
+                            'trailingStop': 66100.0,
+                            'peakPrice': 68420.0,
+                            'protectionMode': 'BREAK_EVEN_PROMOTED',
+                            'feeAdjustedBreakEven': 65120.0,
+                            'promotedProtectiveFloor': 65120.0,
+                            'tpTouchedAtUtc': '2026-04-05T12:02:00+00:00',
+                            'strongerMarginReached': False,
+                            'lastConfirmedHigherLow': None,
+                            'followThroughFailed': False,
+                        },
+                    }
+                ],
+            },
+        )
+
+        payload = position_inspect_service.get_inspect_payload(db, asset_class='crypto', symbol='BTC/USD')
+        db.close()
+
+        assert payload['exitWorker']['protectionMode'] == 'BREAK_EVEN_PROMOTED'
+        assert payload['exitWorker']['logicSummary'] == 'TP hit awaiting weakness'
+        assert payload['exitWorker']['currentPhase'] == 'Break-even promoted'
+        assert payload['exitWorker']['nextExitTrigger'] == 'Follow-through failure or trail breach'
+        assert payload['exitWorker']['feeAdjustedBreakEven'] == 65120.0
+        assert payload['exitWorker']['promotedProtectiveFloor'] == 65120.0
+
+
 def test_crypto_inspect_returns_cooldown_payload_after_exit(tmp_path) -> None:
     with build_session_factory(tmp_path) as SessionFactory:
         db = SessionFactory()

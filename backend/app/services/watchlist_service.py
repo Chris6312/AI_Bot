@@ -83,6 +83,9 @@ PROFIT_TARGET_SCALE_OUT_TEMPLATES = {'scale_out_then_trail', 'sell_into_strength
 FOLLOW_THROUGH_EXIT_TEMPLATES = {'first_failed_follow_through'}
 IMPULSE_TRAIL_TEMPLATES = {'trail_after_impulse'}
 IMPULSE_TRAIL_STOP_FACTOR = 0.5
+RUNNER_BREAK_EVEN_FEE_PCT = 0.0025
+RUNNER_BREAK_EVEN_SLIPPAGE_PCT = 0.001
+RUNNER_STRONGER_EXTENSION_PCT = 0.01
 POSITION_MIRROR_SYNC_SOURCE = 'broker_position_mirror'
 VALIDATION_ACCEPTED_STATUSES = {'accepted', 'valid'}
 REPLAY_REJECTED = 'rejected'
@@ -1974,8 +1977,85 @@ class WatchlistService:
             'impulseTrailArmed': False,
             'impulseTrailingStop': None,
             'peakPrice': None,
+            'protectionMode': 'INITIAL_RISK',
+            'feeAdjustedBreakEven': None,
+            'promotedProtectiveFloor': None,
+            'tpTouchedAtUtc': None,
+            'strongerMarginReached': False,
+            'lastConfirmedHigherLow': None,
         }
         return symbol_payload
+
+    @staticmethod
+    def _resolve_price_precision(*, asset_class: str) -> int:
+        return 8 if str(asset_class or '').lower() == 'crypto' else 4
+
+    def _build_runner_protection_state(
+        self,
+        *,
+        asset_class: str,
+        exit_template: str,
+        observed_at: datetime,
+        entry_time: datetime | None,
+        avg_entry_price: float | None,
+        current_price: float | None,
+        profit_target: float | None,
+        trailing_stop: float | None,
+        peak_price: float | None,
+        follow_through_failed: bool,
+    ) -> dict[str, Any]:
+        precision = self._resolve_price_precision(asset_class=asset_class)
+        normalized_template = str(exit_template or '').strip().lower()
+        applies = normalized_template in FOLLOW_THROUGH_EXIT_TEMPLATES or normalized_template in IMPULSE_TRAIL_TEMPLATES
+        fee_adjusted_break_even = None
+        protection_mode = 'INITIAL_RISK'
+        promoted_floor = trailing_stop
+        tp_touched_at_utc = None
+        stronger_margin_reached = False
+        last_confirmed_higher_low = None
+        active_protective_floor = trailing_stop
+
+        if avg_entry_price is not None and avg_entry_price > 0:
+            fee_adjusted_break_even = round(
+                avg_entry_price * (1.0 + RUNNER_BREAK_EVEN_FEE_PCT + RUNNER_BREAK_EVEN_SLIPPAGE_PCT),
+                precision,
+            )
+
+        if applies and current_price is not None and profit_target is not None and profit_target > 0 and current_price >= profit_target:
+            tp_touched_at_utc = observed_at.isoformat()
+            promoted_floor = max(
+                float(trailing_stop or 0.0),
+                float(fee_adjusted_break_even or 0.0),
+            )
+            protection_mode = 'BREAK_EVEN_PROMOTED'
+            active_protective_floor = promoted_floor
+
+            extension_reference_price = max(float(peak_price or 0.0), float(current_price or 0.0))
+            stronger_margin_reached = extension_reference_price >= (profit_target * (1.0 + RUNNER_STRONGER_EXTENSION_PCT))
+            if stronger_margin_reached:
+                candidate_higher_low = round(
+                    extension_reference_price * (1.0 - (float(settings.TRAILING_STOP_PCT) * IMPULSE_TRAIL_STOP_FACTOR)),
+                    precision,
+                )
+                if candidate_higher_low > float(fee_adjusted_break_even or 0.0):
+                    last_confirmed_higher_low = candidate_higher_low
+                    promoted_floor = max(float(promoted_floor or 0.0), float(candidate_higher_low or 0.0))
+                    protection_mode = 'STRUCTURE_TIGHTENED'
+                    active_protective_floor = promoted_floor
+
+        if follow_through_failed and applies:
+            protection_mode = 'EXIT_READY'
+
+        return {
+            'protectionMode': protection_mode,
+            'feeAdjustedBreakEven': fee_adjusted_break_even,
+            'promotedProtectiveFloor': promoted_floor,
+            'tpTouchedAtUtc': tp_touched_at_utc,
+            'strongerMarginReached': stronger_margin_reached,
+            'lastConfirmedHigherLow': last_confirmed_higher_low,
+            'followThroughFailed': bool(follow_through_failed),
+            'activeProtectiveFloor': active_protective_floor,
+        }
 
     def _build_position_state_map(
         self,
@@ -2071,6 +2151,23 @@ class WatchlistService:
             )
             impulse_reference_price = max(float(peak_price or 0.0), float(current_price or 0.0))
             impulse_trailing_stop = self._calculate_impulse_trailing_stop(impulse_reference_price) if impulse_trail_armed else None
+            runner_protection = self._build_runner_protection_state(
+                asset_class='stock',
+                exit_template=exit_template,
+                observed_at=observed_at,
+                entry_time=entry_time,
+                avg_entry_price=avg_entry_price,
+                current_price=current_price,
+                profit_target=profit_target,
+                trailing_stop=impulse_trailing_stop if impulse_trail_armed and impulse_trailing_stop is not None else trailing_stop,
+                peak_price=peak_price,
+                follow_through_failed=follow_through_failed,
+            )
+            active_protective_floor = runner_protection.get('activeProtectiveFloor')
+            if current_price is not None and active_protective_floor is not None and current_price <= active_protective_floor:
+                trailing_stop_breached = True
+                if 'TRAILING_STOP_BREACH' not in protective_exit_reasons:
+                    protective_exit_reasons.append('TRAILING_STOP_BREACH')
             (
                 effective_expires_at,
                 position_expired,
@@ -2109,6 +2206,12 @@ class WatchlistService:
                 'scaleOutAlreadyTaken': profit_scale_out_taken,
                 'impulseTrailArmed': impulse_trail_armed,
                 'impulseTrailingStop': impulse_trailing_stop,
+                'protectionMode': runner_protection.get('protectionMode'),
+                'feeAdjustedBreakEven': runner_protection.get('feeAdjustedBreakEven'),
+                'promotedProtectiveFloor': runner_protection.get('promotedProtectiveFloor'),
+                'tpTouchedAtUtc': runner_protection.get('tpTouchedAtUtc'),
+                'strongerMarginReached': runner_protection.get('strongerMarginReached'),
+                'lastConfirmedHigherLow': runner_protection.get('lastConfirmedHigherLow'),
                 'entryTimeUtc': entry_time.isoformat() if entry_time else None,
                 'maxHoldHours': max_hold_hours,
                 'basePositionExpiresAtUtc': base_expires_at.isoformat() if base_expires_at else None,
@@ -2429,6 +2532,23 @@ class WatchlistService:
                 and not stop_loss_breached
                 and not trailing_stop_breached
             )
+            runner_protection = self._build_runner_protection_state(
+                asset_class='crypto',
+                exit_template=exit_template,
+                observed_at=observed_at,
+                entry_time=entry_time,
+                avg_entry_price=avg_entry_price,
+                current_price=current_price,
+                profit_target=profit_target,
+                trailing_stop=impulse_trailing_stop if impulse_trail_armed and impulse_trailing_stop is not None else trailing_stop,
+                peak_price=peak_price,
+                follow_through_failed=follow_through_failed,
+            )
+            active_protective_floor = runner_protection.get('activeProtectiveFloor')
+            if current_price is not None and active_protective_floor is not None and current_price <= active_protective_floor:
+                trailing_stop_breached = True
+                if 'TRAILING_STOP_BREACH' not in protective_exit_reasons:
+                    protective_exit_reasons.append('TRAILING_STOP_BREACH')
 
             (
                 effective_expires_at,
@@ -2488,6 +2608,12 @@ class WatchlistService:
                 'scaleOutAlreadyTaken': False,
                 'impulseTrailArmed': impulse_trail_armed,
                 'impulseTrailingStop': impulse_trailing_stop,
+                'protectionMode': runner_protection.get('protectionMode'),
+                'feeAdjustedBreakEven': runner_protection.get('feeAdjustedBreakEven'),
+                'promotedProtectiveFloor': runner_protection.get('promotedProtectiveFloor'),
+                'tpTouchedAtUtc': runner_protection.get('tpTouchedAtUtc'),
+                'strongerMarginReached': runner_protection.get('strongerMarginReached'),
+                'lastConfirmedHigherLow': runner_protection.get('lastConfirmedHigherLow'),
                 'observedAtUtc': observed_at.isoformat(),
             }
             state_map[normalized_symbol] = payload
