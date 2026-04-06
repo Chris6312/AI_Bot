@@ -143,8 +143,9 @@ export function getStatusMeta(raw?: string | null): {
     return { canonical: 'idle', canonicalLabel: 'Idle', rawLabel: 'Idle', tone: 'muted' }
   }
 
+  // Changed tone from 'warn' to 'info' for normal supervision
   if (normalized.includes('MANAGED_ONLY')) {
-    return { canonical: 'managed-only', canonicalLabel: 'Managed-only', rawLabel: startCase(raw), tone: 'warn' }
+    return { canonical: 'managed-only', canonicalLabel: 'Managed-only', rawLabel: startCase(raw), tone: 'info' }
   }
 
   if (normalized.includes('STALE')) {
@@ -166,23 +167,28 @@ export function getStatusMeta(raw?: string | null): {
   }
 
   if (normalized.includes('EXIT_PENDING')) {
-    return { canonical: 'pending', canonicalLabel: 'Pending Exit', rawLabel: startCase(raw), tone: 'warn' }
+    return { canonical: 'pending', canonicalLabel: 'Pending Exit', rawLabel: startCase(raw), tone: 'info' }
   }
 
   if (normalized.includes('WAITING_FOR_MARKET_OPEN')) {
-    return { canonical: 'waiting', canonicalLabel: 'Waiting', rawLabel: startCase(raw), tone: 'warn' }
+    return { canonical: 'waiting', canonicalLabel: 'Waiting', rawLabel: startCase(raw), tone: 'info' }
   }
 
+  // Intercept the backend's "DEGRADED" scope truth and override it to "Pending"
+  if (normalized.includes('DEGRADED')) {
+    return { canonical: 'pending', canonicalLabel: 'Pending', rawLabel: 'Pending', tone: 'info' }
+  }
+
+  // Reclassified normal operational pauses/waits from 'warning'/'warn' to 'pending'/'info'
   if (
     normalized.includes('PAUSED') ||
-    normalized.includes('DEGRADED') ||
     normalized.includes('WAITING') ||
     normalized.includes('PENDING') ||
     normalized.includes('CLOSED') ||
     normalized.includes('MONITOR_ONLY') ||
     normalized.includes('SKIPPED')
   ) {
-    return { canonical: 'warning', canonicalLabel: 'Warning', rawLabel: startCase(raw), tone: 'warn' }
+    return { canonical: 'pending', canonicalLabel: 'Pending', rawLabel: startCase(raw), tone: 'info' }
   }
 
   if (normalized.includes('INACTIVE') || normalized.includes('UNMANAGED') || normalized === 'FLAT') {

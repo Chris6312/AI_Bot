@@ -781,19 +781,82 @@ class PositionInspectService:
         last_confirmed_higher_low = self._maybe_float(details.get('lastConfirmedHigherLow') or exit_plan.get('lastConfirmedHigherLow'))
         hours_since_entry = self._maybe_float(exit_plan.get('hoursSinceEntry') or details.get('hoursSinceEntry') or details.get('hours_open'))
         max_hold_hours = self._maybe_float(exit_plan.get('maxHoldHours'))
+        follow_through_failed = bool(details.get('followThroughFailed') or exit_plan.get('followThroughFailed'))
+
+# --- DYNAMIC RECALCULATION OF RUNNER PROTECTION ---
+        # Ensures UI instantly reflects promoted rails if price crosses targets
+        # between background worker cycles, while strictly respecting already-saved DB state.
+        from datetime import datetime, timezone
+        dynamic_protection = watchlist_service._build_runner_protection_state(
+            asset_class=asset_class,
+            exit_template=template,
+            observed_at=datetime.now(timezone.utc),
+            entry_time=None,
+            avg_entry_price=entry_price,
+            current_price=current_price,
+            profit_target=profit_target,
+            trailing_stop=trailing_stop,
+            peak_price=peak_price,
+            follow_through_failed=follow_through_failed,
+        )
+        
+        dyn_mode = dynamic_protection.get('protectionMode') or 'INITIAL_RISK'
+        mode_rank = {'INITIAL_RISK': 0, 'BREAK_EVEN_PROMOTED': 1, 'STRUCTURE_TIGHTENED': 2, 'EXIT_READY': 3}
+        
+        # We only apply dynamic overrides if the real-time data warrants an UPGRADE to the protection tier
+        if mode_rank.get(dyn_mode, 0) > mode_rank.get(protection_mode, 0):
+            protection_mode = dyn_mode
+            
+            # Since we are upgrading, we adopt the dynamic floors if they are higher
+            fee_adjusted_break_even = fee_adjusted_break_even if fee_adjusted_break_even is not None else dynamic_protection.get('feeAdjustedBreakEven')
+            
+            dyn_promoted_floor = dynamic_protection.get('promotedProtectiveFloor')
+            if dyn_promoted_floor is not None:
+                promoted_protective_floor = max(promoted_protective_floor or 0.0, dyn_promoted_floor) if promoted_protective_floor is not None else dyn_promoted_floor
+
+            dyn_higher_low = dynamic_protection.get('lastConfirmedHigherLow')
+            if dyn_higher_low is not None:
+                last_confirmed_higher_low = max(last_confirmed_higher_low or 0.0, dyn_higher_low) if last_confirmed_higher_low is not None else dyn_higher_low
+
+            tp_touched_at_utc = tp_touched_at_utc or dynamic_protection.get('tpTouchedAtUtc')
+            stronger_margin_reached = stronger_margin_reached or dynamic_protection.get('strongerMarginReached')
+
+        # Always backfill missing fields from dynamic calculation, even if mode wasn't upgraded
+        elif mode_rank.get(dyn_mode, 0) == mode_rank.get(protection_mode, 0):
+            if fee_adjusted_break_even is None:
+                fee_adjusted_break_even = dynamic_protection.get('feeAdjustedBreakEven')
+            if promoted_protective_floor is None:
+                promoted_protective_floor = dynamic_protection.get('promotedProtectiveFloor')
+            if last_confirmed_higher_low is None:
+                last_confirmed_higher_low = dynamic_protection.get('lastConfirmedHigherLow')
+            if tp_touched_at_utc is None:
+                tp_touched_at_utc = dynamic_protection.get('tpTouchedAtUtc')
+            if not stronger_margin_reached:
+                stronger_margin_reached = dynamic_protection.get('strongerMarginReached')
+
+        # Mutate the passed exit_plan so the outer payload also reflects the live state
+        exit_plan['protectionMode'] = protection_mode
+        exit_plan['feeAdjustedBreakEven'] = fee_adjusted_break_even
+        exit_plan['promotedProtectiveFloor'] = promoted_protective_floor
+        exit_plan['tpTouchedAtUtc'] = tp_touched_at_utc
+        exit_plan['strongerMarginReached'] = stronger_margin_reached
+        exit_plan['lastConfirmedHigherLow'] = last_confirmed_higher_low
+        # --- END DYNAMIC RECALCULATION ---
+
         target_reached = bool(details.get('profitTargetReached')) or bool(tp_touched_at_utc) or (current_price is not None and profit_target is not None and current_price >= profit_target)
         effective_protective_floor = trailing_stop
         candidate_floors = [value for value in (trailing_stop, promoted_protective_floor, fee_adjusted_break_even) if value is not None]
         if candidate_floors:
             effective_protective_floor = max(candidate_floors)
+            
         trail_breached = bool(details.get('trailingStopBreached')) or (current_price is not None and effective_protective_floor is not None and current_price <= effective_protective_floor)
         stop_breached = bool(details.get('stopLossBreached')) or (current_price is not None and stop_loss is not None and current_price <= stop_loss)
-        follow_through_failed = bool(details.get('followThroughFailed') or exit_plan.get('followThroughFailed'))
         impulse_trail_armed = bool(details.get('impulseTrailArmed'))
         scale_out_taken = bool(details.get('scaleOutAlreadyTaken'))
         scale_out_ready = bool(details.get('scaleOutReady')) or (template == 'scale_out_then_trail' and target_reached and not scale_out_taken)
         promoted_floor = promoted_protective_floor
         active_protection_rail = promoted_floor or effective_protective_floor or trailing_stop
+        
         execution_status = 'No order pending'
         broker_status = 'Connected'
         logic_state = 'NO_EXIT_SIGNAL'
