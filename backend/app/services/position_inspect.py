@@ -72,6 +72,24 @@ class PositionInspectService:
         if position is None:
             raise PositionInspectNotFound(f'No open stock position found for {symbol}.')
 
+        # --- LIVE QUOTE FETCH & PNL RECALCULATION ---
+        # Ensures the drawer is perfectly up-to-date, overriding any DB lag
+        mode = getattr(runtime_state.get(), 'stock_mode', 'PAPER')
+        try:
+            quote = tradier_client.get_quote_sync(symbol, mode=mode) or {}
+            live_price = quote.get('last') or quote.get('close')
+        except Exception:
+            live_price = None
+
+        current_price = float(live_price) if live_price is not None else float(position.current_price or position.avg_entry_price or 0.0)
+        avg_entry_price = float(position.avg_entry_price or 0.0)
+        shares = float(position.shares or 0)
+        
+        unrealized_pnl = (current_price - avg_entry_price) * shares if shares > 0 else 0.0
+        cost_basis = avg_entry_price * shares
+        unrealized_pnl_pct = ((unrealized_pnl / cost_basis) * 100.0) if cost_basis > 0 else 0.0
+        # --------------------------------------------
+
         entry_reasoning = position.entry_reasoning if isinstance(position.entry_reasoning, dict) else {}
         linked_intent_id = str(entry_reasoning.get('intentId') or position.execution_id or '').strip() or None
         intent = self._find_intent(db, asset_class='stock', symbol=symbol, intent_id=linked_intent_id)
@@ -120,11 +138,11 @@ class PositionInspectService:
             'accountId': position.account_id,
             'quantityLabel': 'Shares',
             'quantity': int(position.shares or 0),
-            'avgEntryPrice': float(position.avg_entry_price or 0.0) if position.avg_entry_price is not None else None,
-            'currentPrice': float(position.current_price or 0.0) if position.current_price is not None else None,
-            'marketValue': (float(position.current_price or 0.0) * float(position.shares or 0.0)) if position.current_price is not None else None,
-            'unrealizedPnl': float(position.unrealized_pnl or 0.0) if position.unrealized_pnl is not None else None,
-            'unrealizedPnlPct': float(position.unrealized_pnl_pct or 0.0) if position.unrealized_pnl_pct is not None else None,
+            'avgEntryPrice': avg_entry_price if position.avg_entry_price is not None else None,
+            'currentPrice': current_price,
+            'marketValue': current_price * shares,
+            'unrealizedPnl': unrealized_pnl,
+            'unrealizedPnlPct': unrealized_pnl_pct,
             'entryTimeUtc': position.entry_time.isoformat() if position.entry_time else None,
             'isOpen': bool(position.is_open),
         }

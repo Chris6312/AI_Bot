@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
@@ -42,6 +43,16 @@ from app.services.template_evaluator import (
 from app.services.watchlist_monitoring import watchlist_monitoring_orchestrator
 from app.services.watchlist_exit_worker import watchlist_exit_worker
 from app.services.watchlist_service import ACTIVE, INACTIVE, MANAGED_ONLY, WatchlistValidationError, watchlist_service
+
+
+@pytest.fixture(autouse=True)
+def mock_tradier_positions_for_watchlists(monkeypatch):
+    """
+    Ensure the live Sandbox API is never accidentally hit by background
+    position reconciliation during watchlist ingestion. Tests that need specific
+    broker position snapshots explicitly mock this function themselves inside the test.
+    """
+    monkeypatch.setattr('app.services.tradier_client.tradier_client.get_positions_snapshot', lambda mode=None, include_quotes=False: [])
 
 
 @contextmanager

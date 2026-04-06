@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from datetime import UTC, datetime, timedelta
 
 from app.models.order_intent import OrderIntent
@@ -11,13 +12,19 @@ from app.services.watchlist_service import watchlist_service
 from tests.test_phase4_watchlists import build_crypto_payload, build_session_factory, build_stock_payload
 
 
+@pytest.fixture(autouse=True)
+def mock_tradier_positions_for_reconciliation(monkeypatch):
+    """
+    Prevent the tests from hitting the live Tradier sandbox API
+    during background reconciliation triggers.
+    """
+    monkeypatch.setattr('app.services.tradier_client.tradier_client.get_positions_snapshot', lambda mode=None, include_quotes=False: [])
+
 
 def _reset_crypto_ledger() -> None:
     crypto_ledger.trades = []
     crypto_ledger.positions = {}
     crypto_ledger.balance = crypto_ledger.starting_balance
-
-
 
 def test_startup_reconciliation_restores_crypto_ledger_from_filled_intents(tmp_path) -> None:
     _reset_crypto_ledger()

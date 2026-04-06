@@ -1357,8 +1357,8 @@ class TemplateEvaluationService:
             '5m': 5,
             '15m': 15,
             '1h': 60,
-            '4h': 60,
-            '1d': 60,
+            '4h': 240,
+            '1d': 1440,
         }
         intervals = [interval_map[item] for item in (row.bot_timeframes or []) if item in interval_map]
         if not intervals:

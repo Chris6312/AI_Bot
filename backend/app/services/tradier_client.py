@@ -213,27 +213,36 @@ class TradierClient:
         session_filter: str = 'open',
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
-        interval_labels = {
-            1: '1min',
-            5: '5min',
-            10: '10min',
-            15: '15min',
-            30: '30min',
-            60: '1hour',
-        }
         target_symbol = str(symbol or '').upper().strip()
         if not target_symbol:
             return []
 
+        # Tradier timesales strictly supports 1min, 5min, and 15min
+        interval_val = max(1, int(interval_minutes))
+        if interval_val < 5:
+            interval_str = '1min'
+        elif interval_val < 15:
+            interval_str = '5min'
+        else:
+            interval_str = '15min'
+
         end_at = _parse_datetime(end) or datetime.now(timezone.utc)
-        start_at = _parse_datetime(start) or (end_at - timedelta(days=5))
+        
+        # If requesting higher timeframes, we need a longer lookback to gather enough 15m candles
+        days_lookback = 5
+        if interval_val == 60:
+            days_lookback = 14
+        elif interval_val >= 240:
+            days_lookback = 30
+
+        start_at = _parse_datetime(start) or (end_at - timedelta(days=days_lookback))
         payload = self._request_json(
             'GET',
             'markets/timesales',
             mode=mode,
             params={
                 'symbol': target_symbol,
-                'interval': interval_labels.get(max(1, int(interval_minutes)), '5min'),
+                'interval': interval_str,
                 'start': start_at.strftime('%Y-%m-%d %H:%M'),
                 'end': end_at.strftime('%Y-%m-%d %H:%M'),
                 'session_filter': session_filter,
@@ -241,22 +250,58 @@ class TradierClient:
             timeout=timeout,
         )
         raw_bars = _extract_collection(payload, 'series', 'data')
-        candles: list[dict[str, Any]] = []
+        
+        base_candles: list[dict[str, Any]] = []
         for bar in raw_bars:
             timestamp = _parse_datetime(bar.get('time') or bar.get('timestamp') or bar.get('datetime') or bar.get('date'))
             if timestamp is None:
                 continue
-            candles.append(
+            base_candles.append(
                 {
                     'timestamp': int(timestamp.timestamp()),
                     'open': _coalesce_numeric(bar, ['open']),
                     'high': _coalesce_numeric(bar, ['high']),
                     'low': _coalesce_numeric(bar, ['low']),
                     'close': _coalesce_numeric(bar, ['close']),
-                    'volume': bar.get('volume') if bar.get('volume') not in (None, '') else None,
+                    'volume': bar.get('volume') if bar.get('volume') not in (None, '') else 0.0,
                 }
             )
-        return candles
+
+        if interval_val <= 15 or not base_candles:
+            return base_candles
+
+        # Aggregate 15m candles up to the requested interval (e.g., 60m, 240m)
+        base_candles.sort(key=lambda c: c['timestamp'])
+        aggregated_candles: list[dict[str, Any]] = []
+        current_agg = None
+
+        for candle in base_candles:
+            ts = candle['timestamp']
+            # Align buckets to standard interval boundaries
+            bucket_ts = ts - (ts % (interval_val * 60))
+            
+            if current_agg is None or current_agg['timestamp'] != bucket_ts:
+                if current_agg is not None:
+                    aggregated_candles.append(current_agg)
+                current_agg = {
+                    'timestamp': bucket_ts,
+                    'open': candle['open'],
+                    'high': candle['high'],
+                    'low': candle['low'],
+                    'close': candle['close'],
+                    'volume': candle['volume'] or 0.0,
+                }
+            else:
+                current_agg['high'] = max(current_agg['high'], candle['high'])
+                current_agg['low'] = min(current_agg['low'], candle['low'])
+                current_agg['close'] = candle['close']
+                if candle['volume'] is not None:
+                    current_agg['volume'] += candle['volume']
+
+        if current_agg is not None:
+            aggregated_candles.append(current_agg)
+
+        return aggregated_candles
 
     async def get_timesales_async(
         self,
@@ -518,21 +563,31 @@ class TradierClient:
             balances,
             ["total_equity", "equity", "net_liquidating_value", "portfolio_value"],
         )
-        cash = _coalesce_numeric(balances, ["total_cash", "cash_available", "cash"])
+        
+        # In a margin account, "total_cash" might be negative, but you still have buying power.
+        # We extract cash just for UI display purposes, not for trade validation.
+        cash = _coalesce_numeric(balances, ["total_cash", "cash"])
 
+        # Buying power is the ultimate source of truth for whether a trade can be placed.
+        # Tradier exposes this clearly in the margin sub-dictionary for margin accounts.
         broker_buying_power = _coalesce_numeric(
-            balances,
-            ["buying_power", "margin_buying_power", "stock_buying_power", "option_buying_power"],
+            margin,
+            ["stock_buying_power", "option_buying_power", "buying_power"],
         )
+        
+        # Fallbacks for cash accounts or differing API responses
         if broker_buying_power <= 0:
             broker_buying_power = _coalesce_numeric(
-                margin,
-                ["stock_buying_power", "option_buying_power", "buying_power"],
+                balances,
+                ["stock_buying_power", "buying_power", "cash_available"],
             )
+            
         if broker_buying_power <= 0:
-            broker_buying_power = cash or portfolio_value
+            broker_buying_power = cash if cash > 0 else portfolio_value
 
-        available_to_trade = cash if cash > 0 else broker_buying_power or portfolio_value
+        # The bot should always use the broker's reported buying power to validate trades,
+        # never just the raw cash balance (which ignores margin).
+        available_to_trade = broker_buying_power
 
         unrealized_pnl = _coalesce_numeric(
             balances,
