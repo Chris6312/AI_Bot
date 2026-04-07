@@ -2120,6 +2120,12 @@ class WatchlistService:
                 .order_by(WatchlistSymbol.id.desc())
                 .first()
             )
+            _stock_monitor_state = (
+                db.query(WatchlistMonitorState)
+                .filter(WatchlistMonitorState.scope == 'stocks_only', WatchlistMonitorState.symbol == symbol)
+                .order_by(WatchlistMonitorState.id.desc())
+                .first()
+            )
             _frozen_exit_template = str(position.frozen_exit_template or '').strip().lower() if position.frozen_exit_template else None
             _frozen_max_hold_hours = int(position.frozen_max_hold_hours) if position.frozen_max_hold_hours is not None else None
             max_hold_hours = _frozen_max_hold_hours if _frozen_max_hold_hours is not None else (int(watchlist_row.max_hold_hours) if watchlist_row is not None and watchlist_row.max_hold_hours is not None else None)
@@ -2162,17 +2168,31 @@ class WatchlistService:
                 and not profit_scale_out_taken
             )
             follow_through_window_hours = self._resolve_follow_through_window_hours(max_hold_hours)
+            _stock_tp_milestone_touched = (
+                _stock_monitor_state is not None
+                and _stock_monitor_state.tp_touched_at_utc is not None
+            )
             follow_through_failed = bool(
                 exit_template in FOLLOW_THROUGH_EXIT_TEMPLATES
-                and avg_entry_price is not None
-                and avg_entry_price > 0
                 and current_price is not None
-                and current_price < avg_entry_price
-                and hours_since_entry is not None
-                and follow_through_window_hours is not None
-                and 1.0 <= hours_since_entry <= follow_through_window_hours
                 and not stop_loss_breached
                 and not trailing_stop_breached
+                and (
+                    (
+                        avg_entry_price is not None
+                        and avg_entry_price > 0
+                        and current_price < avg_entry_price
+                        and hours_since_entry is not None
+                        and follow_through_window_hours is not None
+                        and 1.0 <= hours_since_entry <= follow_through_window_hours
+                    )
+                    or (
+                        _stock_tp_milestone_touched
+                        and profit_target is not None
+                        and profit_target > 0
+                        and current_price < profit_target
+                    )
+                )
             )
             impulse_trail_armed = bool(
                 exit_template in IMPULSE_TRAIL_TEMPLATES
@@ -2260,12 +2280,6 @@ class WatchlistService:
                 'stopLossBreached': stop_loss_breached,
                 'trailingStopBreached': trailing_stop_breached,
             }
-            _stock_monitor_state = (
-                db.query(WatchlistMonitorState)
-                .filter(WatchlistMonitorState.scope == 'stocks_only', WatchlistMonitorState.symbol == symbol)
-                .order_by(WatchlistMonitorState.id.desc())
-                .first()
-            )
             _milestone_state = self._load_milestone_state_from_monitor(_stock_monitor_state)
             if _milestone_state:
                 state_map[symbol] = self._merge_protection_state_monotonic(state_map[symbol], _milestone_state)
@@ -2567,17 +2581,31 @@ class WatchlistService:
             impulse_trailing_stop = self._calculate_impulse_trailing_stop(impulse_reference_price) if impulse_trail_armed else None
 
             follow_through_window_hours = self._resolve_follow_through_window_hours(max_hold_hours)
+            _crypto_tp_milestone_touched = (
+                _latest_monitor_state is not None
+                and _latest_monitor_state.tp_touched_at_utc is not None
+            )
             follow_through_failed = bool(
                 exit_template in FOLLOW_THROUGH_EXIT_TEMPLATES
-                and avg_entry_price is not None
-                and avg_entry_price > 0
                 and current_price is not None
-                and current_price < avg_entry_price
-                and hours_since_entry is not None
-                and follow_through_window_hours is not None
-                and 1.0 <= hours_since_entry <= follow_through_window_hours
                 and not stop_loss_breached
                 and not trailing_stop_breached
+                and (
+                    (
+                        avg_entry_price is not None
+                        and avg_entry_price > 0
+                        and current_price < avg_entry_price
+                        and hours_since_entry is not None
+                        and follow_through_window_hours is not None
+                        and 1.0 <= hours_since_entry <= follow_through_window_hours
+                    )
+                    or (
+                        _crypto_tp_milestone_touched
+                        and profit_target is not None
+                        and profit_target > 0
+                        and current_price < profit_target
+                    )
+                )
             )
             runner_protection = self._build_runner_protection_state(
                 asset_class='crypto',
