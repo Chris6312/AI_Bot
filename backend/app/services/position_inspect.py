@@ -916,9 +916,24 @@ class PositionInspectService:
             
         trail_breached = bool(details.get('trailingStopBreached')) or (current_price is not None and effective_protective_floor is not None and current_price <= effective_protective_floor)
         stop_breached = bool(details.get('stopLossBreached')) or (current_price is not None and stop_loss is not None and current_price <= stop_loss)
+        # Live recompute: if the TP milestone was previously recorded and price has since retreated
+        # below the profit target, follow-through has failed. This mirrors the milestone-aware
+        # OR-branch in the position state map builders so the drawer is accurate between worker cycles.
+        if (
+            not follow_through_failed
+            and template == 'first_failed_follow_through'
+            and tp_touched_at_utc is not None
+            and current_price is not None
+            and profit_target is not None
+            and profit_target > 0
+            and current_price < profit_target
+            and not stop_breached
+            and not trail_breached
+        ):
+            follow_through_failed = True
         impulse_trail_armed = bool(details.get('impulseTrailArmed'))
         scale_out_taken = bool(details.get('scaleOutAlreadyTaken'))
-        scale_out_ready = bool(details.get('scaleOutReady')) or (template == 'scale_out_then_trail' and target_reached and not scale_out_taken)
+        scale_out_ready = bool(details.get('scaleOutReady')) or (template in {'scale_out_then_trail', 'sell_into_strength'} and target_reached and not scale_out_taken)
         promoted_floor = promoted_protective_floor
         active_protection_rail = promoted_floor or effective_protective_floor or trailing_stop
         
