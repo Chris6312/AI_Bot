@@ -1810,7 +1810,7 @@ class WatchlistService:
         symbol_value = self._normalize_scope_symbol(scope=scope, symbol=symbol, quote_currency=quote_currency)
         if active_upload_id and row_upload_id == active_upload_id:
             return ACTIVE
-        if symbol_value in open_symbols and symbol_value not in active_symbols:
+        if symbol_value in open_symbols:
             return MANAGED_ONLY
         return INACTIVE
 
