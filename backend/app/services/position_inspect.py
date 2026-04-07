@@ -1097,6 +1097,54 @@ class PositionInspectService:
                 exit_readiness_score = 0.32
                 exit_likelihood = 'Low to moderate probability of exit before the first target is reached.'
                 active_trigger_label = 'Profit target'
+        elif template == 'sell_into_strength':
+            strategy_biases = ['sell-into-strength bias', 'momentum capture', 'trail protection']
+            exit_sensitivity = 'Aggressive'
+            if scale_out_taken:
+                logic_state = 'RUNNER_ACTIVE_TRAIL_PROTECTING'
+                logic_summary = 'Trailing remainder'
+                why_not = 'Partial profits have already been harvested into momentum and the remaining size is now managed by the trailing rail.'
+                next_trigger = 'Trailing stop breach'
+                next_trigger_level = trailing_stop
+                current_phase = 'Trailing Remainder'
+                phase_transition = 'Will transition to exit ready when the trailing stop is breached.'
+                structure_health = 'Healthy'
+                trail_status = 'Active'
+                risk_state = 'Improving'
+                risk_compression = 'Active'
+                exit_readiness_score = 0.45
+                exit_likelihood = 'Moderate probability of exit if the remaining position gives back momentum.'
+                active_trigger_label = 'Trailing stop'
+            elif scale_out_ready:
+                logic_state = 'SCALE_OUT_READY'
+                logic_summary = 'Selling into strength'
+                why_not = 'The profit target has been reached and the worker is ready to sell into momentum.'
+                next_trigger = 'Scale-out submission'
+                next_trigger_level = profit_target
+                current_phase = 'Scale Out'
+                phase_transition = 'Will transition to trailing mode after the scale-out fill is recorded.'
+                structure_health = 'Healthy'
+                trail_status = 'Pending activation'
+                risk_state = 'Improving'
+                risk_compression = 'Active'
+                exit_readiness_score = 0.78
+                exit_likelihood = 'High probability of scale-out soon.'
+                active_trigger_label = 'Scale-out trigger'
+            else:
+                logic_state = 'AWAITING_SCALE_OUT_TRIGGER'
+                logic_summary = 'Awaiting profit target'
+                why_not = 'Price has not yet reached the profit-target level required to begin selling into strength.'
+                next_trigger = 'Profit target touch'
+                next_trigger_level = profit_target
+                current_phase = 'Pre-Target'
+                phase_transition = 'Will transition to scale-out once price reaches the profit target.'
+                structure_health = 'Healthy'
+                trail_status = 'Configured'
+                risk_state = 'Stable'
+                risk_compression = 'Mixed'
+                exit_readiness_score = 0.30
+                exit_likelihood = 'Low to moderate probability of exit before the target is reached.'
+                active_trigger_label = 'Profit target'
         elif template == 'trail_after_impulse':
             strategy_biases = ['let-run bias', 'impulse confirmation', 'trail protection']
             exit_sensitivity = 'Delayed'
