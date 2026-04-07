@@ -27,6 +27,12 @@ class Position(Base):
     
     is_open = Column(Boolean, default=True, index=True)
     execution_id = Column(String(50))
-    
+
+    # Frozen management policy — set once at confirmed fill, never overwritten by subsequent watchlist uploads
+    frozen_exit_template = Column(String(64), nullable=True)
+    frozen_max_hold_hours = Column(Integer, nullable=True)
+    frozen_management_policy_version = Column(String(32), nullable=True)
+    entry_watchlist_upload_id = Column(String(64), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

@@ -26,6 +26,7 @@ import type {
 type MonitoringCollection = Partial<Record<WatchlistScope, WatchlistMonitoringSnapshot>>
 type ExitReadinessCollection = Partial<Record<WatchlistScope, WatchlistExitReadinessSnapshot>>
 type OrchestrationCollection = Partial<Record<WatchlistScope, WatchlistOrchestrationStatus | null>>
+type OrchestrationResponse = OrchestrationCollection | WatchlistOrchestrationStatus | null
 
 function normalizeMonitoringSymbol(value: string | null | undefined): string {
   const raw = String(value ?? '').trim().toUpperCase()
@@ -57,11 +58,13 @@ export default function Monitoring() {
     refetchInterval: 10000,
   })
 
-  const { data: orchestration = {} } = useQuery<OrchestrationCollection>({
+  const { data: rawOrchestration = null } = useQuery<OrchestrationResponse>({
     queryKey: ['watchlists', 'orchestration'],
-    queryFn: () => api.getOrchestrationStatus() as Promise<OrchestrationCollection>,
+    queryFn: () => api.getOrchestrationStatus() as Promise<OrchestrationResponse>,
     refetchInterval: 10000,
   })
+
+  const orchestration = normalizeOrchestrationCollection(rawOrchestration)
 
   const { data: exitReadiness = {} } = useQuery<ExitReadinessCollection>({
     queryKey: ['watchlists', 'exitReadiness'],
@@ -490,6 +493,23 @@ function buildExitFlags(row: WatchlistSymbolRecord) {
   if (row.positionState?.timeStopExtended) flags.push('extended')
   if (flags.length === 0) return '—'
   return flags.join(', ')
+}
+
+function isWatchlistOrchestrationStatus(value: unknown): value is WatchlistOrchestrationStatus {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<WatchlistOrchestrationStatus>
+  return typeof candidate.enabled === 'boolean' && typeof candidate.pollSeconds === 'number' && 'dueSnapshot' in candidate
+}
+
+function normalizeOrchestrationCollection(payload: OrchestrationResponse): OrchestrationCollection {
+  if (!payload) return {}
+  if (isWatchlistOrchestrationStatus(payload)) {
+    return {
+      stocks_only: payload,
+      crypto_only: payload,
+    }
+  }
+  return payload
 }
 
 function extractScopeSnapshot(orchestration: WatchlistOrchestrationStatus | undefined, scope: WatchlistScope) {

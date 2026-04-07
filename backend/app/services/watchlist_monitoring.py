@@ -898,6 +898,12 @@ class WatchlistMonitoringOrchestrator:
             current_price=current_price,
         )
         if fill_record is not None:
+            _pos = db.query(Position).filter(Position.id == fill_record.get("position_id")).first()
+            if _pos is not None and _pos.frozen_exit_template is None:
+                _pos.frozen_exit_template = symbol_row.exit_template
+                _pos.frozen_max_hold_hours = int(symbol_row.max_hold_hours) if symbol_row.max_hold_hours is not None else None
+                _pos.frozen_management_policy_version = str(symbol_row.upload_id or "")[:32] or None
+                _pos.entry_watchlist_upload_id = str(symbol_row.upload_id or "") or None
             payload.update({
                 "action": "ENTRY_FILLED",
                 "reason": intent.rejection_reason,
@@ -1155,6 +1161,17 @@ class WatchlistMonitoringOrchestrator:
         )
         db.commit()
         db.refresh(intent)
+        _existing_frozen = (monitor_state.decision_context_json or {}).get("frozenManagementPolicy")
+        if _existing_frozen is None:
+            _ctx = dict(monitor_state.decision_context_json or {})
+            _ctx["frozenManagementPolicy"] = {
+                "exitTemplate": symbol_row.exit_template,
+                "maxHoldHours": int(symbol_row.max_hold_hours) if symbol_row.max_hold_hours is not None else None,
+                "policyVersion": str(symbol_row.upload_id or "")[:32] or None,
+                "frozenAtUtc": event_time.isoformat(),
+            }
+            monitor_state.decision_context_json = _ctx
+            flag_modified(monitor_state, "decision_context_json")
         payload.update({
             "action": "ENTRY_FILLED",
             "reason": None,

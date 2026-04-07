@@ -89,6 +89,12 @@ RUNNER_STRONGER_EXTENSION_PCT = 0.01
 POSITION_MIRROR_SYNC_SOURCE = 'broker_position_mirror'
 VALIDATION_ACCEPTED_STATUSES = {'accepted', 'valid'}
 REPLAY_REJECTED = 'rejected'
+PROTECTION_MODE_RANK: dict[str, int] = {
+    'INITIAL_RISK': 0,
+    'BREAK_EVEN_PROMOTED': 1,
+    'STRUCTURE_TIGHTENED': 2,
+    'EXIT_READY': 3,
+}
 
 
 def _stable_hash(value: Any) -> str:
@@ -1838,6 +1844,16 @@ class WatchlistService:
         }
         changed = False
         if monitor_state is None:
+            previous_state = (
+                db.query(WatchlistMonitorState)
+                .filter(
+                    WatchlistMonitorState.scope == row.scope,
+                    WatchlistMonitorState.symbol == row.symbol,
+                    WatchlistMonitorState.watchlist_symbol_id != row.id,
+                )
+                .order_by(WatchlistMonitorState.id.desc())
+                .first()
+            )
             monitor_state = WatchlistMonitorState(
                 watchlist_symbol_id=row.id,
                 upload_id=row.upload_id,
@@ -1853,6 +1869,17 @@ class WatchlistService:
                 last_evaluated_at_utc=None,
                 next_evaluation_at_utc=next_evaluation_at,
                 last_market_data_at_utc=None,
+                protection_mode_high_water=previous_state.protection_mode_high_water if previous_state else None,
+                tp_touched_at_utc=previous_state.tp_touched_at_utc if previous_state else None,
+                break_even_promoted_at_utc=previous_state.break_even_promoted_at_utc if previous_state else None,
+                stronger_margin_promoted_at_utc=previous_state.stronger_margin_promoted_at_utc if previous_state else None,
+                promoted_protective_floor=previous_state.promoted_protective_floor if previous_state else None,
+                highest_protective_floor=previous_state.highest_protective_floor if previous_state else None,
+                peak_price_since_entry=previous_state.peak_price_since_entry if previous_state else None,
+                impulse_trail_armed_at_utc=previous_state.impulse_trail_armed_at_utc if previous_state else None,
+                impulse_trailing_stop=previous_state.impulse_trailing_stop if previous_state else None,
+                scale_out_taken=previous_state.scale_out_taken if previous_state else None,
+                last_management_evaluated_at_utc=previous_state.last_management_evaluated_at_utc if previous_state else None,
             )
             db.add(monitor_state)
             return True
@@ -2093,8 +2120,10 @@ class WatchlistService:
                 .order_by(WatchlistSymbol.id.desc())
                 .first()
             )
-            max_hold_hours = int(watchlist_row.max_hold_hours) if watchlist_row is not None and watchlist_row.max_hold_hours is not None else None
-            exit_template = str(watchlist_row.exit_template or '').strip().lower() if watchlist_row is not None and watchlist_row.exit_template is not None else ''
+            _frozen_exit_template = str(position.frozen_exit_template or '').strip().lower() if position.frozen_exit_template else None
+            _frozen_max_hold_hours = int(position.frozen_max_hold_hours) if position.frozen_max_hold_hours is not None else None
+            max_hold_hours = _frozen_max_hold_hours if _frozen_max_hold_hours is not None else (int(watchlist_row.max_hold_hours) if watchlist_row is not None and watchlist_row.max_hold_hours is not None else None)
+            exit_template = _frozen_exit_template if _frozen_exit_template else (str(watchlist_row.exit_template or '').strip().lower() if watchlist_row is not None and watchlist_row.exit_template is not None else '')
             trade = self._resolve_trade_for_position(db, position)
             profit_scale_out_taken = self._trade_has_partial_trigger(trade, 'PROFIT_TARGET_REACHED')
             base_expires_at = entry_time + timedelta(hours=max_hold_hours) if entry_time is not None and max_hold_hours is not None else None
@@ -2231,6 +2260,15 @@ class WatchlistService:
                 'stopLossBreached': stop_loss_breached,
                 'trailingStopBreached': trailing_stop_breached,
             }
+            _stock_monitor_state = (
+                db.query(WatchlistMonitorState)
+                .filter(WatchlistMonitorState.scope == 'stocks_only', WatchlistMonitorState.symbol == symbol)
+                .order_by(WatchlistMonitorState.id.desc())
+                .first()
+            )
+            _milestone_state = self._load_milestone_state_from_monitor(_stock_monitor_state)
+            if _milestone_state:
+                state_map[symbol] = self._merge_protection_state_monotonic(state_map[symbol], _milestone_state)
 
         for symbol, broker_position in broker_positions.items():
             if symbol in state_map:
@@ -2443,9 +2481,18 @@ class WatchlistService:
                     latest_row = row_candidate
                     break
 
-            max_hold_hours = int(latest_row.max_hold_hours) if latest_row is not None and latest_row.max_hold_hours is not None else None
-            exit_template = str(latest_row.exit_template or '').strip().lower() if latest_row is not None and latest_row.exit_template is not None else ''
-
+            _latest_monitor_state: WatchlistMonitorState | None = None
+            if latest_row is not None:
+                _latest_monitor_state = (
+                    db.query(WatchlistMonitorState)
+                    .filter(WatchlistMonitorState.watchlist_symbol_id == latest_row.id)
+                    .first()
+                )
+            _frozen_policy: dict[str, Any] = {}
+            if _latest_monitor_state is not None:
+                _frozen_policy = dict((_latest_monitor_state.decision_context_json or {}).get('frozenManagementPolicy') or {})
+            max_hold_hours = int(_frozen_policy['maxHoldHours']) if _frozen_policy.get('maxHoldHours') is not None else (int(latest_row.max_hold_hours) if latest_row is not None and latest_row.max_hold_hours is not None else None)
+            exit_template = str(_frozen_policy['exitTemplate']).strip().lower() if _frozen_policy.get('exitTemplate') else (str(latest_row.exit_template or '').strip().lower() if latest_row is not None and latest_row.exit_template is not None else '')
             entry_time_raw = position.get('entryTimeUtc')
             entry_time = None
             if entry_time_raw:
@@ -2617,6 +2664,9 @@ class WatchlistService:
                 'observedAtUtc': observed_at.isoformat(),
             }
             state_map[normalized_symbol] = payload
+            _milestone_state = self._load_milestone_state_from_monitor(_latest_monitor_state)
+            if _milestone_state:
+                state_map[normalized_symbol] = self._merge_protection_state_monotonic(state_map[normalized_symbol], _milestone_state)
         return state_map
 
     def _derive_runtime_monitoring_status(self, row: WatchlistSymbol, position_state: dict[str, Any]) -> str | None:
@@ -2726,6 +2776,122 @@ class WatchlistService:
         if isinstance(regime_note, str) and regime_note.strip():
             fallback.append(regime_note.strip())
         return ' · '.join(fallback)
+
+    @staticmethod
+    def _load_milestone_state_from_monitor(monitor_state: WatchlistMonitorState | None) -> dict[str, Any]:
+        if monitor_state is None:
+            return {}
+        return {
+            'protectionModeHighWater': monitor_state.protection_mode_high_water,
+            'tpTouchedAtUtc': monitor_state.tp_touched_at_utc.isoformat() if monitor_state.tp_touched_at_utc else None,
+            'breakEvenPromotedAtUtc': monitor_state.break_even_promoted_at_utc.isoformat() if monitor_state.break_even_promoted_at_utc else None,
+            'strongerMarginPromotedAtUtc': monitor_state.stronger_margin_promoted_at_utc.isoformat() if monitor_state.stronger_margin_promoted_at_utc else None,
+            'promotedProtectiveFloor': monitor_state.promoted_protective_floor,
+            'highestProtectiveFloor': monitor_state.highest_protective_floor,
+            'peakPriceSinceEntry': monitor_state.peak_price_since_entry,
+            'impulseTrailArmedAtUtc': monitor_state.impulse_trail_armed_at_utc.isoformat() if monitor_state.impulse_trail_armed_at_utc else None,
+            'impulseTrailingStop': monitor_state.impulse_trailing_stop,
+            'scaleOutTaken': bool(monitor_state.scale_out_taken),
+            'lastManagementEvaluatedAtUtc': monitor_state.last_management_evaluated_at_utc.isoformat() if monitor_state.last_management_evaluated_at_utc else None,
+        }
+
+    @staticmethod
+    def _merge_protection_state_monotonic(position_state: dict[str, Any], milestone_state: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(position_state)
+        live_mode = str(merged.get('protectionMode') or 'INITIAL_RISK').upper()
+        persisted_mode = str(milestone_state.get('protectionModeHighWater') or 'INITIAL_RISK').upper()
+        if PROTECTION_MODE_RANK.get(persisted_mode, 0) > PROTECTION_MODE_RANK.get(live_mode, 0):
+            merged['protectionMode'] = persisted_mode
+        if not merged.get('tpTouchedAtUtc') and milestone_state.get('tpTouchedAtUtc'):
+            merged['tpTouchedAtUtc'] = milestone_state['tpTouchedAtUtc']
+        live_floor = merged.get('promotedProtectiveFloor')
+        persisted_floor = milestone_state.get('promotedProtectiveFloor')
+        if persisted_floor is not None and (live_floor is None or float(persisted_floor) > float(live_floor)):
+            merged['promotedProtectiveFloor'] = persisted_floor
+        live_peak = merged.get('peakPrice')
+        persisted_peak = milestone_state.get('peakPriceSinceEntry')
+        if persisted_peak is not None and (live_peak is None or float(persisted_peak) > float(live_peak)):
+            merged['peakPrice'] = persisted_peak
+        if milestone_state.get('scaleOutTaken'):
+            merged['scaleOutAlreadyTaken'] = True
+            merged['scaleOutReady'] = False
+        if milestone_state.get('strongerMarginPromotedAtUtc'):
+            merged['strongerMarginReached'] = True
+        live_its = merged.get('impulseTrailingStop')
+        persisted_its = milestone_state.get('impulseTrailingStop')
+        if persisted_its is not None and (live_its is None or float(persisted_its) > float(live_its)):
+            merged['impulseTrailingStop'] = persisted_its
+        return merged
+
+    def _apply_milestone_updates(self, monitor_state: WatchlistMonitorState, position_state: dict[str, Any], *, observed_at: datetime) -> bool:
+        live_mode = str(position_state.get('protectionMode') or 'INITIAL_RISK').upper()
+        persisted_mode = str(monitor_state.protection_mode_high_water or 'INITIAL_RISK').upper()
+        if PROTECTION_MODE_RANK.get(live_mode, 0) > PROTECTION_MODE_RANK.get(persisted_mode, 0):
+            monitor_state.protection_mode_high_water = live_mode
+        tp_touched = position_state.get('tpTouchedAtUtc')
+        if tp_touched and monitor_state.tp_touched_at_utc is None:
+            try:
+                parsed_tp = datetime.fromisoformat(str(tp_touched).replace('Z', '+00:00'))
+                monitor_state.tp_touched_at_utc = parsed_tp.replace(tzinfo=UTC) if parsed_tp.tzinfo is None else parsed_tp
+            except (ValueError, TypeError):
+                monitor_state.tp_touched_at_utc = observed_at
+        live_rank = PROTECTION_MODE_RANK.get(live_mode, 0)
+        if live_rank >= PROTECTION_MODE_RANK.get('BREAK_EVEN_PROMOTED', 1) and monitor_state.break_even_promoted_at_utc is None:
+            monitor_state.break_even_promoted_at_utc = observed_at
+        if position_state.get('strongerMarginReached') and monitor_state.stronger_margin_promoted_at_utc is None:
+            monitor_state.stronger_margin_promoted_at_utc = observed_at
+        live_floor = position_state.get('promotedProtectiveFloor')
+        if live_floor is not None and (monitor_state.promoted_protective_floor is None or float(live_floor) > float(monitor_state.promoted_protective_floor)):
+            monitor_state.promoted_protective_floor = float(live_floor)
+        floor_candidates = [v for v in (
+            position_state.get('promotedProtectiveFloor'),
+            position_state.get('trailingStop'),
+            position_state.get('feeAdjustedBreakEven'),
+        ) if v is not None]
+        if floor_candidates:
+            max_floor = max(float(v) for v in floor_candidates)
+            if monitor_state.highest_protective_floor is None or max_floor > float(monitor_state.highest_protective_floor):
+                monitor_state.highest_protective_floor = max_floor
+        peak = position_state.get('peakPrice')
+        if peak is not None and (monitor_state.peak_price_since_entry is None or float(peak) > float(monitor_state.peak_price_since_entry)):
+            monitor_state.peak_price_since_entry = float(peak)
+        if position_state.get('impulseTrailArmed') and monitor_state.impulse_trail_armed_at_utc is None:
+            monitor_state.impulse_trail_armed_at_utc = observed_at
+        impulse_stop = position_state.get('impulseTrailingStop')
+        if impulse_stop is not None and (monitor_state.impulse_trailing_stop is None or float(impulse_stop) > float(monitor_state.impulse_trailing_stop)):
+            monitor_state.impulse_trailing_stop = float(impulse_stop)
+        if position_state.get('scaleOutAlreadyTaken') and not monitor_state.scale_out_taken:
+            monitor_state.scale_out_taken = True
+        monitor_state.last_management_evaluated_at_utc = observed_at
+        return True
+
+    def advance_position_milestones(self, db: Session, *, scope: WATCHLIST_SCOPE, observed_at: datetime) -> dict[str, int]:
+        position_state_map = self._build_position_state_map(db, scope=scope, observed_at=observed_at)
+        pairs = (
+            db.query(WatchlistMonitorState, WatchlistSymbol)
+            .join(WatchlistSymbol, WatchlistSymbol.id == WatchlistMonitorState.watchlist_symbol_id)
+            .filter(WatchlistMonitorState.scope == scope)
+            .all()
+        )
+        seen_keys: set[str] = set()
+        updated = 0
+        for monitor_state, symbol_row in pairs:
+            symbol_key = self._normalize_scope_symbol(
+                scope=scope,
+                symbol=symbol_row.symbol,
+                quote_currency=symbol_row.quote_currency,
+            )
+            if not symbol_key or symbol_key in seen_keys:
+                continue
+            position_state = position_state_map.get(symbol_key)
+            if not position_state or not position_state.get('hasOpenPosition'):
+                continue
+            seen_keys.add(symbol_key)
+            if self._apply_milestone_updates(monitor_state, position_state, observed_at=observed_at):
+                updated += 1
+        if updated:
+            db.commit()
+        return {'updated': updated}
 
 
 watchlist_service = WatchlistService()

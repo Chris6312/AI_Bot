@@ -147,6 +147,11 @@ class WatchlistExitWorkerService:
         )
 
         due_rows = self._collect_rows(db, observed_at=observed_at, limit=limit)
+        for scope in SUPPORTED_SCOPES:
+            try:
+                watchlist_service.advance_position_milestones(db, scope=scope, observed_at=observed_at)
+            except Exception as exc:
+                logger.warning("advance_position_milestones failed for scope %s: %s", scope, exc)
         rows: list[dict[str, Any]] = []
         summary = {
             "candidateCount": 0,

@@ -120,17 +120,29 @@ class PositionInspectService:
             'requestedPrice': float(intent.requested_price or 0.0) if intent is not None and intent.requested_price is not None else None,
             'avgFillPrice': float(intent.avg_fill_price or 0.0) if intent is not None and intent.avg_fill_price is not None else float(position.avg_entry_price or 0.0),
         }
+        _stock_ms = (
+            db.query(WatchlistMonitorState)
+            .filter(WatchlistMonitorState.scope == 'stocks_only', WatchlistMonitorState.symbol == symbol)
+            .order_by(WatchlistMonitorState.id.desc())
+            .first()
+        )
+        _frozen_tpl = str(position.frozen_exit_template or '').strip() or None
+        _frozen_hrs = int(position.frozen_max_hold_hours) if position.frozen_max_hold_hours is not None else None
+        _db_peak = float(position.peak_price) if position.peak_price is not None else None
+        _ms_peak = float(_stock_ms.peak_price_since_entry) if _stock_ms is not None and _stock_ms.peak_price_since_entry is not None else None
+        _peak_price = max(p for p in (_db_peak, _ms_peak) if p is not None) if (_db_peak is not None or _ms_peak is not None) else None
         exit_plan = {
-            'template': None,
+            'template': _frozen_tpl,
+            'maxHoldHours': _frozen_hrs,
             'stopLoss': float(position.stop_loss or 0.0) if position.stop_loss is not None else None,
             'profitTarget': float(position.profit_target or 0.0) if position.profit_target is not None else None,
             'trailingStop': float(position.trailing_stop or 0.0) if position.trailing_stop is not None else None,
-            'peakPrice': float(position.peak_price or 0.0) if position.peak_price is not None else None,
-            'protectionMode': None,
+            'peakPrice': _peak_price,
+            'protectionMode': _stock_ms.protection_mode_high_water if _stock_ms is not None else None,
             'feeAdjustedBreakEven': None,
-            'promotedProtectiveFloor': None,
-            'tpTouchedAtUtc': None,
-            'strongerMarginReached': False,
+            'promotedProtectiveFloor': _stock_ms.promoted_protective_floor if _stock_ms is not None else None,
+            'tpTouchedAtUtc': _stock_ms.tp_touched_at_utc.isoformat() if _stock_ms is not None and _stock_ms.tp_touched_at_utc else None,
+            'strongerMarginReached': bool(_stock_ms.stronger_margin_promoted_at_utc) if _stock_ms is not None else False,
             'lastConfirmedHigherLow': None,
             'tradeExitTrigger': trade.exit_trigger if trade is not None else None,
         }
@@ -308,9 +320,20 @@ class PositionInspectService:
         stop_distance = (current_price - stop_loss) if current_price is not None and stop_loss is not None else None
         target_distance = (profit_target - current_price) if current_price is not None and profit_target is not None else None
         trailing_distance = (current_price - trailing_stop) if current_price is not None and trailing_stop is not None else None
+        frozen_policy = dict(base_monitor_context.get('frozenManagementPolicy') or {})
         exit_plan = {
-            'template': watch_symbol.exit_template if watch_symbol is not None else watchlist_context.get('exitTemplate') or base_monitor_context.get('exitTemplate'),
-            'maxHoldHours': watch_symbol.max_hold_hours if watch_symbol is not None else watchlist_context.get('maxHoldHours') or base_monitor_context.get('maxHoldHours'),
+            'template': (
+                watchlist_context.get('exitTemplate')
+                or frozen_policy.get('exitTemplate')
+                or (watch_symbol.exit_template if watch_symbol is not None else None)
+                or base_monitor_context.get('exitTemplate')
+            ),
+            'maxHoldHours': (
+                watchlist_context.get('maxHoldHours')
+                or frozen_policy.get('maxHoldHours')
+                or (watch_symbol.max_hold_hours if watch_symbol is not None else None)
+                or base_monitor_context.get('maxHoldHours')
+            ),
             'triggerLevel': self._maybe_float(details.get('triggerLevel')),
             'bounceFloor': self._maybe_float(details.get('bounceFloor')),
             'breakoutLevel': self._maybe_float(details.get('breakoutLevel')),
@@ -452,6 +475,7 @@ class PositionInspectService:
         if watch_symbol is not None:
             upload = db.query(WatchlistUpload).filter(WatchlistUpload.upload_id == watch_symbol.upload_id).first()
         base_monitor_context = dict(monitor_state.decision_context_json or {}) if isinstance(monitor_state.decision_context_json, dict) else {}
+        frozen_policy = dict(base_monitor_context.get('frozenManagementPolicy') or {})
         exit_execution = dict(base_monitor_context.get('exitExecution') or {})
         latest_eval = {
             'state': monitor_state.latest_decision_state,
@@ -523,8 +547,16 @@ class PositionInspectService:
                 'note': 'The symbol is flat and in post-exit cooldown. Timeframes remain attached to the watchlist context.',
             },
             'exitPlan': {
-                'template': watch_symbol.exit_template if watch_symbol is not None else base_monitor_context.get('exitTemplate'),
-                'maxHoldHours': watch_symbol.max_hold_hours if watch_symbol is not None else base_monitor_context.get('maxHoldHours'),
+                'template': (
+                    frozen_policy.get('exitTemplate')
+                    or (watch_symbol.exit_template if watch_symbol is not None else None)
+                    or base_monitor_context.get('exitTemplate')
+                ),
+                'maxHoldHours': (
+                    frozen_policy.get('maxHoldHours')
+                    or (watch_symbol.max_hold_hours if watch_symbol is not None else None)
+                    or base_monitor_context.get('maxHoldHours')
+                ),
                 'stopLoss': None,
                 'profitTarget': None,
                 'trailingStop': None,
