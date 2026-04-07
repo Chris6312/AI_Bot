@@ -248,6 +248,22 @@ class PositionInspectService:
             details = dict(base_monitor_context.get('details') or {})
         if live_position_state:
             details.update({key: value for key, value in live_position_state.items() if value is not None})
+        # Upgrade details with monotonic milestone columns — these never regress between eval cycles
+        if monitor_state is not None:
+            _ms_pm_rank = {'INITIAL_RISK': 0, 'BREAK_EVEN_PROMOTED': 1, 'STRUCTURE_TIGHTENED': 2, 'EXIT_READY': 3}
+            _ms_pm = str(monitor_state.protection_mode_high_water or '').strip().upper()
+            _det_pm = str(details.get('protectionMode') or '').strip().upper() or 'INITIAL_RISK'
+            if _ms_pm and _ms_pm_rank.get(_ms_pm, 0) > _ms_pm_rank.get(_det_pm, 0):
+                details['protectionMode'] = monitor_state.protection_mode_high_water
+            if monitor_state.tp_touched_at_utc and not details.get('tpTouchedAtUtc'):
+                details['tpTouchedAtUtc'] = monitor_state.tp_touched_at_utc.isoformat()
+            if monitor_state.stronger_margin_promoted_at_utc and not details.get('strongerMarginReached'):
+                details['strongerMarginReached'] = True
+            if monitor_state.promoted_protective_floor is not None:
+                _ms_floor = float(monitor_state.promoted_protective_floor)
+                _det_floor = self._maybe_float(details.get('promotedProtectiveFloor'))
+                if _det_floor is None or _ms_floor > _det_floor:
+                    details['promotedProtectiveFloor'] = _ms_floor
 
         configured_timeframes = list(
             (watch_symbol.bot_timeframes if watch_symbol is not None else None)
@@ -402,8 +418,7 @@ class PositionInspectService:
             'state': (latest_eval or {}).get('state') or live_monitoring.get('latestDecisionState'),
             'reason': (latest_eval or {}).get('reason') or live_monitoring.get('latestDecisionReason'),
             'details': {
-                **dict((latest_eval or {}).get('details') or {}),
-                **{key: value for key, value in live_position_state.items() if value is not None},
+                **details,
                 'cooldownActive': cooldown_active,
                 'reentryBlockedUntilUtc': base_monitor_context.get('reentryBlockedUntilUtc'),
                 'lastExitAtUtc': base_monitor_context.get('lastExitAtUtc'),
